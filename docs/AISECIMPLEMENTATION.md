@@ -31,7 +31,7 @@
 | Install script portability | ✅ Done | `install.sh` supports `--install-dir`, `MACSEC_INSTALL_DIR`, `MACSEC_SECURITY_DIR`, generates default config.toml |
 | TOMLKit SPM dependency | ✅ Done | `Package.swift` — `TOMLKit 0.6.0` |
 | AISecurityApp.swift hardcoded paths | ✅ Done | dismissed.json + alerts.log now use config; Mail.app path has fallback |
-| Verification: fresh Mac user account test | 🔜 Pending Mac | Requires macOS to build and run |
+| Verification: fresh Mac user account test | ✅ Done | All 4 steps passed (default paths, custom config, env override, no config fallback) — 2026-03-28 |
 
 ### Phase 2: Rust Core Library
 
