@@ -3,19 +3,57 @@
 *.o
 *.d
 *.swp
+Package.resolved
 
 # Xcode
 *.xcodeproj/
 *.xcworkspace/
 xcuserdata/
 DerivedData/
+*.pbxuser
+*.mode1v3
+*.mode2v3
+*.perspectivev3
+*.moved-aside
+*.hmap
+*.ipa
+*.xcuserstate
 
-# macOS
+# macOS system files
 .DS_Store
+**/.DS_Store
+.AppleDouble
+.LSOverride
+._*
+.Spotlight-V100
+.Trashes
+.fseventsd
+.TemporaryItems
+.AppleDB
+.apdisk
+Icon?
+
+# Debug symbols & crash logs
 *.dSYM/
+*.dSYM.zip
+*.crash
 
 # App bundle (built artifact)
 AISecurity.app/
+
+# Code signing
+*.p12
+*.cer
+*.mobileprovision
+*.provisionprofile
+
+# Secrets & credentials (never commit these)
+*.env
+.env.*
+*.pem
+*.key
+*.keychain
+*.keychain-db
 
 # Claude Code
 .claude/
@@ -23,3 +61,9 @@ AISecurity.app/
 # IDE
 .vscode/
 .idea/
+*.sublime-project
+*.sublime-workspace
+
+# Misc
+*.log
+Thumbs.db
