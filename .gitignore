@@ -1,0 +1,25 @@
+# Swift build artifacts
+.build/
+*.o
+*.d
+*.swp
+
+# Xcode
+*.xcodeproj/
+*.xcworkspace/
+xcuserdata/
+DerivedData/
+
+# macOS
+.DS_Store
+*.dSYM/
+
+# App bundle (built artifact)
+AISecurity.app/
+
+# Claude Code
+.claude/
+
+# IDE
+.vscode/
+.idea/

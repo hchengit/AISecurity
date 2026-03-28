@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <!--
+      No App Sandbox — this security agent needs access to ~/Library/Mail/
+      and ~/Library/Messages/chat.db, which requires Full Disk Access (FDA).
+      Sandbox would block those paths even with FDA granted.
+
+      The user must grant Full Disk Access in:
+        System Settings > Privacy & Security > Full Disk Access
+    -->
+
+    <!-- Read/write user-selected files (for manual scan via file picker) -->
+    <key>com.apple.security.files.user-selected.read-write</key>
+    <true/>
+
+    <!-- Read/write Downloads folder -->
+    <key>com.apple.security.files.downloads.read-write</key>
+    <true/>
+</dict>
+</plist>
