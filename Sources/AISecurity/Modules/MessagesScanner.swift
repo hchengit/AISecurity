@@ -22,10 +22,10 @@ final class MessagesScanner: @unchecked Sendable {
     private(set) var byCategory: [String: Int] = [:]
     var onAlert: AlertHandler?
 
-    private let home = FileManager.default.homeDirectoryForCurrentUser.path
-    private var chatDbPath: String { (home as NSString).appendingPathComponent("Library/Messages/chat.db") }
+    private let config = SecurityConfig.shared
+    private var chatDbPath: String { config.messagesScanner.messagesDb }
     private var stateFilePath: String {
-        (home as NSString).appendingPathComponent(".mac-security/messages-last-scan.json")
+        (config.securityDir as NSString).appendingPathComponent("messages-last-scan.json")
     }
 
     // MARK: - Threat Patterns

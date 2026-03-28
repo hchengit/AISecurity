@@ -1,9 +1,15 @@
 #!/bin/bash
 # ─────────────────────────────────────────────────────────────────────────────
 #  AISecurity — Installer
-#  Builds, installs to /Applications, and sets up a LaunchAgent for auto-start.
+#  Builds, installs the .app bundle, and sets up a LaunchAgent for auto-start.
 #
-#  Usage: bash install.sh
+#  Usage: bash install.sh [--install-dir /path/to/dir]
+#
+#  Options:
+#    --install-dir DIR   Install .app to DIR instead of /Applications
+#
+#  Environment variables:
+#    MACSEC_INSTALL_DIR  Same as --install-dir (flag takes precedence)
 # ─────────────────────────────────────────────────────────────────────────────
 
 set -e
@@ -14,10 +20,25 @@ success() { echo -e "${GREEN}[✓]${NC} $1"; }
 warn()    { echo -e "${YELLOW}[!]${NC} $1"; }
 error()   { echo -e "${RED}[✗]${NC} $1"; exit 1; }
 
+# ── Parse arguments ──────────────────────────────────────────────────────────
+INSTALL_DIR=""
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --install-dir)
+            INSTALL_DIR="$2"
+            shift 2
+            ;;
+        *)
+            warn "Unknown option: $1"
+            shift
+            ;;
+    esac
+done
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-SECURITY_DIR="$HOME/.mac-security"
+SECURITY_DIR="${MACSEC_SECURITY_DIR:-$HOME/.mac-security}"
+INSTALL_DIR="${INSTALL_DIR:-${MACSEC_INSTALL_DIR:-/Applications}}"
 APP_NAME="AISecurity.app"
-INSTALL_DIR="/Applications"
 AGENT_LABEL="com.aisecurity.menubar"
 AGENT_PLIST="$HOME/Library/LaunchAgents/${AGENT_LABEL}.plist"
 
@@ -26,6 +47,8 @@ echo "╔═══════════════════════�
 echo "║     AISecurity — Installer                   ║"
 echo "╚══════════════════════════════════════════════╝"
 echo ""
+log "Install dir: $INSTALL_DIR"
+log "Security dir: $SECURITY_DIR"
 
 # Stop existing instance
 log "Stopping any running instance..."
@@ -38,6 +61,20 @@ success "Cleared"
 log "Creating security directories..."
 mkdir -p "$SECURITY_DIR/logs" "$SECURITY_DIR/quarantine"
 success "Directories: $SECURITY_DIR"
+
+# Generate default config.toml if it doesn't exist
+CONFIG_FILE="$SECURITY_DIR/config.toml"
+if [ ! -f "$CONFIG_FILE" ]; then
+    log "Generating default config.toml..."
+    if [ -f "$SCRIPT_DIR/config.toml.example" ]; then
+        cp "$SCRIPT_DIR/config.toml.example" "$CONFIG_FILE"
+        success "Config: $CONFIG_FILE (from template)"
+    else
+        warn "config.toml.example not found — using built-in defaults"
+    fi
+else
+    success "Config: $CONFIG_FILE (existing, not overwritten)"
+fi
 
 # Build
 log "Building AISecurity (Release)..."
@@ -111,9 +148,9 @@ cat > "$AGENT_PLIST" << EOF
     <key>LimitLoadToSessionType</key>
     <string>Aqua</string>
     <key>StandardOutPath</key>
-    <string>${HOME}/.mac-security/logs/launchagent-stdout.log</string>
+    <string>${SECURITY_DIR}/logs/launchagent-stdout.log</string>
     <key>StandardErrorPath</key>
-    <string>${HOME}/.mac-security/logs/launchagent-stderr.log</string>
+    <string>${SECURITY_DIR}/logs/launchagent-stderr.log</string>
 </dict>
 </plist>
 EOF
@@ -138,10 +175,12 @@ echo "║                                                          ║"
 echo "║  The shield icon should appear in your menu bar.         ║"
 echo "║  AISecurity will auto-start on login.                    ║"
 echo "║                                                          ║"
+echo "║  Config:  $SECURITY_DIR/config.toml"
+echo "║  Logs:    $SECURITY_DIR/logs/"
+echo "║                                                          ║"
 echo "║  Commands:                                               ║"
-echo "║    Start:  launchctl start com.aisecurity.agent          ║"
-echo "║    Stop:   launchctl stop com.aisecurity.agent           ║"
-echo "║    Logs:   ~/.mac-security/logs/                         ║"
+echo "║    Start:  launchctl start $AGENT_LABEL"
+echo "║    Stop:   launchctl stop $AGENT_LABEL"
 echo "║                                                          ║"
 echo "║  IMPORTANT: Grant Full Disk Access to AISecurity.app in  ║"
 echo "║  System Settings > Privacy & Security > Full Disk Access ║"

@@ -1,0 +1,117 @@
+# ─────────────────────────────────────────────────────────────────────────────
+#  AISecurity Configuration
+#
+#  Copy to ~/.mac-security/config.toml and customize as needed.
+#  All paths support ~ expansion (resolved to $HOME at runtime).
+#  Every value below shows the default — omit any section to use defaults.
+#
+#  Override priority:  environment variable > config.toml > built-in default
+# ─────────────────────────────────────────────────────────────────────────────
+
+[general]
+# PRODUCTION = all alerts + auto-quarantine
+# TESTING    = alerts only, no quarantine
+# DEVELOPMENT = logging only
+# Env override: MACSEC_MODE
+mode = "PRODUCTION"
+
+[paths]
+# Base directory for logs, quarantine, state files
+# Env override: MACSEC_SECURITY_DIR
+security_dir = "~/.mac-security"
+
+# Apple Mail .emlx directory
+# Env override: MACSEC_MAIL_DIR
+mail_dir = "~/Library/Mail"
+
+# iMessage / Messages database
+# Env override: MACSEC_MESSAGES_DB
+messages_db = "~/Library/Messages/chat.db"
+
+# Quarantine directory for suspicious files
+# Env override: MACSEC_QUARANTINE_DIR
+quarantine_dir = "~/.mac-security/quarantine"
+
+# Log directory
+# Env override: MACSEC_LOG_DIR
+log_dir = "~/.mac-security/logs"
+
+[file_watcher]
+enabled = true
+# Directories to monitor for new/changed files
+# Env override: MACSEC_SCAN_DIRS (colon-separated)
+monitored_directories = ["~/Downloads", "~/Desktop", "~/Documents"]
+max_scan_size_bytes = 5242880   # 5 MB
+debounce_ms = 300
+
+[email_scanner]
+enabled = true
+startup_scan_limit = 50
+
+[messages_scanner]
+enabled = true
+
+[prompt_injection_guard]
+enabled = true
+clipboard_monitor_interval_ms = 2000
+
+[sensitive_data_detector]
+enabled = true
+critical_categories = ["crypto", "financial", "credential", "pii"]
+
+[external_file_sanitizer]
+enabled = true
+scan_downloads_on_start = true
+
+[scheduled_scan]
+enabled = true
+interval_hours = 6
+scan_directories = ["~/Downloads", "~/Desktop", "~/Documents"]
+
+[notifications]
+enabled = true
+critical_only = true    # Only notify on CRITICAL in PRODUCTION
+
+[audit]
+log_blocked_operations = true
+log_alerts = true
+max_log_age_days = 90
+
+[protected_paths]
+# Override the default protected path list.
+# Omit this section entirely to use platform defaults.
+# Uncomment and customize to add/remove monitored paths:
+#
+# paths = [
+#     "~/Pictures/Photos Library.photoslibrary",
+#     "~/Pictures",
+#     "~/Library/Application Support/com.apple.photoanalysisd",
+#     "~/Library/Application Support/Photos",
+#     "~/Library/Application Support/Sparrow",
+#     "~/.sparrow",
+#     "~/.bitcoin",
+#     "~/.lnd",
+#     "~/Library/Application Support/Bitwarden",
+#     "~/Library/Application Support/Aura",
+#     "~/Library/Keychains",
+#     "~/Library/Mail",
+#     "~/Library/Messages",
+#     "~/Library/Group Containers/group.com.apple.notes",
+#     "~/Library/Calendars",
+#     "~/.ssh",
+#     "~/.gnupg",
+#     "~/Library/Safari",
+#     "~/Documents/Tax Returns",
+#     "~/Documents/TurboTax",
+# ]
+
+[always_forbidden]
+wallet_key_access = true
+credit_card_transmission = true
+ssn_transmission = true
+drivers_license_upload = true
+photos_library_upload = true
+keychain_dump = true
+env_file_upload = true
+private_pem_key_upload = true
+turbotax_upload = true

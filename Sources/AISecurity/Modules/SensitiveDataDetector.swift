@@ -210,31 +210,7 @@ final class SensitiveDataDetector: @unchecked Sendable {
 
     // MARK: - Protected Paths
 
-    static let protectedPaths: [String] = {
-        let home = FileManager.default.homeDirectoryForCurrentUser.path
-        return [
-            "\(home)/Pictures/Photos Library.photoslibrary",
-            "\(home)/Pictures",
-            "\(home)/Library/Application Support/com.apple.photoanalysisd",
-            "\(home)/Library/Application Support/Photos",
-            "\(home)/Library/Application Support/Sparrow",
-            "\(home)/.sparrow",
-            "\(home)/.bitcoin",
-            "\(home)/.lnd",
-            "\(home)/Library/Application Support/Bitwarden",
-            "\(home)/Library/Application Support/Aura",
-            "\(home)/Library/Keychains",
-            "\(home)/Library/Mail",
-            "\(home)/Library/Messages",
-            "\(home)/Library/Group Containers/group.com.apple.notes",
-            "\(home)/Library/Calendars",
-            "\(home)/.ssh",
-            "\(home)/.gnupg",
-            "\(home)/Library/Safari",
-            "\(home)/Documents/Tax Returns",
-            "\(home)/Documents/TurboTax",
-        ]
-    }()
+    static let protectedPaths: [String] = SecurityConfig.shared.paths.protectedPaths
 
     static let sensitiveExtensions: Set<String> = [
         ".key", ".pem", ".p12", ".pfx", ".cert", ".crt",

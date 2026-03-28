@@ -380,18 +380,26 @@ struct ThreatsWindowView: View {
 
     // MARK: - Actions
 
+    private static let mailAppPath: String = {
+        // Prefer /System/Applications, fall back to /Applications
+        for candidate in ["/System/Applications/Mail.app", "/Applications/Mail.app"] {
+            if FileManager.default.fileExists(atPath: candidate) { return candidate }
+        }
+        return "/System/Applications/Mail.app"
+    }()
+
     private func openInMail(_ alert: SecurityAlert) {
         // Open the .emlx file directly in Mail if we have the path
         if let fp = alert.filePath, FileManager.default.fileExists(atPath: fp) {
             NSWorkspace.shared.open(
                 [URL(fileURLWithPath: fp)],
-                withApplicationAt: URL(fileURLWithPath: "/System/Applications/Mail.app"),
+                withApplicationAt: URL(fileURLWithPath: Self.mailAppPath),
                 configuration: NSWorkspace.OpenConfiguration()
             )
             return
         }
         // Fallback: open Mail app
-        NSWorkspace.shared.open(URL(fileURLWithPath: "/System/Applications/Mail.app"))
+        NSWorkspace.shared.open(URL(fileURLWithPath: Self.mailAppPath))
     }
 
     private func openMessages(_ alert: SecurityAlert) {
@@ -434,11 +442,11 @@ struct ThreatsWindowView: View {
     }
 
     private static let dismissedPath: String = {
-        (NSHomeDirectory() as NSString).appendingPathComponent(".mac-security/dismissed.json")
+        (SecurityConfig.shared.securityDir as NSString).appendingPathComponent("dismissed.json")
     }()
 
     private static let alertsLogPath: String = {
-        (NSHomeDirectory() as NSString).appendingPathComponent(".mac-security/logs/alerts.log")
+        (SecurityConfig.shared.paths.logDir as NSString).appendingPathComponent("alerts.log")
     }()
 
     private static func loadDismissed() -> Set<String> {
