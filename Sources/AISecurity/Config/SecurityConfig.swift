@@ -149,7 +149,7 @@ struct SecurityConfig: Sendable {
         guard let table = table,
               let sec = table[section] as? TOMLTable,
               let val = sec[key] as? TOMLInt else { return nil }
-        return Int(val)
+        return val.int
     }
 
     /// Safely read a bool from a TOML table.

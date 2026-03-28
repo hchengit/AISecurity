@@ -56,7 +56,8 @@ struct PathResolver: Sendable {
         configScheduledScanDirs: [String]? = nil,
         configProtectedPaths: [String]? = nil
     ) {
-        self.home = FileManager.default.homeDirectoryForCurrentUser.path
+        let home = FileManager.default.homeDirectoryForCurrentUser.path
+        self.home = home
 
         // Helper: resolve ~ in a path, then check env override
         func resolve(_ path: String) -> String {
