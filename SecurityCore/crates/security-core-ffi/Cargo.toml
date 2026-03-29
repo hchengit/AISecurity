@@ -1,0 +1,15 @@
+[package]
+name = "security-core-ffi"
+version = "0.1.0"
+edition = "2021"
+description = "C ABI FFI layer for security-core"
+
+[lib]
+crate-type = ["staticlib", "cdylib"]
+
+[dependencies]
+security-core = { path = "../security-core" }
+serde_json = "1"
+
+[build-dependencies]
+cbindgen = "0.27"

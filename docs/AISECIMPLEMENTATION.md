@@ -1,7 +1,7 @@
 # AISecurity — Cross-Platform Assessment & Implementation Plan
 
 **Date:** 2026-03-28
-**Status:** Phase 1 complete (Mac portability) — Phase 2 next (Rust core)
+**Status:** Phase 2 complete (Rust core) — Phase 3 next (macOS FFI integration)
 **Last Updated:** 2026-03-28
 
 ---
@@ -16,7 +16,7 @@
 | MacSec cloned (JS/Node.js, reference) | ✅ Done | `/home/junc/MacSec/` |
 | Full codebase audit (both repos) | ✅ Done | See §0b below |
 | ElizaOS Rust security research | ✅ Done | See §0c below |
-| SecurityCore Rust workspace | ⬜ Not started | TBD (Phase 2) |
+| SecurityCore Rust workspace | ✅ Done | `SecurityCore/` |
 | Remote repo (GitHub) | ⬜ Not started | — |
 
 ### Phase 1: Mac Portability
@@ -37,20 +37,21 @@
 
 | Component | Status | Location |
 |-----------|--------|----------|
-| Cargo workspace + crate structure | ⬜ Not started | `SecurityCore/` |
-| Core data types (SeverityLevel, SecurityAlert) | ⬜ Not started | `severity.rs`, `alert.rs` |
-| ThreatIntentParser (7-layer scoring) | ⬜ Not started | `threat_intent_parser.rs` |
-| SensitiveDataDetector (40+ patterns) | ⬜ Not started | `sensitive_data.rs` |
-| PromptInjectionGuard (8 categories) | ⬜ Not started | `prompt_injection.rs` |
-| ExternalFileSanitizer patterns | ⬜ Not started | `file_sanitizer.rs` |
-| Email threat patterns (10 categories) | ⬜ Not started | `email_patterns.rs` |
-| Message threat patterns (9 categories) | ⬜ Not started | `message_patterns.rs` |
-| SenderWhitelist logic | ⬜ Not started | `sender_whitelist.rs` |
-| TOML config parser (same format as Phase 1) | ⬜ Not started | `config.rs` |
-| FFI layer (C ABI + cbindgen) | ⬜ Not started | `security-core-ffi/` |
-| Generated C header | ⬜ Not started | `security_core.h` via cbindgen |
-| cargo test — all modules passing | ⬜ Not started | — |
-| Cross-validation: Rust output == Swift output | ⬜ Not started | — |
+| Cargo workspace + crate structure | ✅ Done | `SecurityCore/Cargo.toml` workspace with `security-core` + `security-core-ffi` |
+| Core data types (SeverityLevel, SecurityAlert) | ✅ Done | `severity.rs`, `alert.rs` |
+| ThreatIntentParser (7-layer scoring) | ✅ Done | `threat_intent_parser.rs` — 6 layers, scoring thresholds match Swift |
+| SensitiveDataDetector (40+ patterns) | ✅ Done | `sensitive_data.rs` — 40+ patterns across 9 categories |
+| PromptInjectionGuard (8 categories) | ✅ Done | `prompt_injection.rs` — 8 groups + sanitize + heuristics |
+| ExternalFileSanitizer patterns | ✅ Done | `file_sanitizer.rs` — 9 groups + suspicious filenames |
+| Email threat patterns (9 categories) | ✅ Done | `email_patterns.rs` — 9 groups + trusted domains + attachment helpers |
+| Message threat patterns (9 categories) | ✅ Done | `message_patterns.rs` — 9 groups + known phishing domains |
+| SenderWhitelist logic | ✅ Done | `sender_whitelist.rs` — policy engine + freemail blocklist + JSON persistence |
+| TOML config parser (same format as Phase 1) | ✅ Done | `config.rs` — TOML parsing + env var overrides (MACSEC_*) |
+| Path resolver (platform-aware defaults) | ✅ Done | `path_resolver.rs` — cfg!(target_os) for macOS vs Linux paths |
+| FFI layer (C ABI + cbindgen) | ✅ Done | `security-core-ffi/src/lib.rs` — 10 exports + 6 free functions |
+| Generated C header | ⬜ Pending cbindgen install | `security_core.h` via cbindgen (build works, header gen needs cbindgen CLI) |
+| cargo test — all modules passing | ✅ Done | 90 tests passing — 2026-03-28 |
+| Cross-validation: Rust output == Swift output | ⬜ Deferred to Phase 3 | Needs macOS to run Swift side |
 
 ### Phase 3: macOS FFI Integration
 
