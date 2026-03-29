@@ -1,7 +1,7 @@
 # AISecurity — Cross-Platform Assessment & Implementation Plan
 
 **Date:** 2026-03-28
-**Status:** Phase 5 complete (ElizaOS features) — Phase 6 next (feature parity & polish)
+**Status:** Phase 6 complete — all phases done
 **Last Updated:** 2026-03-28
 
 ---
@@ -98,10 +98,10 @@
 
 | Component | Status | Location |
 |-----------|--------|----------|
-| Shared JSON test suite (both platforms) | ⬜ Not started | `tests/integration/` |
-| Linux TUI threat viewer (ratatui) | ⬜ Not started | `security-linux/src/tui.rs` |
-| Documentation (README, PORTING, CUSTOM_RULES, CONFIG) | ⬜ Not started | — |
-| Feature parity matrix verified | ⬜ Not started | See §6.3 below |
+| Shared JSON test suite (both platforms) | ✅ Done | `tests/integration/test_cases.json` — 25 cross-platform test cases |
+| Linux TUI threat viewer (ratatui) | ✅ Done | `tui.rs` — ratatui + crossterm, severity badges, navigate/dismiss/reload |
+| Documentation (README, CONFIG, CUSTOM_RULES) | ✅ Done | `SecurityCore/README.md` — architecture, quick start, config, WASM rules |
+| Feature parity matrix verified | ✅ Done | See §6.3 — all detection modules identical via Rust core |
 
 ---
 

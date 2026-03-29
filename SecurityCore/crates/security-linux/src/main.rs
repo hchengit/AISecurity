@@ -4,6 +4,7 @@ mod file_watcher;
 mod logger;
 mod message_scanner;
 mod notifications;
+mod tui;
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -12,6 +13,20 @@ use std::thread;
 use security_core::config::SecurityConfig;
 
 fn main() {
+    // Check for --tui flag before anything else
+    let args: Vec<String> = std::env::args().collect();
+    if args.iter().any(|a| a == "--tui") {
+        let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
+        let config_path = format!("{}/.mac-security/config.toml", home);
+        let config = SecurityConfig::load_or_default(&config_path);
+        let alerts_path = format!("{}/alerts.log", config.paths.log_dir);
+        if let Err(e) = tui::run(&alerts_path) {
+            eprintln!("TUI error: {}", e);
+            std::process::exit(1);
+        }
+        return;
+    }
+
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
         .format_timestamp_secs()
         .init();
