@@ -1,7 +1,7 @@
 # AISecurity — Cross-Platform Assessment & Implementation Plan
 
 **Date:** 2026-03-28
-**Status:** Phase 3 in progress (macOS FFI integration) — all 6 modules migrated to Rust FFI
+**Status:** Phase 4 complete (Linux daemon) — Phase 5 next (ElizaOS features)
 **Last Updated:** 2026-03-28
 
 ---
@@ -73,16 +73,16 @@
 
 | Component | Status | Location |
 |-----------|--------|----------|
-| Linux daemon crate | ⬜ Not started | `crates/security-linux/` |
-| File watcher (inotify) | ⬜ Not started | `file_watcher_linux.rs` |
-| Email scanner (Thunderbird mbox/maildir) | ⬜ Not started | `email_scanner_linux.rs` |
-| Messages scanner (Signal Desktop SQLite) | ⬜ Not started | `message_scanner_linux.rs` |
-| Clipboard monitor (arboard/xclip/wl-paste) | ⬜ Not started | `clipboard_linux.rs` |
-| Desktop notifications (notify-rust/D-Bus) | ⬜ Not started | `notifications_linux.rs` |
-| System tray (ksni) | ⬜ Not started | `tray.rs` |
-| systemd user service | ⬜ Not started | `deploy/linux/security-core.service` |
-| Linux install script | ⬜ Not started | `deploy/linux/install.sh` |
-| Verification: Ubuntu 22.04+ / Fedora 38+ | ⬜ Not started | �� |
+| Linux daemon crate | ✅ Done | `crates/security-linux/` — binary + 6 modules |
+| File watcher (inotify) | ✅ Done | `file_watcher.rs` — inotify on Downloads/Desktop/Documents + SHA256 cache |
+| Email scanner (Thunderbird mbox/maildir) | ✅ Done | `email_scanner.rs` — mbox parser + mailparse + intent scoring |
+| Messages scanner (Signal Desktop SQLite) | ✅ Done | `message_scanner.rs` — rusqlite polling + intent scoring |
+| Clipboard monitor (arboard) | ✅ Done | `clipboard.rs` — 2s polling, sensitive data + prompt injection |
+| Desktop notifications (notify-rust/D-Bus) | ✅ Done | `notifications.rs` — D-Bus notifications with urgency levels |
+| System tray (ksni) | ⬜ Deferred to Phase 6 | Needs GTK/icon assets |
+| systemd user service | ✅ Done | `deploy/linux/security-core.service` — sandboxed, auto-restart |
+| Linux install script | ✅ Done | `deploy/linux/install.sh` — build, install, config, systemd enable |
+| Verification: file watcher test | ✅ Done | Reverse shell in ~/Downloads → CRITICAL alert — 2026-03-28 |
 
 ### Phase 5: ElizaOS-Inspired Features
 

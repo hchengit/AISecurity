@@ -1,0 +1,21 @@
+[Unit]
+Description=SecurityCore Security Daemon
+Documentation=https://github.com/hchengit/AISecurity
+After=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/security-core-linux
+Restart=on-failure
+RestartSec=5
+Environment=MACSEC_MODE=PRODUCTION
+Environment=RUST_LOG=info
+
+# Sandboxing
+NoNewPrivileges=true
+ProtectHome=read-only
+ProtectSystem=strict
+ReadWritePaths=%h/.mac-security
+
+[Install]
+WantedBy=default.target
