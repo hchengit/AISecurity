@@ -55,6 +55,10 @@ AISecurity.app/
 *.keychain
 *.keychain-db
 
+# Rust build artifacts
+SecurityCore/target/
+CSecurityCore/lib/
+
 # Claude Code
 .claude/
 

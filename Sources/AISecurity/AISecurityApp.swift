@@ -39,6 +39,9 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         }
         statusItem.isVisible = true
 
+        // Warm up Rust security-core lazy statics
+        SecurityCoreBridge.initialize()
+
         // Start daemon
         daemon = SecurityDaemon()
         daemon!.onStateChange = { [weak self] in

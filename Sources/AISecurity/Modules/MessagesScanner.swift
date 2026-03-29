@@ -2,7 +2,8 @@ import Foundation
 import SQLite3
 
 /// Apple Messages / iMessage scanner — queries ~/Library/Messages/chat.db via sqlite3.
-/// Replaces modules/messages-scanner.js — all patterns and logic ported 1:1.
+/// Pattern matching now backed by Rust security-core via FFI.
+/// SQLite access, timer, state persistence, and whitelist logic stay in Swift.
 final class MessagesScanner: @unchecked Sendable {
 
     typealias AlertHandler = @Sendable (SecurityAlert) -> Void
@@ -28,18 +29,6 @@ final class MessagesScanner: @unchecked Sendable {
         (config.securityDir as NSString).appendingPathComponent("messages-last-scan.json")
     }
 
-    // MARK: - Threat Patterns
-
-    private struct PatternGroup {
-        let patterns: [NSRegularExpression]
-        let label: String
-        let severity: SeverityLevel
-        let category: String
-    }
-
-    private let threatPatterns: [(String, PatternGroup)]
-    private let knownPhishingDomains: [String]
-
     // MARK: - Init
 
     init(logger: SecurityLogger, whitelist: SenderWhitelist? = nil, scanIntervalMs: Int = 60000, autoDeleteCritical: Bool = false) {
@@ -48,109 +37,6 @@ final class MessagesScanner: @unchecked Sendable {
         self.scanInterval = Double(scanIntervalMs) / 1000.0
         self.autoDeleteCritical = autoDeleteCritical
         self.lastSeenRowId = 0
-
-        func compile(_ pats: [String]) -> [NSRegularExpression] {
-            pats.compactMap { try? NSRegularExpression(pattern: $0, options: .caseInsensitive) }
-        }
-
-        var groups: [(String, PatternGroup)] = []
-
-        groups.append(("smishingBank", PatternGroup(
-            patterns: compile([
-                #"your\s+(?:bank\s+)?account\s+(?:has\s+been\s+)?(?:suspended|locked|flagged|compromised)"#,
-                #"unusual\s+(?:activity|transaction|login)\s+(?:detected|noticed)\s+on\s+your\s+account"#,
-                #"verify\s+your\s+(?:bank|account|card|identity)\s+(?:now|immediately|urgently)"#,
-                #"(?:chase|wells\s+fargo|bank\s+of\s+america|citibank|us\s+bank|capital\s+one)\s+(?:alert|notice|security)"#,
-                #"your\s+(?:debit|credit)\s+card\s+(?:has\s+been\s+)?(?:suspended|blocked|frozen)"#,
-            ]),
-            label: "Bank / Financial Smishing", severity: .critical, category: "smishing_bank"
-        )))
-
-        groups.append(("smishingApple", PatternGroup(
-            patterns: compile([
-                #"(?:apple|icloud|apple\s+id)\s+(?:account\s+)?(?:suspended|locked|compromised|disabled)"#,
-                #"your\s+apple\s+id\s+(?:has\s+been\s+)?(?:used|signed\s+in|accessed)\s+(?:in|from)\s+"#,
-                #"appleid\.apple\.com(?!\.apple\.com)"#,
-                #"verify\s+your\s+apple\s+(?:id|account|payment)"#,
-            ]),
-            label: "Apple ID / iCloud Smishing", severity: .critical, category: "smishing_apple"
-        )))
-
-        groups.append(("smishingDelivery", PatternGroup(
-            patterns: compile([
-                #"(?:fedex|ups|usps|dhl|amazon)\s+(?:package|delivery|shipment)\s+(?:held|failed|pending|delayed)"#,
-                #"your\s+(?:package|parcel|delivery)\s+(?:could\s+not\s+be\s+delivered|is\s+pending|requires\s+action)"#,
-                #"(?:reschedule|confirm|update)\s+your\s+(?:delivery|shipment|package)\s+(?:address|info)"#,
-            ]),
-            label: "Fake Delivery / Shipping Smishing", severity: .high, category: "smishing_delivery"
-        )))
-
-        groups.append(("smishingIRS", PatternGroup(
-            patterns: compile([
-                #"(?:irs|internal\s+revenue)\s+(?:notice|alert|warning|action\s+required)"#,
-                #"tax\s+(?:refund|return|penalty|audit)\s+(?:pending|held|notice)"#,
-                #"(?:social\s+security|ssa|medicare)\s+(?:number\s+)?(?:suspended|compromised|flagged)"#,
-                #"warrant\s+(?:issued|filed)\s+for\s+(?:your\s+)?(?:arrest|non[-\s]?payment)"#,
-            ]),
-            label: "Government / IRS Impersonation", severity: .critical, category: "smishing_irs"
-        )))
-
-        groups.append(("maliciousUrls", PatternGroup(
-            patterns: compile([
-                #"https?://(?:bit\.ly|tinyurl\.com|t\.co|ow\.ly|short\.io|cutt\.ly|is\.gd|rebrand\.ly)/\S+"#,
-                #"https?://\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}(?::\d+)?/\S*"#,
-                #"https?://[a-z0-9\-]+\.(?:xyz|tk|ml|ga|cf|gq|pw|top|click|loan|win|date|party|review|work)/\S*"#,
-                #"https?://\S+\.(?:dmg|exe|sh|apk|pkg|msi|bat|ps1)\b"#,
-                #"https?://[a-z0-9]*(?:paypa1|arnazon|g00gle|micros0ft|app1e|app1e-id|icloud-verify|apple-security)[a-z0-9]*\."#,
-            ]),
-            label: "Malicious / Suspicious URL in Message", severity: .critical, category: "malicious_url"
-        )))
-
-        groups.append(("cryptoScam", PatternGroup(
-            patterns: compile([
-                #"(?:send|transfer|pay)\s+(?:bitcoin|btc|ethereum|eth|usdt|crypto)\s+(?:to|worth|\$)"#,
-                #"(?:i\s+have\s+)?(?:hacked|compromised|recorded)\s+your\s+(?:phone|device|computer|camera)"#,
-                #"pay\s+(?:\$[\d,]+|[\d,]+\s+(?:btc|usd))\s+(?:or|within|to\s+prevent)"#,
-                #"(?:investment|trading)\s+(?:opportunity|platform|returns?)\s+(?:guaranteed|risk[-\s]free)"#,
-                #"double\s+your\s+(?:bitcoin|crypto|money|investment)\s+in\s+"#,
-            ]),
-            label: "Crypto Scam / Sextortion in Message", severity: .critical, category: "crypto_scam"
-        )))
-
-        groups.append(("otpTheft", PatternGroup(
-            patterns: compile([
-                #"(?:share|send|provide|give|type|enter|read\s+out)\s+(?:your\s+)?(?:otp|one[-\s]time\s+(?:password|code)|verification\s+code)\s+(?:to|with)\s+(?:us|our|an?\s+agent|support)"#,
-                #"(?:never\s+share|do\s+not\s+share|don'?t\s+share)\s+(?:your\s+)?(?:otp|code|pin)\s+with\s+(?:anyone|our\s+(?:team|agent|staff))"#,
-                #"our\s+(?:agent|representative|support|team)\s+(?:will\s+)?(?:ask|never\s+ask)\s+(?:you\s+)?for\s+(?:your\s+)?(?:otp|code|pin|password)"#,
-            ]),
-            label: "OTP / Verification Code Theft Attempt", severity: .high, category: "otp_theft"
-        )))
-
-        groups.append(("prizeScam", PatternGroup(
-            patterns: compile([
-                #"(?:congratulations|you\s+(?:have\s+)?won|you've\s+been\s+selected)\s+(?:a\s+)?(?:prize|reward|gift\s+card|cash)"#,
-                #"claim\s+your\s+(?:free\s+)?(?:prize|reward|gift|iphone|macbook|cash)\s+(?:now|today|here)"#,
-                #"(?:winner|selected|chosen)\s+(?:for|to\s+receive)\s+(?:a\s+)?(?:\$[\d,]+|gift|prize)"#,
-            ]),
-            label: "Prize / Lottery Scam", severity: .high, category: "prize_scam"
-        )))
-
-        groups.append(("urgencyTactics", PatternGroup(
-            patterns: compile([
-                #"(?:act|respond|reply|click)\s+(?:now|immediately|within\s+\d+\s+hours?)\s+(?:or|to\s+avoid)"#,
-                #"(?:final|last|urgent)\s+(?:warning|notice|reminder|chance)\s+(?:before|to)"#,
-                #"your\s+(?:account|service|number|line)\s+will\s+be\s+(?:terminated|cancelled|suspended)\s+(?:in\s+\d+|unless)"#,
-            ]),
-            label: "Urgency / Fear Tactic", severity: .medium, category: "urgency_tactic"
-        )))
-
-        self.threatPatterns = groups
-
-        self.knownPhishingDomains = [
-            "apple-id-verify", "icloud-locked", "account-verify", "secure-login",
-            "apple-support-", "chase-secure", "paypal-secure", "amazon-security",
-            "irs-refund", "usps-tracking-", "fedex-delivery-", "ups-alert-"
-        ]
 
         // Load saved state
         self.lastSeenRowId = Self.loadLastSeenRowId(from: stateFilePath)
@@ -266,7 +152,7 @@ final class MessagesScanner: @unchecked Sendable {
         }
     }
 
-    // MARK: - Fetch Messages via SQLite C API (runs in-process, inherits FDA)
+    // MARK: - Fetch Messages via SQLite C API (stays in Swift — inherits FDA)
 
     private func fetchNewMessages() throws -> [[String: Any]] {
         var db: OpaquePointer?
@@ -317,32 +203,13 @@ final class MessagesScanner: @unchecked Sendable {
         return results
     }
 
-    // MARK: - Analyze
+    // MARK: - Analyze (delegates to Rust FFI)
 
     private func analyzeMessage(_ text: String) -> [(type: String, label: String, severity: SeverityLevel, category: String)] {
-        var threats: [(type: String, label: String, severity: SeverityLevel, category: String)] = []
-        let nsText = text as NSString
-        let range = NSRange(location: 0, length: nsText.length)
-
-        for (key, group) in threatPatterns {
-            for pattern in group.patterns {
-                if pattern.firstMatch(in: text, range: range) != nil {
-                    threats.append((type: key, label: group.label, severity: group.severity, category: group.category))
-                    break
-                }
-            }
+        let rustThreats = SecurityCoreBridge.analyzeMessage(text)
+        return rustThreats.map { t in
+            (type: t.type, label: t.label, severity: t.severity, category: t.category)
         }
-
-        let lower = text.lowercased()
-        for domain in knownPhishingDomains {
-            if lower.contains(domain) {
-                threats.append((type: "known_phishing_domain", label: "Known phishing domain: \(domain)",
-                                severity: .critical, category: "malicious_url"))
-                break
-            }
-        }
-
-        return threats
     }
 
     // MARK: - State Persistence

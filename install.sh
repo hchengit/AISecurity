@@ -76,9 +76,13 @@ else
     success "Config: $CONFIG_FILE (existing, not overwritten)"
 fi
 
-# Build
-log "Building AISecurity (Release)..."
+# Build Rust security-core static library
+log "Building Rust security-core (Release)..."
 cd "$SCRIPT_DIR"
+bash build-rust.sh release 2>&1 | tail -5
+
+# Build Swift app
+log "Building AISecurity (Release)..."
 swift build -c release 2>&1 | tail -5
 BUILD_PATH="$SCRIPT_DIR/.build/release/AISecurity"
 [ -f "$BUILD_PATH" ] || error "Build failed — binary not found at $BUILD_PATH"

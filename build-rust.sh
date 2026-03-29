@@ -1,0 +1,30 @@
+#!/usr/bin/env bash
+# Build the Rust SecurityCore static library and copy artifacts to CSecurityCore/
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+RUST_DIR="$SCRIPT_DIR/SecurityCore"
+OUT_DIR="$SCRIPT_DIR/CSecurityCore"
+
+PROFILE="${1:-release}"
+if [ "$PROFILE" = "debug" ]; then
+    CARGO_FLAG=""
+    TARGET_DIR="$RUST_DIR/target/debug"
+else
+    CARGO_FLAG="--release"
+    TARGET_DIR="$RUST_DIR/target/release"
+fi
+
+echo "==> Building SecurityCore ($PROFILE)..."
+export PATH="$HOME/.cargo/bin:$PATH"
+(cd "$RUST_DIR" && cargo build $CARGO_FLAG -p security-core-ffi)
+
+echo "==> Generating C header..."
+(cd "$RUST_DIR" && cbindgen --crate security-core-ffi --output "$OUT_DIR/include/security_core.h")
+
+echo "==> Copying static library..."
+cp "$TARGET_DIR/libsecurity_core_ffi.a" "$OUT_DIR/lib/"
+
+echo "==> Done."
+echo "    Header:  $OUT_DIR/include/security_core.h"
+echo "    Library:  $OUT_DIR/lib/libsecurity_core_ffi.a"

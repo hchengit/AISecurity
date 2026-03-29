@@ -1,0 +1,5 @@
+module CSecurityCore {
+    header "include/security_core.h"
+    link "security_core_ffi"
+    export *
+}

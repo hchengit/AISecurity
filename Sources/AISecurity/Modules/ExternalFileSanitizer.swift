@@ -2,7 +2,7 @@ import Foundation
 import CryptoKit
 
 /// Scans files from external sources for malicious code, prompt injection, and sensitive data.
-/// Replaces modules/external-file-sanitizer.js — all patterns ported 1:1.
+/// Pattern matching now backed by Rust security-core via FFI. File I/O stays in Swift.
 final class ExternalFileSanitizer: @unchecked Sendable {
 
     // MARK: - Types
@@ -37,17 +37,9 @@ final class ExternalFileSanitizer: @unchecked Sendable {
         let error: String?
     }
 
-    private struct PatternGroup {
-        let patterns: [NSRegularExpression]
-        let label: String
-        let severity: SeverityLevel
-        let category: String
-    }
-
     // MARK: - Properties
 
     private let logger: SecurityLogger
-    private let maliciousPatterns: [(String, PatternGroup)]
     private let suspiciousFilenamePatterns: [NSRegularExpression]
     private var scannedCache: [String: String] = [:] // path → hash
     private let lock = NSLock()
@@ -59,113 +51,6 @@ final class ExternalFileSanitizer: @unchecked Sendable {
 
     init(logger: SecurityLogger) {
         self.logger = logger
-
-        func compile(_ pats: [String], _ opts: NSRegularExpression.Options = .caseInsensitive) -> [NSRegularExpression] {
-            pats.compactMap { try? NSRegularExpression(pattern: $0, options: opts) }
-        }
-
-        var groups: [(String, PatternGroup)] = []
-
-        groups.append(("reverseShell", PatternGroup(
-            patterns: compile([
-                #"\bbash\s+-i\s+>&?\s*/dev/tcp/"#,
-                #"\bnc\s+-e\s+/bin/(?:bash|sh)"#,
-                #"\bpython\d*\s+-c\s+["']import socket"#,
-                #"\bsocat\s+.*exec:"#,
-                #"mkfifo\s+/tmp/[a-z]+\s*;\s*nc"#,
-            ]),
-            label: "Reverse Shell Payload", severity: .critical, category: "malicious_code"
-        )))
-
-        groups.append(("shellBombs", PatternGroup(
-            patterns: compile([
-                #":\(\)\s*\{\s*:\|:\s*&\s*\}\s*;"#,
-                #"rm\s+-rf\s+/(?:\s|$|\*)"#,
-                #"chmod\s+-R\s+777\s+/"#,
-                #"dd\s+if=/dev/zero\s+of=/dev/"#,
-            ], []),
-            label: "Destructive Shell Command", severity: .critical, category: "malicious_code"
-        )))
-
-        groups.append(("codeExecution", PatternGroup(
-            patterns: compile([
-                #"\beval\s*\(\s*(?:base64_decode|gzinflate|str_rot13)"#,
-                #"\beval\s*\(\s*atob\s*\("#,
-                #"new\s+Function\s*\(\s*atob\s*\("#,
-                #"exec\s*\(\s*['"`].*(?:wget|curl|nc|ncat)"#,
-                #"os\.system\s*\(\s*['"`].*(?:wget|curl|nc)"#,
-                #"\bpowershell\b.*-[Ee]nc(?:oded)?[Cc]ommand\b"#,
-                #"\bIEX\s*\((?:New-Object\s+)?Net\.WebClient\)"#,
-            ]),
-            label: "Remote Code Execution Pattern", severity: .critical, category: "malicious_code"
-        )))
-
-        groups.append(("downloadAndExecute", PatternGroup(
-            patterns: compile([
-                #"curl\s+.*\|\s*(?:bash|sh|python|ruby|perl)"#,
-                #"wget\s+.*-O\s*-\s*\|\s*(?:bash|sh)"#,
-                #"fetch\s+.*\|\s*sh"#,
-            ]),
-            label: "Download-and-Execute Pattern", severity: .critical, category: "malicious_code"
-        )))
-
-        groups.append(("dataExfiltration", PatternGroup(
-            patterns: compile([
-                #"curl\s+.*-d\s+.*(?:\$HOME|~/\.ssh|keychain|wallet|sparrow|photos)"#,
-                #"wget\s+.*--post-data.*(?:passwd|shadow|\.env|\.ssh)"#,
-                #"(?:cat|cp|tar)\s+.*\.ssh.*\|\s*(?:curl|wget|nc)"#,
-                #"find\s+.*(?:\.wallet|photoslibrary)\s+.*-exec\s+(?:curl|wget)"#,
-                #"(?:cp|rsync|scp)\s+.*Photos Library.*(?:curl|wget|nc|sftp)"#,
-            ]),
-            label: "Data Exfiltration Attempt", severity: .critical, category: "exfiltration"
-        )))
-
-        groups.append(("cryptomining", PatternGroup(
-            patterns: compile([
-                #"\bxmrig\b"#,
-                #"\bstratum\+tcp://"#,
-                #"cryptonight"#,
-            ]),
-            label: "Cryptomining Code", severity: .high, category: "malicious_code"
-        )))
-
-        groups.append(("obfuscation", PatternGroup(
-            patterns: compile([
-                #"\\x[0-9a-f]{2}(?:\\x[0-9a-f]{2}){10,}"#,
-                #"chr\s*\(\s*\d+\s*\)\s*\.\s*chr\s*\(\s*\d+"#,
-                #"String\.fromCharCode\s*\(\s*\d+(?:\s*,\s*\d+){10,}\)"#,
-            ]),
-            label: "Obfuscated Code / Payload", severity: .high, category: "obfuscation"
-        )))
-
-        groups.append(("promptInjection", PatternGroup(
-            patterns: compile([
-                #"ignore\s+(previous|all|prior)\s+instructions?"#,
-                #"forget\s+(your|all|previous)\s+instructions?"#,
-                #"you\s+are\s+now\s+(a|an)\s+"#,
-                #"new\s+system\s+prompt\s*:"#,
-                #"override\s+(your|all|prior)\s+(rules?|instructions?)"#,
-                #"jailbreak"#,
-                #"reveal\s+(your|the)\s+(prompt|instructions?|system)"#,
-            ]),
-            label: "Prompt Injection Payload", severity: .high, category: "prompt_injection"
-        )))
-
-        groups.append(("macOSSpecific", PatternGroup(
-            patterns: compile([
-                #"osascript\s+-e\s+["']tell\s+application"#,
-                #"launchctl\s+submit\s+-l"#,
-                #"security\s+find-generic-password"#,
-                #"security\s+add-generic-password"#,
-                #"\bdscl\s+\.\s+-create\s+/Users\b"#,
-                #"csrutil\s+disable"#,
-                #"osascript.*Photos.*export"#,
-                #"sqlite3.*Photos.*ZGENERICASSET"#,
-            ]),
-            label: "macOS-Specific Attack", severity: .critical, category: "malicious_code"
-        )))
-
-        self.maliciousPatterns = groups
 
         self.suspiciousFilenamePatterns = [
             #"\.sh\.download$"#,
@@ -225,26 +110,20 @@ final class ExternalFileSanitizer: @unchecked Sendable {
             }
         }
 
-        // Scan text content
+        // Scan text content via Rust FFI
         if let text = String(data: data, encoding: .utf8) {
-            let nsText = text as NSString
-            let range = NSRange(location: 0, length: nsText.length)
+            let rustThreats = SecurityCoreBridge.scanFileContent(text)
 
-            for (key, group) in maliciousPatterns {
-                for pattern in group.patterns {
-                    if pattern.firstMatch(in: text, range: range) != nil {
-                        result.safe = false
-                        result.threats.append(.init(
-                            type: key, label: group.label,
-                            severity: group.severity, category: group.category
-                        ))
-                        lock.lock()
-                        threatsDetected += 1
-                        byCategory[group.category, default: 0] += 1
-                        lock.unlock()
-                        break
-                    }
-                }
+            for t in rustThreats {
+                result.safe = false
+                result.threats.append(.init(
+                    type: t.type, label: t.label,
+                    severity: t.severity, category: t.category
+                ))
+                lock.lock()
+                threatsDetected += 1
+                byCategory[t.category, default: 0] += 1
+                lock.unlock()
             }
         }
 

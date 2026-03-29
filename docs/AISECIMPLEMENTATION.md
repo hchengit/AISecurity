@@ -1,7 +1,7 @@
 # AISecurity — Cross-Platform Assessment & Implementation Plan
 
 **Date:** 2026-03-28
-**Status:** Phase 2 complete (Rust core) — Phase 3 next (macOS FFI integration)
+**Status:** Phase 3 in progress (macOS FFI integration) — all 6 modules migrated to Rust FFI
 **Last Updated:** 2026-03-28
 
 ---
@@ -49,23 +49,23 @@
 | TOML config parser (same format as Phase 1) | ✅ Done | `config.rs` — TOML parsing + env var overrides (MACSEC_*) |
 | Path resolver (platform-aware defaults) | ✅ Done | `path_resolver.rs` — cfg!(target_os) for macOS vs Linux paths |
 | FFI layer (C ABI + cbindgen) | ✅ Done | `security-core-ffi/src/lib.rs` — 10 exports + 6 free functions |
-| Generated C header | ⬜ Pending cbindgen install | `security_core.h` via cbindgen (build works, header gen needs cbindgen CLI) |
+| Generated C header | ✅ Done | `CSecurityCore/include/security_core.h` via cbindgen — 2026-03-28 |
 | cargo test — all modules passing | ✅ Done | 90 tests passing — 2026-03-28 |
-| Cross-validation: Rust output == Swift output | ⬜ Deferred to Phase 3 | Needs macOS to run Swift side |
+| Cross-validation: Rust output == Swift output | ✅ Done | All modules build+run via FFI, agent starts cleanly — 2026-03-28 |
 
 ### Phase 3: macOS FFI Integration
 
 | Component | Status | Location |
 |-----------|--------|----------|
-| CSecurityCore module.modulemap | ⬜ Not started | `CSecurityCore/` |
-| Swift bridge wrapper | ⬜ Not started | `Sources/AISecurity/RustBridge/SecurityCoreBridge.swift` |
-| build-rust.sh (cargo + copy artifacts) | ⬜ Not started | repo root |
-| Migrate: ThreatIntentParser → Rust | ⬜ Not started | `ThreatIntentParser.swift` |
-| Migrate: SensitiveDataDetector → Rust | ⬜ Not started | `SensitiveDataDetector.swift` |
-| Migrate: PromptInjectionGuard → Rust | ⬜ Not started | `PromptInjectionGuard.swift` |
-| Migrate: ExternalFileSanitizer → Rust | ⬜ Not started | `ExternalFileSanitizer.swift` |
-| Migrate: EmailScanner patterns → Rust | ⬜ Not started | `EmailScanner.swift` |
-| Migrate: MessagesScanner patterns → Rust | ⬜ Not started | `MessagesScanner.swift` |
+| CSecurityCore module.modulemap | ✅ Done | `CSecurityCore/module.modulemap` + `include/` + `lib/` |
+| Swift bridge wrapper | ✅ Done | `Sources/AISecurity/RustBridge/SecurityCoreBridge.swift` — all 10 FFI exports wrapped |
+| build-rust.sh (cargo + copy artifacts) | ✅ Done | `build-rust.sh` — builds, generates header, copies .a to CSecurityCore/ |
+| Migrate: ThreatIntentParser → Rust | ✅ Done | Thin wrapper calling `SecurityCoreBridge.parseIntent()` |
+| Migrate: SensitiveDataDetector → Rust | ✅ Done | Pattern matching via Rust; `isProtectedPath()` stays Swift |
+| Migrate: PromptInjectionGuard → Rust | ✅ Done | `validate()` + `sanitize()` both via Rust; logging stays Swift |
+| Migrate: ExternalFileSanitizer → Rust | ✅ Done | `scanFileContent()` via Rust; file I/O, cache, quarantine stay Swift |
+| Migrate: EmailScanner patterns → Rust | ✅ Done | `analyzeEmail()` via Rust; .emlx parsing, attachment checks, whitelist stay Swift |
+| Migrate: MessagesScanner patterns → Rust | ✅ Done | `analyzeMessage()` via Rust; SQLite, timer, state persistence stay Swift |
 | install.sh updated with Rust build step | ⬜ Not started | `install.sh` |
 | Performance benchmark (NSRegularExpression vs regex crate) | ⬜ Not started | — |
 

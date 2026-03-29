@@ -1,7 +1,8 @@
 import Foundation
 
 /// Apple Mail email scanner — monitors ~/Library/Mail/ for new .emlx files.
-/// Replaces modules/email-scanner.js — all patterns and logic ported 1:1.
+/// Pattern matching now backed by Rust security-core via FFI.
+/// .emlx parsing, file watching, attachment checks, and whitelist logic stay in Swift.
 final class EmailScanner: @unchecked Sendable {
 
     typealias AlertHandler = @Sendable (SecurityAlert) -> Void
@@ -22,16 +23,8 @@ final class EmailScanner: @unchecked Sendable {
     private(set) var byCategory: [String: Int] = [:]
     var onAlert: AlertHandler?
 
-    // MARK: - Threat Pattern Groups
+    // MARK: - Attachment checks (stay in Swift — operate on parsed email structure)
 
-    private struct PatternGroup {
-        let patterns: [NSRegularExpression]
-        let label: String
-        let severity: SeverityLevel
-        let category: String
-    }
-
-    private let threatPatterns: [(String, PatternGroup)]
     private let dangerousExtensions: Set<String>
     private let suspiciousAttachmentNames: [NSRegularExpression]
 
@@ -68,126 +61,6 @@ final class EmailScanner: @unchecked Sendable {
            let dict = try? JSONDecoder().decode([String: TimeInterval].self, from: data) {
             self.scannedFiles = dict
         }
-
-        func compile(_ pats: [String]) -> [NSRegularExpression] {
-            pats.compactMap { try? NSRegularExpression(pattern: $0, options: .caseInsensitive) }
-        }
-
-        var groups: [(String, PatternGroup)] = []
-
-        groups.append(("phishing", PatternGroup(
-            patterns: compile([
-                #"verify\s+your\s+(account|identity|email|password|information)"#,
-                #"confirm\s+your\s+(account|identity|email|billing|payment)"#,
-                #"your\s+account\s+(has\s+been|will\s+be)\s+(suspended|locked|disabled|closed)"#,
-                #"click\s+(?:here\s+)?to\s+(?:verify|confirm|restore|unlock|update)\s+your\s+account"#,
-                #"unusual\s+(?:sign[-\s]?in|activity|login|access)\s+(?:attempt|detected)"#,
-                #"we\s+(?:noticed|detected)\s+(?:suspicious|unauthorized|unusual)\s+activity"#,
-                #"your\s+(?:password|account|access)\s+(?:expires?|will\s+expire)"#,
-                #"update\s+your\s+(?:payment|billing|credit\s+card)\s+information"#,
-                #"(?:paypal|apple|amazon|google|microsoft|irs|bank\s+of\s+america|chase|wells\s+fargo)\s+(?:security\s+)?alert"#,
-            ]),
-            label: "Phishing / Credential Harvesting", severity: .critical, category: "phishing"
-        )))
-
-        groups.append(("socialEngineering", PatternGroup(
-            patterns: compile([
-                #"(?:act|respond|reply)\s+(?:now|immediately|urgently|within\s+\d+\s+hours?)"#,
-                #"(?:final|last|urgent|immediate)\s+(?:notice|warning|reminder|action\s+required)"#,
-                #"your\s+(?:account|service|subscription)\s+(?:will\s+be\s+)?(?:terminated|cancelled|suspended)\s+(?:in\s+\d+|unless)"#,
-                #"failure\s+to\s+(?:respond|verify|update|confirm)\s+will\s+result"#,
-                #"\$\d[\d,]*\s+(?:has\s+been\s+)?(?:charged|debited|withdrawn|transferred)\s+(?:from\s+)?your"#,
-                #"you\s+(?:have\s+)?(?:won|been\s+selected|been\s+chosen)\s+(?:a\s+)?(?:prize|reward|gift|lottery)"#,
-                #"congratulations[!,]?\s+you(?:'ve|\s+have)\s+(?:won|been\s+selected)"#,
-                #"transfer\s+(?:the\s+)?(?:funds?|money|amount)\s+(?:to|into)\s+(?:your|our|the)\s+(?:account|wallet)"#,
-            ]),
-            label: "Social Engineering / Urgency Tactic", severity: .high, category: "social_engineering"
-        )))
-
-        groups.append(("authorityImpersonation", PatternGroup(
-            patterns: compile([
-                #"(?:irs|internal\s+revenue\s+service)\s+(?:is\s+)?(?:contacting|notifying|warning)\s+you"#,
-                #"(?:irs|internal\s+revenue)\s+(?:notice|case|file|action)\s+(?:number|#|no\.?)\s*[\w\-]+"#,
-                #"(?:irs|tax\s+authority).*(?:warrant|levy|lien|seizure)\s+(?:has\s+been\s+)?(?:issued|filed)"#,
-                #"(?:fbi|federal\s+bureau)\s+(?:is\s+)?(?:investigating\s+you|has\s+opened\s+a\s+case\s+against)"#,
-                #"(?:federal\s+agent|law\s+enforcement\s+officer)\s+will\s+(?:arrest|visit|contact)\s+you"#,
-                #"warrant\s+(?:has\s+been\s+)?(?:issued|filed)\s+for\s+your\s+(?:arrest|detention)"#,
-                #"(?:social\s+security|ssa)\s+(?:number|account|benefits?)\s+(?:has\s+been\s+)?(?:suspended|blocked|flagged)\s+(?:due\s+to|because|for\s+suspicious)"#,
-                #"this\s+is\s+(?:a\s+)?(?:final\s+)?(?:legal|court|judicial)\s+(?:notice|warning|order)\s+(?:against\s+you|regarding\s+your)"#,
-                #"you\s+(?:are|have\s+been)\s+(?:named|listed|identified)\s+in\s+(?:a\s+)?(?:federal|criminal|court)\s+(?:case|complaint|warrant)"#,
-            ]),
-            label: "Authority Impersonation (IRS/FBI/SSA)", severity: .high, category: "authority_impersonation"
-        )))
-
-        groups.append(("sensitiveDataRequest", PatternGroup(
-            patterns: compile([
-                #"(?:provide|send|reply\s+with|confirm)\s+your\s+(?:social\s+security|ssn|tax\s+id)"#,
-                #"(?:provide|send|enter|reply\s+with)\s+your\s+(?:credit\s+card|card\s+number|cvv|billing)"#,
-                #"(?:provide|send|reply\s+with)\s+your\s+(?:password|passphrase|pin|secret\s+(?:word|answer))"#,
-                #"(?:provide|send|share)\s+your\s+(?:private\s+key|seed\s+phrase|recovery\s+phrase|wallet)"#,
-                #"(?:provide|send|reply\s+with)\s+your\s+(?:bank\s+account|routing\s+number|account\s+number)"#,
-                #"(?:verify|confirm)\s+your\s+(?:date\s+of\s+birth|driver['\s]?s\s+licen[sc]e|passport)"#,
-            ]),
-            label: "Sensitive Data Request (SSN/CC/Password/Crypto)", severity: .critical, category: "sensitive_data_request"
-        )))
-
-        groups.append(("maliciousUrls", PatternGroup(
-            patterns: compile([
-                #"https?://(?:bit\.ly|tinyurl\.com|t\.co|ow\.ly|short\.io|rebrand\.ly|cutt\.ly|is\.gd|buff\.ly)/\S+"#,
-                #"https?://(?!(?:apple|google|microsoft|amazon|paypal|icloud|chase|bankofamerica|wellsfargo)\.com)[a-z0-9\-]+\.(?:xyz|tk|ml|ga|cf|gq|pw|top|click|download|work|party|loan|review|trade|win|date)/"#,
-                #"https?://\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}(?::\d+)?/\S*"#,
-                #"https?://[a-z0-9]*(?:paypa1|arnazon|g00gle|micros0ft|app1e|netfl1x|faceb00k)[a-z0-9]*\."#,
-                #"https?://\S+\.(?:exe|dmg|sh|bat|cmd|vbs|ps1|msi|pkg|run)\b"#,
-            ]),
-            label: "Malicious / Suspicious URL", severity: .high, category: "malicious_url"
-        )))
-
-        groups.append(("dangerousAttachments", PatternGroup(
-            patterns: compile([
-                #"Content-Disposition:.*filename.*["']?\S+\.(?:exe|dmg|sh|bash|zsh|bat|cmd|vbs|ps1|msi|pkg|run|app|jar|deb|rpm)["']?"#,
-                #"Content-Disposition:.*filename.*["']?\S+\.(?:docm|xlsm|pptm|xlam|doc|xls|ppt)["']?"#,
-                #"Content-Disposition:.*filename.*["']?(?:invoice|payment|receipt|order|statement|document|attachment)\S*\.(?:zip|rar|7z|tar|gz)["']?"#,
-                #"Content-Disposition:.*filename.*["']?\S+\.(?:js|jsx|ts|py|rb|pl|php)["']?"#,
-                #"Content-Disposition:.*filename.*["']?\S+\.(?:iso|img|dmg)["']?"#,
-            ]),
-            label: "Dangerous Email Attachment", severity: .critical, category: "dangerous_attachment"
-        )))
-
-        groups.append(("cryptoScam", PatternGroup(
-            patterns: compile([
-                #"(?:send|transfer|pay)\s+(?:bitcoin|btc|ethereum|eth|crypto|usdt)\s+(?:to|worth)"#,
-                #"bitcoin\s+(?:wallet\s+)?address\s*[:=]\s*[13][a-zA-Z0-9]{25,34}"#,
-                #"(?:i\s+have\s+)?(?:hacked|compromised|gained\s+access\s+to)\s+your\s+(?:computer|device|webcam|camera)"#,
-                #"(?:sextortion|i\s+recorded\s+you|webcam\s+footage|your\s+browsing\s+history)"#,
-                #"pay\s+(?:within\s+\d+\s+hours?|\$[\d,]+)\s+(?:or|otherwise|to\s+prevent)"#,
-            ]),
-            label: "Crypto Scam / Sextortion", severity: .high, category: "crypto_scam"
-        )))
-
-        groups.append(("promptInjection", PatternGroup(
-            patterns: compile([
-                #"ignore\s+(?:all\s+)?(?:previous|prior)\s+instructions?"#,
-                #"you\s+are\s+now\s+(?:a|an)\s+"#,
-                #"\[system\]"#,
-                #"<system>"#,
-                #"forget\s+(?:your|all)\s+(?:instructions?|training)"#,
-                #"new\s+system\s+prompt\s*:"#,
-            ]),
-            label: "Prompt Injection Payload in Email", severity: .high, category: "prompt_injection"
-        )))
-
-        groups.append(("malwareDropper", PatternGroup(
-            patterns: compile([
-                #"(?:enable\s+)?(?:macros?|content)\s+(?:to\s+)?(?:view|open|read|access)\s+(?:this\s+)?(?:document|file)"#,
-                #"click\s+(?:enable|allow)\s+(?:macros?|content|editing)"#,
-                #"download\s+(?:and\s+)?(?:install|run|execute)\s+(?:the\s+)?(?:attached|following)\s+(?:file|software|tool|updater)"#,
-                #"your\s+(?:adobe|flash|java|browser|antivirus)\s+(?:is\s+)?(?:out[-\s]?of[-\s]?date|needs?\s+(?:updating|an?\s+update))"#,
-                #"(?:install|download)\s+(?:the\s+)?(?:required|necessary)\s+(?:plugin|extension|software|viewer)"#,
-            ]),
-            label: "Malware Dropper / Macro Lure", severity: .critical, category: "malware_dropper"
-        )))
-
-        self.threatPatterns = groups
 
         self.dangerousExtensions = [
             ".exe", ".dmg", ".sh", ".bash", ".zsh", ".bat", ".cmd",
@@ -308,21 +181,14 @@ final class EmailScanner: @unchecked Sendable {
         let replyTo = email.headers["reply-to"] ?? ""
         let fullText = "\(from)\n\(subject)\n\(to)\n\(replyTo)\n\(email.body)"
 
-        // Run threat patterns
-        let nsText = fullText as NSString
-        let range = NSRange(location: 0, length: nsText.length)
-
-        for (key, group) in threatPatterns {
-            for pattern in group.patterns {
-                if pattern.firstMatch(in: fullText, range: range) != nil {
-                    threats.append((type: key, label: group.label, severity: group.severity, category: group.category))
-                    byCategory[group.category, default: 0] += 1
-                    break
-                }
-            }
+        // Run threat patterns via Rust FFI
+        let rustThreats = SecurityCoreBridge.analyzeEmail(fullText)
+        for t in rustThreats {
+            threats.append((type: t.type, label: t.label, severity: t.severity, category: t.category))
+            byCategory[t.category, default: 0] += 1
         }
 
-        // Check attachment names
+        // Check attachment names (stays in Swift — operates on parsed email structure)
         for attachName in email.attachmentNames {
             let ext = (attachName as NSString).pathExtension.lowercased()
             let dotExt = ext.isEmpty ? "" : ".\(ext)"
@@ -350,7 +216,7 @@ final class EmailScanner: @unchecked Sendable {
             }
         }
 
-        // 7-Layer Intent Validation
+        // 7-Layer Intent Validation (now via Rust through ThreatIntentParser)
         let intent = intentParser.parse(fullText, channel: .email)
         let senderDomain = extractSenderDomain(from)
         let isTrusted = senderDomain.map { sd in
@@ -374,7 +240,7 @@ final class EmailScanner: @unchecked Sendable {
             ))
         }
 
-        // Apply whitelist policy — always scan malware/URLs, suppress social engineering for trusted senders
+        // Apply whitelist policy
         let senderPolicy = whitelist.policy(for: from)
         if senderPolicy.isWhitelisted {
             confirmedThreats = confirmedThreats.filter { t in
@@ -406,7 +272,7 @@ final class EmailScanner: @unchecked Sendable {
         }
     }
 
-    // MARK: - .emlx Parser
+    // MARK: - .emlx Parser (stays in Swift — file I/O)
 
     private struct ParsedEmail {
         var headers: [String: String] = [:]
