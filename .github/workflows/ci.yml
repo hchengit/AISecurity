@@ -1,0 +1,96 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'SecurityCore/**'
+      - '.github/workflows/ci.yml'
+  pull_request:
+    branches: [main]
+    paths:
+      - 'SecurityCore/**'
+      - '.github/workflows/ci.yml'
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+
+jobs:
+  test-linux:
+    name: Test (Linux)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: SecurityCore
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install system dependencies
+        run: sudo apt-get update && sudo apt-get install -y libdbus-1-dev libsqlite3-dev pkg-config
+
+      - name: Cache cargo registry & build
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            SecurityCore/target
+          key: linux-cargo-${{ hashFiles('SecurityCore/Cargo.lock') }}
+          restore-keys: linux-cargo-
+
+      - name: Run tests
+        run: cargo test --workspace
+
+      - name: Build release
+        run: cargo build --release -p security-linux
+
+  test-macos:
+    name: Test (macOS)
+    runs-on: macos-latest
+    defaults:
+      run:
+        working-directory: SecurityCore
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Cache cargo registry & build
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            SecurityCore/target
+          key: macos-cargo-${{ hashFiles('SecurityCore/Cargo.lock') }}
+          restore-keys: macos-cargo-
+
+      - name: Run core tests
+        run: cargo test -p security-core
+
+      - name: Run integration tests
+        run: cargo test -p security-core --test cross_validation
+
+  clippy:
+    name: Clippy
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: SecurityCore
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install system dependencies
+        run: sudo apt-get update && sudo apt-get install -y libdbus-1-dev libsqlite3-dev pkg-config
+
+      - name: Cache cargo registry & build
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            SecurityCore/target
+          key: clippy-cargo-${{ hashFiles('SecurityCore/Cargo.lock') }}
+          restore-keys: clippy-cargo-
+
+      - name: Clippy
+        run: cargo clippy --workspace -- -D warnings
