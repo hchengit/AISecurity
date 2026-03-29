@@ -71,6 +71,7 @@ impl SecurityLogger {
         }
     }
 
+    #[allow(dead_code)]
     pub fn log_dir(&self) -> &str {
         self.log_dir.to_str().unwrap_or("")
     }

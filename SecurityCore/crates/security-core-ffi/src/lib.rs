@@ -2,6 +2,7 @@
 //!
 //! All functions use `#[no_mangle] pub extern "C"` for stable ABI.
 //! Callers must free returned pointers via the corresponding `sec_free_*` function.
+#![allow(clippy::not_unsafe_ptr_arg_deref)]
 
 use std::ffi::{c_char, CStr, CString};
 use std::ptr;

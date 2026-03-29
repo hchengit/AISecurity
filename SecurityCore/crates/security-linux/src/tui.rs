@@ -15,7 +15,6 @@ use std::time::Duration;
 struct App {
     alerts: Vec<SecurityAlert>,
     selected: usize,
-    scroll_offset: usize,
     should_quit: bool,
 }
 
@@ -24,7 +23,6 @@ impl App {
         Self {
             alerts,
             selected: 0,
-            scroll_offset: 0,
             should_quit: false,
         }
     }
@@ -59,11 +57,9 @@ fn load_alerts(log_path: &Path) -> Vec<SecurityAlert> {
     let reader = io::BufReader::new(file);
     let mut alerts = Vec::new();
 
-    for line in reader.lines() {
-        if let Ok(line) = line {
-            if let Ok(alert) = serde_json::from_str::<SecurityAlert>(&line) {
-                alerts.push(alert);
-            }
+    for line in reader.lines().map_while(Result::ok) {
+        if let Ok(alert) = serde_json::from_str::<SecurityAlert>(&line) {
+            alerts.push(alert);
         }
     }
 

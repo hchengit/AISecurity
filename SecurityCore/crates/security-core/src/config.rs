@@ -78,6 +78,7 @@ pub struct ProtectedPathsConfig {
 
 // -- Defaults --
 
+#[allow(clippy::derivable_impls)]
 impl Default for SecurityConfig {
     fn default() -> Self {
         Self {
@@ -169,6 +170,7 @@ impl Default for NotificationsConfig {
     }
 }
 
+#[allow(clippy::derivable_impls)]
 impl Default for ProtectedPathsConfig {
     fn default() -> Self {
         Self { paths: None }

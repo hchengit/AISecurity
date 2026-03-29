@@ -144,8 +144,7 @@ impl SenderWhitelist {
         }
 
         // Block domain-level whitelist for freemail providers
-        if addr.starts_with('@') {
-            let domain = &addr[1..];
+        if let Some(domain) = addr.strip_prefix('@') {
             if FREEMAIL_DOMAINS.contains(&domain) {
                 return false;
             }
