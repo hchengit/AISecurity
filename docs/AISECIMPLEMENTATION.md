@@ -1,7 +1,7 @@
 # AISecurity — Cross-Platform Assessment & Implementation Plan
 
 **Date:** 2026-03-28
-**Status:** Phase 4 complete (Linux daemon) — Phase 5 next (ElizaOS features)
+**Status:** Phase 5 complete (ElizaOS features) — Phase 6 next (feature parity & polish)
 **Last Updated:** 2026-03-28
 
 ---
@@ -88,11 +88,11 @@
 
 | Component | Status | Location |
 |-----------|--------|----------|
-| AES-256-GCM encryption (config + whitelist + logs) | ⬜ Not started | `encryption.rs` |
-| Sensitive key filtering (log/display redaction) | ⬜ Not started | `key_filter.rs` |
-| WASM sandbox for custom detection rules | ⬜ Not started | `wasm_sandbox.rs` |
-| rustls TLS transport (future remote logging) | ⬜ Not started | `tls_transport.rs` |
-| Process lifecycle manager (cancellation tokens) | ⬜ Not started | `process_manager.rs` |
+| AES-256-GCM encryption (config + whitelist + logs) | ✅ Done | `encryption.rs` — encrypt/decrypt + SHA-256 key derivation + 4 AAD contexts + hex serialization |
+| Sensitive key filtering (log/display redaction) | ✅ Done | `key_filter.rs` — 24 key patterns + 8 value patterns + JSON/config redaction |
+| WASM sandbox for custom detection rules | ✅ Done | `wasm_sandbox.rs` — wasmtime loader + memory isolation + plugin discovery |
+| rustls TLS transport (future remote logging) | ✅ Done | `tls_transport.rs` — pure-Rust TLS + LogShipper for SIEM integration |
+| Process lifecycle manager (cancellation tokens) | ✅ Done | `process_manager.rs` — CancellationToken + child tokens + ProcessManager + cancellable_sleep |
 
 ### Phase 6: Feature Parity & Polish
 

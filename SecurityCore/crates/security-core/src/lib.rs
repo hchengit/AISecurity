@@ -9,3 +9,8 @@ pub mod message_patterns;
 pub mod sender_whitelist;
 pub mod config;
 pub mod path_resolver;
+pub mod encryption;
+pub mod key_filter;
+pub mod wasm_sandbox;
+pub mod tls_transport;
+pub mod process_manager;
