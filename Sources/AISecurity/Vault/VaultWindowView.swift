@@ -200,7 +200,7 @@ struct VaultWindowView: View {
     @ViewBuilder
     private func statusBadge(_ entry: SecurityCoreBridge.VaultEntry) -> some View {
         if entry.protection == .locked && entry.isUnlocked {
-            Text("OPEN")
+            Text("DECRYPTED")
                 .font(.caption2.bold())
                 .padding(.horizontal, 6)
                 .padding(.vertical, 2)
