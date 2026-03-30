@@ -60,6 +60,52 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         daemon?.stop()
     }
 
+    // MARK: - Handle .vault file opens (double-click from Finder)
+
+    func application(_ sender: NSApplication, openFiles filenames: [String]) {
+        let vaultFiles = filenames.filter { $0.hasSuffix(".vault") }
+        guard !vaultFiles.isEmpty else {
+            sender.reply(toOpenOrPrint: .failure)
+            return
+        }
+
+        // Activate app so dialogs appear in front
+        NSApplication.shared.activate(ignoringOtherApps: true)
+
+        guard ensureVaultSetup() else {
+            sender.reply(toOpenOrPrint: .failure)
+            return
+        }
+
+        // Always require fresh auth for file opens (no session cache)
+        VaultManager.shared.clearPassphrase()
+        VaultManager.shared.withAuth(
+            reason: "Authenticate to decrypt files",
+            passphrasePrompt: "Enter Vault Passphrase to Decrypt",
+            onPassphrase: { passphrase in
+                let result = VaultManager.shared.unlockFiles(vaultFiles, passphrase: passphrase)
+                if result.success {
+                    VaultDialogs.showSuccess(result.message)
+                    // Open the decrypted files in Finder
+                    for vf in vaultFiles {
+                        let original = String(vf.dropLast(".vault".count))
+                        if FileManager.default.fileExists(atPath: original) {
+                            NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: original)])
+                        }
+                    }
+                } else {
+                    VaultDialogs.showError(result.message)
+                }
+                sender.reply(toOpenOrPrint: result.success ? .success : .failure)
+            },
+            onCancel: { sender.reply(toOpenOrPrint: .cancel) },
+            onError: { msg in
+                VaultDialogs.showError(msg)
+                sender.reply(toOpenOrPrint: .failure)
+            }
+        )
+    }
+
     // MARK: - Build Menu
 
     private func rebuildMenu() {
@@ -103,9 +149,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         vaultHeader.isEnabled = false
         menu.addItem(vaultHeader)
         menu.addItem(makeItem("Protect Files...", action: #selector(vaultProtectFiles)))
-        menu.addItem(makeItem("View Protected Files", action: #selector(vaultViewFiles)))
-        menu.addItem(makeItem("Unlock Files...", action: #selector(vaultUnlockFiles)))
-        menu.addItem(makeItem("Lock Open Files", action: #selector(vaultLockFiles)))
+        menu.addItem(makeItem("Open Vault...", action: #selector(vaultOpenWindow)))
         menu.addItem(makeItem("Change Passphrase...", action: #selector(vaultChangePassphrase)))
 
         menu.addItem(.separator())
@@ -226,65 +270,10 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             onPassphrase: { passphrase in
                 let result = VaultManager.shared.addFiles(paths, protection: protection, passphrase: passphrase)
                 if result.success {
-                    VaultDialogs.showSuccess(result.message)
-                } else {
-                    VaultDialogs.showError(result.message)
-                }
-            },
-            onCancel: {},
-            onError: { VaultDialogs.showError($0) }
-        )
-    }
-
-    @objc private func vaultViewFiles() {
-        guard ensureVaultSetup() else { return }
-
-        VaultManager.shared.withAuth(
-            reason: "Authenticate to view vault",
-            passphrasePrompt: "Enter Vault Passphrase",
-            onPassphrase: { passphrase in
-                let entries = VaultManager.shared.listEntries(passphrase: passphrase)
-                if entries.isEmpty {
-                    VaultDialogs.showSuccess("Your vault is empty. Use 'Protect Files...' to add files.")
-                } else {
-                    let lines = entries.map { e in
-                        let status = e.isUnlocked ? "(unlocked)" : "(locked)"
-                        let name = (e.originalPath as NSString).lastPathComponent
-                        return "\(e.protection.label)  \(name)  \(status)"
+                    // Tag files/folders in Finder so they're visually marked
+                    for path in paths {
+                        FinderTags.addTag(path, protection: protection)
                     }
-                    let alert = NSAlert()
-                    alert.messageText = "Protected Files (\(entries.count))"
-                    alert.informativeText = lines.joined(separator: "\n")
-                    alert.alertStyle = .informational
-                    alert.addButton(withTitle: "OK")
-                    alert.runModal()
-                }
-            },
-            onCancel: {},
-            onError: { VaultDialogs.showError($0) }
-        )
-    }
-
-    @objc private func vaultUnlockFiles() {
-        guard ensureVaultSetup() else { return }
-
-        VaultManager.shared.withAuth(
-            reason: "Authenticate to unlock files",
-            passphrasePrompt: "Enter Vault Passphrase",
-            onPassphrase: { passphrase in
-                let entries = VaultManager.shared.listEntries(passphrase: passphrase)
-                    .filter { $0.protection == .locked && !$0.isUnlocked }
-
-                if entries.isEmpty {
-                    VaultDialogs.showSuccess("No locked files to unlock.")
-                    return
-                }
-
-                guard VaultDialogs.confirmDecrypt(count: entries.count) else { return }
-
-                let paths = entries.map { $0.originalPath }
-                let result = VaultManager.shared.unlockFiles(paths, passphrase: passphrase)
-                if result.success {
                     VaultDialogs.showSuccess(result.message)
                 } else {
                     VaultDialogs.showError(result.message)
@@ -295,27 +284,20 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         )
     }
 
-    @objc private func vaultLockFiles() {
+    @objc private func vaultOpenWindow() {
         guard ensureVaultSetup() else { return }
 
+        // Always require fresh auth to open vault
+        VaultManager.shared.clearPassphrase()
         VaultManager.shared.withAuth(
-            reason: "Authenticate to lock files",
+            reason: "Authenticate to open vault",
             passphrasePrompt: "Enter Vault Passphrase",
             onPassphrase: { passphrase in
-                let entries = VaultManager.shared.listEntries(passphrase: passphrase)
-                    .filter { $0.protection == .locked && $0.isUnlocked }
-
-                if entries.isEmpty {
-                    VaultDialogs.showSuccess("No unlocked files to lock.")
-                    return
-                }
-
-                let paths = entries.map { $0.originalPath }
-                let result = VaultManager.shared.lockFiles(paths, passphrase: passphrase)
-                if result.success {
-                    VaultDialogs.showSuccess(result.message)
-                } else {
-                    VaultDialogs.showError(result.message)
+                DispatchQueue.main.async {
+                    WindowManager.shared.showVault(
+                        securityDir: SecurityConfig.shared.securityDir,
+                        passphrase: passphrase
+                    )
                 }
             },
             onCancel: {},
@@ -359,6 +341,7 @@ final class WindowManager {
 
     private var threatsWindow: NSWindow?
     private var logWindow: NSWindow?
+    private var vaultWindow: NSWindow?
 
     func showThreats(daemon: SecurityDaemon) {
         if let w = threatsWindow, w.isVisible {
@@ -377,6 +360,24 @@ final class WindowManager {
         window.makeKeyAndOrderFront(nil)
         NSApplication.shared.activate(ignoringOtherApps: true)
         threatsWindow = window
+    }
+
+    func showVault(securityDir: String, passphrase: String) {
+        if let w = vaultWindow, w.isVisible {
+            w.makeKeyAndOrderFront(nil)
+            NSApplication.shared.activate(ignoringOtherApps: true)
+            return
+        }
+        let view = VaultWindowView(securityDir: securityDir, passphrase: passphrase)
+        let controller = NSHostingController(rootView: view)
+        let window = NSWindow(contentViewController: controller)
+        window.title = "AISecurity \u{2014} Vault"
+        window.setContentSize(NSSize(width: 700, height: 500))
+        window.styleMask = [.titled, .closable, .resizable, .miniaturizable]
+        window.center()
+        window.makeKeyAndOrderFront(nil)
+        NSApplication.shared.activate(ignoringOtherApps: true)
+        vaultWindow = window
     }
 
     func showLog(config: SecurityConfig) {
