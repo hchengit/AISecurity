@@ -259,21 +259,37 @@ struct VaultWindowView: View {
 
         // Unlock encrypted files temporarily
         if !lockedPaths.isEmpty {
-            let result = SecurityCoreBridge.vaultUnlock(
-                securityDir: securityDir, paths: lockedPaths, passphrase: passphrase)
-            if result.success {
-                messages.append("\(result.entriesAffected) encrypted file(s) opened temporarily")
-                // Open in default app
-                for path in lockedPaths {
-                    let url = URL(fileURLWithPath: path)
-                    if FileManager.default.fileExists(atPath: path) {
-                        NSWorkspace.shared.open(url)
-                    }
+            // Split into already-unlocked (just open) vs still-encrypted (decrypt first)
+            let alreadyOpen = lockedPaths.filter { p in
+                entries.first(where: { $0.originalPath == p })?.isUnlocked == true
+            }
+            let needsDecrypt = lockedPaths.filter { p in
+                entries.first(where: { $0.originalPath == p })?.isUnlocked != true
+            }
+
+            // Decrypt any that are still encrypted
+            if !needsDecrypt.isEmpty {
+                let result = SecurityCoreBridge.vaultUnlock(
+                    securityDir: securityDir, paths: needsDecrypt, passphrase: passphrase)
+                if result.success && result.entriesAffected > 0 {
+                    messages.append("\(result.entriesAffected) file(s) decrypted")
+                } else if !result.success {
+                    messages.append("Decrypt failed: \(result.message)")
                 }
-                // Start watching for close — re-encrypt after a delay
+            }
+
+            // Open all files (both newly decrypted and already open)
+            var opened = 0
+            for path in lockedPaths {
+                if FileManager.default.fileExists(atPath: path) {
+                    NSWorkspace.shared.open(URL(fileURLWithPath: path))
+                    opened += 1
+                }
+            }
+            if opened > 0 {
+                messages.append("\(opened) file(s) opened temporarily")
+                // Start watching for close — re-encrypt when done
                 startReEncryptTimer(paths: lockedPaths)
-            } else {
-                messages.append("Unlock failed: \(result.message)")
             }
         }
 
