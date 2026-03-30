@@ -8,6 +8,7 @@ use std::ffi::{c_char, CStr, CString};
 use std::ptr;
 
 use security_core::email_patterns;
+use security_core::vault;
 use security_core::file_sanitizer;
 use security_core::message_patterns;
 use security_core::prompt_injection;
@@ -386,6 +387,293 @@ pub extern "C" fn sec_free_scan_policy(ptr: *mut ScanPolicyFFI) {
 unsafe fn free_c_string(ptr: *mut c_char) {
     if !ptr.is_null() {
         drop(unsafe { CString::from_raw(ptr) });
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Vault
+// ---------------------------------------------------------------------------
+
+/// FFI-safe vault operation result.
+#[repr(C)]
+pub struct VaultResultFFI {
+    pub success: bool,
+    pub message: *mut c_char,
+    pub entries_affected: u32,
+}
+
+/// FFI-safe vault entry.
+#[repr(C)]
+pub struct VaultEntryFFI {
+    pub original_path: *mut c_char,
+    pub vault_path: *mut c_char,
+    pub protection: u8, // 0=locked, 1=read_only, 2=local_only
+    pub encrypted_at: *mut c_char,
+    pub size_bytes: u64,
+    pub is_directory: bool,
+    pub is_unlocked: bool,
+}
+
+/// FFI-safe vault entry array.
+#[repr(C)]
+pub struct VaultEntryArrayFFI {
+    pub items: *mut VaultEntryFFI,
+    pub count: u32,
+}
+
+fn protection_to_u8(p: vault::ProtectionLevel) -> u8 {
+    match p {
+        vault::ProtectionLevel::Locked => 0,
+        vault::ProtectionLevel::ReadOnly => 1,
+        vault::ProtectionLevel::LocalOnly => 2,
+    }
+}
+
+fn u8_to_protection(v: u8) -> vault::ProtectionLevel {
+    match v {
+        1 => vault::ProtectionLevel::ReadOnly,
+        2 => vault::ProtectionLevel::LocalOnly,
+        _ => vault::ProtectionLevel::Locked,
+    }
+}
+
+/// Check if vault has been set up.
+#[no_mangle]
+pub extern "C" fn sec_vault_is_setup(security_dir: *const c_char) -> bool {
+    let dir = match unsafe { from_c_str(security_dir) } {
+        Some(d) => d,
+        None => return false,
+    };
+    vault::Vault::new(&dir).is_setup()
+}
+
+/// First-time vault setup — generates salt, creates manifest, writes recovery file.
+#[no_mangle]
+pub extern "C" fn sec_vault_setup(security_dir: *const c_char) -> *mut VaultResultFFI {
+    let dir = match unsafe { from_c_str(security_dir) } {
+        Some(d) => d,
+        None => return ptr::null_mut(),
+    };
+    let v = vault::Vault::new(&dir);
+    match v.setup() {
+        Ok(()) => Box::into_raw(Box::new(VaultResultFFI {
+            success: true,
+            message: to_c_string("Vault setup complete"),
+            entries_affected: 0,
+        })),
+        Err(e) => Box::into_raw(Box::new(VaultResultFFI {
+            success: false,
+            message: to_c_string(&format!("{}", e)),
+            entries_affected: 0,
+        })),
+    }
+}
+
+/// Set the initial vault passphrase (first-time only).
+#[no_mangle]
+pub extern "C" fn sec_vault_set_passphrase(
+    security_dir: *const c_char,
+    passphrase: *const c_char,
+) -> bool {
+    let dir = match unsafe { from_c_str(security_dir) } { Some(d) => d, None => return false };
+    let pass = match unsafe { from_c_str(passphrase) } { Some(p) => p, None => return false };
+    vault::Vault::new(&dir).set_initial_passphrase(&pass).is_ok()
+}
+
+/// Verify vault passphrase.
+#[no_mangle]
+pub extern "C" fn sec_vault_verify_passphrase(
+    security_dir: *const c_char,
+    passphrase: *const c_char,
+) -> bool {
+    let dir = match unsafe { from_c_str(security_dir) } { Some(d) => d, None => return false };
+    let pass = match unsafe { from_c_str(passphrase) } { Some(p) => p, None => return false };
+    vault::Vault::new(&dir).verify_passphrase(&pass).unwrap_or(false)
+}
+
+/// Add files to vault. `paths` is a colon-separated list. `protection`: 0=locked, 1=read_only, 2=local_only.
+#[no_mangle]
+pub extern "C" fn sec_vault_add(
+    security_dir: *const c_char,
+    paths: *const c_char,
+    protection: u8,
+    passphrase: *const c_char,
+) -> *mut VaultResultFFI {
+    let dir = match unsafe { from_c_str(security_dir) } { Some(d) => d, None => return ptr::null_mut() };
+    let paths_str = match unsafe { from_c_str(paths) } { Some(p) => p, None => return ptr::null_mut() };
+    let pass = match unsafe { from_c_str(passphrase) } { Some(p) => p, None => return ptr::null_mut() };
+
+    let path_list: Vec<&str> = paths_str.split(':').collect();
+    let prot = u8_to_protection(protection);
+    let v = vault::Vault::new(&dir);
+
+    match v.add(&path_list, prot, &pass) {
+        Ok(r) => Box::into_raw(Box::new(VaultResultFFI {
+            success: r.success,
+            message: to_c_string(&r.message),
+            entries_affected: r.entries_affected as u32,
+        })),
+        Err(e) => Box::into_raw(Box::new(VaultResultFFI {
+            success: false,
+            message: to_c_string(&format!("{}", e)),
+            entries_affected: 0,
+        })),
+    }
+}
+
+/// Unlock (decrypt) vault entries. `paths` is colon-separated.
+#[no_mangle]
+pub extern "C" fn sec_vault_unlock(
+    security_dir: *const c_char,
+    paths: *const c_char,
+    passphrase: *const c_char,
+) -> *mut VaultResultFFI {
+    let dir = match unsafe { from_c_str(security_dir) } { Some(d) => d, None => return ptr::null_mut() };
+    let paths_str = match unsafe { from_c_str(paths) } { Some(p) => p, None => return ptr::null_mut() };
+    let pass = match unsafe { from_c_str(passphrase) } { Some(p) => p, None => return ptr::null_mut() };
+
+    let path_list: Vec<&str> = paths_str.split(':').collect();
+    let v = vault::Vault::new(&dir);
+
+    match v.unlock(&path_list, &pass) {
+        Ok(r) => Box::into_raw(Box::new(VaultResultFFI {
+            success: r.success, message: to_c_string(&r.message), entries_affected: r.entries_affected as u32,
+        })),
+        Err(e) => Box::into_raw(Box::new(VaultResultFFI {
+            success: false, message: to_c_string(&format!("{}", e)), entries_affected: 0,
+        })),
+    }
+}
+
+/// Lock (re-encrypt) previously unlocked entries. `paths` is colon-separated.
+#[no_mangle]
+pub extern "C" fn sec_vault_lock(
+    security_dir: *const c_char,
+    paths: *const c_char,
+    passphrase: *const c_char,
+) -> *mut VaultResultFFI {
+    let dir = match unsafe { from_c_str(security_dir) } { Some(d) => d, None => return ptr::null_mut() };
+    let paths_str = match unsafe { from_c_str(paths) } { Some(p) => p, None => return ptr::null_mut() };
+    let pass = match unsafe { from_c_str(passphrase) } { Some(p) => p, None => return ptr::null_mut() };
+
+    let path_list: Vec<&str> = paths_str.split(':').collect();
+    let v = vault::Vault::new(&dir);
+
+    match v.lock(&path_list, &pass) {
+        Ok(r) => Box::into_raw(Box::new(VaultResultFFI {
+            success: r.success, message: to_c_string(&r.message), entries_affected: r.entries_affected as u32,
+        })),
+        Err(e) => Box::into_raw(Box::new(VaultResultFFI {
+            success: false, message: to_c_string(&format!("{}", e)), entries_affected: 0,
+        })),
+    }
+}
+
+/// Remove entries from vault (decrypt and restore). `paths` is colon-separated.
+#[no_mangle]
+pub extern "C" fn sec_vault_remove(
+    security_dir: *const c_char,
+    paths: *const c_char,
+    passphrase: *const c_char,
+) -> *mut VaultResultFFI {
+    let dir = match unsafe { from_c_str(security_dir) } { Some(d) => d, None => return ptr::null_mut() };
+    let paths_str = match unsafe { from_c_str(paths) } { Some(p) => p, None => return ptr::null_mut() };
+    let pass = match unsafe { from_c_str(passphrase) } { Some(p) => p, None => return ptr::null_mut() };
+
+    let path_list: Vec<&str> = paths_str.split(':').collect();
+    let v = vault::Vault::new(&dir);
+
+    match v.remove(&path_list, &pass) {
+        Ok(r) => Box::into_raw(Box::new(VaultResultFFI {
+            success: r.success, message: to_c_string(&r.message), entries_affected: r.entries_affected as u32,
+        })),
+        Err(e) => Box::into_raw(Box::new(VaultResultFFI {
+            success: false, message: to_c_string(&format!("{}", e)), entries_affected: 0,
+        })),
+    }
+}
+
+/// List all vault entries.
+#[no_mangle]
+pub extern "C" fn sec_vault_list(
+    security_dir: *const c_char,
+    passphrase: *const c_char,
+) -> *mut VaultEntryArrayFFI {
+    let dir = match unsafe { from_c_str(security_dir) } { Some(d) => d, None => return ptr::null_mut() };
+    let pass = match unsafe { from_c_str(passphrase) } { Some(p) => p, None => return ptr::null_mut() };
+
+    let v = vault::Vault::new(&dir);
+    let entries = match v.list(&pass) {
+        Ok(e) => e,
+        Err(_) => return ptr::null_mut(),
+    };
+
+    let items: Vec<VaultEntryFFI> = entries.iter().map(|e| VaultEntryFFI {
+        original_path: to_c_string(&e.original_path),
+        vault_path: to_c_string(&e.vault_path),
+        protection: protection_to_u8(e.protection),
+        encrypted_at: to_c_string(&e.encrypted_at),
+        size_bytes: e.size_bytes,
+        is_directory: e.is_directory,
+        is_unlocked: e.is_unlocked,
+    }).collect();
+
+    let count = items.len() as u32;
+    let items_ptr = if items.is_empty() {
+        ptr::null_mut()
+    } else {
+        let mut boxed = items.into_boxed_slice();
+        let p = boxed.as_mut_ptr();
+        std::mem::forget(boxed);
+        p
+    };
+
+    Box::into_raw(Box::new(VaultEntryArrayFFI { items: items_ptr, count }))
+}
+
+/// Change vault passphrase.
+#[no_mangle]
+pub extern "C" fn sec_vault_change_passphrase(
+    security_dir: *const c_char,
+    old_passphrase: *const c_char,
+    new_passphrase: *const c_char,
+) -> *mut VaultResultFFI {
+    let dir = match unsafe { from_c_str(security_dir) } { Some(d) => d, None => return ptr::null_mut() };
+    let old_pass = match unsafe { from_c_str(old_passphrase) } { Some(p) => p, None => return ptr::null_mut() };
+    let new_pass = match unsafe { from_c_str(new_passphrase) } { Some(p) => p, None => return ptr::null_mut() };
+
+    let v = vault::Vault::new(&dir);
+    match v.change_passphrase(&old_pass, &new_pass) {
+        Ok(r) => Box::into_raw(Box::new(VaultResultFFI {
+            success: r.success, message: to_c_string(&r.message), entries_affected: r.entries_affected as u32,
+        })),
+        Err(e) => Box::into_raw(Box::new(VaultResultFFI {
+            success: false, message: to_c_string(&format!("{}", e)), entries_affected: 0,
+        })),
+    }
+}
+
+/// Free a VaultResultFFI.
+#[no_mangle]
+pub extern "C" fn sec_free_vault_result(ptr: *mut VaultResultFFI) {
+    if ptr.is_null() { return; }
+    unsafe { let r = Box::from_raw(ptr); free_c_string(r.message); }
+}
+
+/// Free a VaultEntryArrayFFI.
+#[no_mangle]
+pub extern "C" fn sec_free_vault_entries(ptr: *mut VaultEntryArrayFFI) {
+    if ptr.is_null() { return; }
+    unsafe {
+        let arr = Box::from_raw(ptr);
+        if !arr.items.is_null() && arr.count > 0 {
+            let items = Vec::from_raw_parts(arr.items, arr.count as usize, arr.count as usize);
+            for item in items {
+                free_c_string(item.original_path);
+                free_c_string(item.vault_path);
+                free_c_string(item.encrypted_at);
+            }
+        }
     }
 }
 

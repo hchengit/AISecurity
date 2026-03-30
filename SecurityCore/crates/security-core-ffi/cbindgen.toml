@@ -15,6 +15,9 @@ include = [
     "ThreatsArrayFFI",
     "ThreatFFI",
     "ScanPolicyFFI",
+    "VaultResultFFI",
+    "VaultEntryFFI",
+    "VaultEntryArrayFFI",
 ]
 
 [fn]

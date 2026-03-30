@@ -1,8 +1,8 @@
 # AISecurity — Cross-Platform Assessment & Implementation Plan
 
 **Date:** 2026-03-28
-**Status:** Phase 6 complete — all phases done
-**Last Updated:** 2026-03-28
+**Status:** Phase 7 in progress (Vault — file/folder protection with encryption + auth)
+**Last Updated:** 2026-03-29
 
 ---
 
@@ -102,6 +102,54 @@
 | Linux TUI threat viewer (ratatui) | ✅ Done | `tui.rs` — ratatui + crossterm, severity badges, navigate/dismiss/reload |
 | Documentation (README, CONFIG, CUSTOM_RULES) | ✅ Done | `SecurityCore/README.md` — architecture, quick start, config, WASM rules |
 | Feature parity matrix verified | ✅ Done | See §6.3 — all detection modules identical via Rust core |
+
+### Phase 7: Vault — File/Folder Protection with Encryption + Auth
+
+| Component | Status | Location |
+|-----------|--------|----------|
+| **Vault Core (Rust)** | | |
+| Vault manifest (vault.json — tracks protected files/folders) | ✅ Done | `vault.rs` — encrypted manifest with VaultEntry structs |
+| File encrypt (AES-256-GCM, in-place → `.vault` extension) | ✅ Done | `vault.rs` — uses existing `encryption.rs` + VAULT_AAD |
+| File decrypt (auth-gated, restore original) | ✅ Done | `vault.rs` — unlock() restores to original path |
+| Secure delete (overwrite original after encrypt) | ✅ Done | `vault.rs` — 3-pass random overwrite before unlink |
+| Folder protection (recursive encrypt all contents) | ✅ Done | `vault.rs` — add_directory() recursive walk |
+| Vault manifest persistence (JSON, itself encrypted) | ✅ Done | `vault.json.enc` — AES-256-GCM with VAULT_MANIFEST_AAD |
+| Vault status queries (list, verify integrity) | ✅ Done | `vault.rs` — list(), verify_passphrase() |
+| 3 protection levels (locked/read-only/local-only) | ✅ Done | `vault.rs` — ProtectionLevel enum + per-level enforcement |
+| Passphrase change (re-encrypt all files + manifest) | ✅ Done | `vault.rs` — change_passphrase() |
+| 6 Rust tests passing | ✅ Done | roundtrip, wrong passphrase, change passphrase, read-only, list |
+| **Vault FFI + Swift Bridge** | | |
+| FFI exports for vault operations (C ABI) | ✅ Done | 11 exports: setup, add, unlock, lock, remove, list, change_passphrase, etc. |
+| SecurityCoreBridge.swift vault wrappers | ✅ Done | All 11 vault operations wrapped with Swift types |
+| **Authentication Gate (macOS)** | | |
+| LocalAuthentication (Touch ID / system password) | ✅ Done | `Vault/AuthGate.swift` — LAContext.deviceOwnerAuthentication |
+| Auth session caching (5-minute window) | ✅ Done | `AuthGate.swift` — configurable sessionTimeout |
+| **Authentication Gate (Linux)** | | |
+| PAM / polkit owner verification | ⬜ Not started | `security-linux/src/auth.rs` |
+| **Menu Bar UI (macOS)** | | |
+| "Protect Files..." menu item with NSOpenPanel (multi-select) | ✅ Done | `AISecurityApp.swift` — files + folders, protection level picker |
+| Vault status panel (list protected files) | ✅ Done | `AISecurityApp.swift` — shows all entries with status |
+| "Unlock Files..." / "Lock Open Files" menu items | ✅ Done | `AISecurityApp.swift` — auth-gated |
+| "Change Passphrase..." menu item | ✅ Done | `AISecurityApp.swift` — old/new/confirm flow |
+| **User Education & Safety** | | |
+| First-run setup wizard (3 panels: welcome, passphrase, recovery) | ✅ Done | `VaultDialogs.swift` — runSetupWizard() |
+| Passphrase setup with min-length + confirmation | ✅ Done | `VaultDialogs.swift` — 8-char minimum, must match |
+| Pre-encrypt confirmation per protection level | ✅ Done | `VaultDialogs.swift` — confirmEncrypt() with level-specific text |
+| Pre-decrypt confirmation | ✅ Done | `VaultDialogs.swift` — confirmDecrypt() |
+| Recovery instructions saved to `VAULT-RECOVERY.txt` | ✅ Done | `vault.rs` — write_recovery_file() at setup |
+| Passphrase change workflow (old → new → confirm) | ✅ Done | `VaultDialogs.swift` — promptChangePassphrase() |
+| Protection level picker (locked/read-only/local-only) | ✅ Done | `VaultDialogs.swift` — pickProtectionLevel() |
+| **FileWatcher Integration** | | |
+| Alert on unauthorized access attempts to vault files | ⬜ Not started | `FileWatcher.swift` |
+| Block-and-notify when non-authenticated process touches vault entries | ⬜ Not started | `FileWatcher.swift` |
+| **Linux TUI** | | |
+| Vault management screen in ratatui TUI | ⬜ Not started | `tui.rs` |
+| File browser with checkbox selection | ⬜ Not started | `tui.rs` |
+| **Verification** | | |
+| Rust unit tests (6 tests passing) | ✅ Done | encrypt/decrypt roundtrip, wrong passphrase, change, read-only, list |
+| macOS build + install + run | ✅ Done | Installed to /Applications, shield icon with Vault menu — 2026-03-29 |
+| Auth gate test (Touch ID / password prompt) | ⬜ Pending user test | Click "Protect Files..." to trigger |
+| Passphrase change test | ⬜ Pending user test | Click "Change Passphrase..." to test |
 
 ---
 
@@ -715,6 +763,166 @@ Using `ratatui` crate — reads alerts.log, shows severity badges, dismiss/trust
 
 ---
 
+## 7. Phase 7: Vault — File/Folder Protection with Encryption + Auth
+
+**Goal:** Users can select files/folders to protect. Protected files are encrypted in-place
+with AES-256-GCM. All vault operations require biometric or password authentication.
+Clear user guidance at every step so users never get locked out of their own data.
+
+### 7.1 Vault Core (Rust — `vault.rs`)
+
+**Manifest:** `~/.mac-security/vault.json` (itself encrypted with AES-256-GCM)
+```json
+{
+  "version": 1,
+  "created": "2026-03-29T...",
+  "entries": [
+    {
+      "original_path": "/Users/alice/Documents/tax-2025.pdf",
+      "vault_path": "/Users/alice/Documents/tax-2025.pdf.vault",
+      "encrypted_at": "2026-03-29T...",
+      "size_bytes": 245760,
+      "sha256_original": "abc123...",
+      "is_directory": false
+    }
+  ]
+}
+```
+
+**Operations:**
+- `vault_add(paths, passphrase)` → encrypt each file, write `.vault`, secure-delete original, update manifest
+- `vault_unlock(paths, passphrase)` → decrypt `.vault` → restore original, update manifest
+- `vault_lock(paths, passphrase)` → re-encrypt previously unlocked files
+- `vault_list()` → return manifest entries (no auth needed — metadata only)
+- `vault_verify(passphrase)` → verify passphrase is correct without decrypting files
+- `vault_change_passphrase(old, new)` → decrypt all → re-encrypt with new key
+
+**Secure delete:** Overwrite file with random bytes before unlinking (3-pass).
+
+**Key derivation:** SHA-256(passphrase + machine-salt). Machine salt stored in
+`~/.mac-security/.vault-salt` (generated once at setup, 32 random bytes).
+
+### 7.2 Authentication Gate
+
+**macOS — LocalAuthentication framework:**
+```swift
+let context = LAContext()
+context.evaluatePolicy(.deviceOwnerAuthentication,
+    localizedReason: "Authenticate to access your protected files")
+```
+- Supports Touch ID, Apple Watch, or system password
+- Auth session cached for 5 minutes (configurable) — `LAContext` reused
+- Every vault operation (add, unlock, lock, change passphrase) requires auth
+- Viewing vault file list (metadata) does NOT require auth
+
+**Linux — PAM integration:**
+- Verify current user password via PAM `auth` stack
+- Same 5-minute session cache
+
+### 7.3 User Education & Safety (CRITICAL)
+
+**First-Run Setup Wizard** (shown when user first clicks "Protect Files..."):
+
+1. **Welcome panel:** "AISecurity Vault encrypts your files so only you can access them —
+   even if your Mac is compromised. Here's what you need to know before starting."
+
+2. **How it works panel:**
+   - "Files you protect are encrypted with military-grade AES-256-GCM encryption"
+   - "The original unencrypted file is securely deleted after encryption"
+   - "Only YOUR passphrase can decrypt these files — we never store it"
+   - "You can unlock files anytime with Touch ID or your system password + vault passphrase"
+
+3. **Passphrase setup panel:**
+   - User creates a vault passphrase (separate from system password)
+   - Strength meter (weak / fair / strong / very strong)
+   - Must type twice to confirm
+   - Warning: "If you forget this passphrase, your encrypted files CANNOT be recovered.
+     There is no reset option. We recommend writing it down and storing it securely."
+
+4. **Recovery instructions panel:**
+   - Shows recovery steps on screen
+   - Saves `~/.mac-security/VAULT-RECOVERY.txt` with:
+     - What the vault is
+     - Where encrypted files are stored (`.vault` extension)
+     - How to decrypt: open AISecurity → Vault → Unlock, authenticate, enter passphrase
+     - Emergency: if AISecurity is uninstalled, files remain as `.vault` — reinstall app to decrypt
+   - Option to print or save to another location
+
+5. **Confirmation:** "You're all set! Click 'Protect Files...' in the menu bar to get started."
+
+**Pre-Encrypt Confirmation** (every time user adds files to vault):
+- Lists all files/folders selected
+- Shows total size
+- "These files will be encrypted and the originals securely deleted."
+- "You will need your vault passphrase to access them again."
+- [Cancel] [Encrypt & Protect]
+
+**Pre-Decrypt Confirmation:**
+- Touch ID / password prompt first
+- Then vault passphrase entry
+- "Decrypting X files to their original locations."
+- [Cancel] [Decrypt]
+
+### 7.4 Menu Bar Integration (macOS)
+
+New menu items under the shield icon:
+```
+──────────────────────
+🔒 Vault
+   Protect Files...        (opens NSOpenPanel, multi-select files/folders)
+   View Protected Files    (shows vault status panel)
+   Unlock Files...         (auth-gated, select files to decrypt)
+   Lock Open Files         (re-encrypt previously unlocked files)
+   ─────────────
+   Change Passphrase...    (auth-gated)
+   Vault Recovery Info     (shows/re-saves recovery instructions)
+──────────────────────
+```
+
+**NSOpenPanel** for file selection:
+- `allowsMultipleSelection = true`
+- `canChooseDirectories = true`
+- `canChooseFiles = true`
+- Shows current vault entries as disabled (already protected)
+
+**Vault Status Panel** (NSWindow):
+- Table view: filename, original path, encrypted date, size, status (locked/unlocked)
+- Buttons: Unlock Selected, Lock Selected, Remove from Vault
+
+### 7.5 FileWatcher Integration
+
+- Vault file paths added to FileWatcher's monitored list
+- Any access attempt to `.vault` files by external processes triggers CRITICAL alert
+- Alert: "Unauthorized access attempt to protected file: {filename}"
+- Notification sent via macOS notification center
+
+### 7.6 Verification
+
+```bash
+# 1. Setup wizard — create vault passphrase
+#    Open AISecurity menu → Vault → Protect Files... (first time triggers wizard)
+
+# 2. Encrypt test file
+echo "secret data" > /tmp/test-vault.txt
+#    Select /tmp/test-vault.txt via Protect Files dialog
+#    Verify: /tmp/test-vault.txt.vault exists, original gone
+
+# 3. Decrypt test file
+#    Vault → Unlock Files... → select test-vault.txt.vault
+#    Authenticate (Touch ID or password)
+#    Enter vault passphrase
+#    Verify: /tmp/test-vault.txt restored with correct content
+
+# 4. Unauthorized access alert
+#    Try to open a .vault file with another app → should trigger alert
+
+# 5. Passphrase change
+#    Vault → Change Passphrase... → old pass → new pass
+#    Verify: can still decrypt with new passphrase
+```
+
+---
+
 ## Execution Timeline
 
 ```
@@ -736,6 +944,14 @@ Mac Portability    -->  Rust Core Library     -->  macOS FFI Integration
                                               Phase 6 (Weeks 14-15)
                                               Feature Parity + Polish
                                                 Shared test suite, TUI, docs
+
+                                              Phase 7 (Weeks 16-18)
+                                              Vault — File Protection
+                                                AES-256-GCM file encrypt
+                                                Touch ID / password auth
+                                                NSOpenPanel file picker
+                                                User education wizard
+                                                FileWatcher integration
 ```
 
 ## Key Architectural Decisions

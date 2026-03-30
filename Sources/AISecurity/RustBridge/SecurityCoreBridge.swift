@@ -184,6 +184,161 @@ enum SecurityCoreBridge {
         return String(cString: ptr)
     }
 
+    // MARK: - Vault
+
+    enum ProtectionLevel: UInt8, Sendable {
+        case locked = 0
+        case readOnly = 1
+        case localOnly = 2
+
+        var label: String {
+            switch self {
+            case .locked: return "Locked (encrypted)"
+            case .readOnly: return "Read-only"
+            case .localOnly: return "Local-only"
+            }
+        }
+    }
+
+    struct VaultResult: Sendable {
+        let success: Bool
+        let message: String
+        let entriesAffected: Int
+    }
+
+    struct VaultEntry: Sendable {
+        let originalPath: String
+        let vaultPath: String
+        let protection: ProtectionLevel
+        let encryptedAt: String
+        let sizeBytes: UInt64
+        let isDirectory: Bool
+        let isUnlocked: Bool
+    }
+
+    static func vaultIsSetup(securityDir: String) -> Bool {
+        securityDir.withCString { sec_vault_is_setup($0) }
+    }
+
+    static func vaultSetup(securityDir: String) -> VaultResult {
+        let ptr = securityDir.withCString { sec_vault_setup($0) }
+        return vaultResultFromFFI(ptr)
+    }
+
+    static func vaultSetPassphrase(securityDir: String, passphrase: String) -> Bool {
+        securityDir.withCString { d in
+            passphrase.withCString { p in
+                sec_vault_set_passphrase(d, p)
+            }
+        }
+    }
+
+    static func vaultVerifyPassphrase(securityDir: String, passphrase: String) -> Bool {
+        securityDir.withCString { d in
+            passphrase.withCString { p in
+                sec_vault_verify_passphrase(d, p)
+            }
+        }
+    }
+
+    static func vaultAdd(securityDir: String, paths: [String], protection: ProtectionLevel, passphrase: String) -> VaultResult {
+        let joined = paths.joined(separator: ":")
+        let ptr = securityDir.withCString { d in
+            joined.withCString { p in
+                passphrase.withCString { pass in
+                    sec_vault_add(d, p, protection.rawValue, pass)
+                }
+            }
+        }
+        return vaultResultFromFFI(ptr)
+    }
+
+    static func vaultUnlock(securityDir: String, paths: [String], passphrase: String) -> VaultResult {
+        let joined = paths.joined(separator: ":")
+        let ptr = securityDir.withCString { d in
+            joined.withCString { p in
+                passphrase.withCString { pass in
+                    sec_vault_unlock(d, p, pass)
+                }
+            }
+        }
+        return vaultResultFromFFI(ptr)
+    }
+
+    static func vaultLock(securityDir: String, paths: [String], passphrase: String) -> VaultResult {
+        let joined = paths.joined(separator: ":")
+        let ptr = securityDir.withCString { d in
+            joined.withCString { p in
+                passphrase.withCString { pass in
+                    sec_vault_lock(d, p, pass)
+                }
+            }
+        }
+        return vaultResultFromFFI(ptr)
+    }
+
+    static func vaultRemove(securityDir: String, paths: [String], passphrase: String) -> VaultResult {
+        let joined = paths.joined(separator: ":")
+        let ptr = securityDir.withCString { d in
+            joined.withCString { p in
+                passphrase.withCString { pass in
+                    sec_vault_remove(d, p, pass)
+                }
+            }
+        }
+        return vaultResultFromFFI(ptr)
+    }
+
+    static func vaultList(securityDir: String, passphrase: String) -> [VaultEntry] {
+        let ptr = securityDir.withCString { d in
+            passphrase.withCString { p in
+                sec_vault_list(d, p)
+            }
+        }
+        guard let arr = ptr else { return [] }
+        defer { sec_free_vault_entries(ptr) }
+        let a = arr.pointee
+        guard a.count > 0, a.items != nil else { return [] }
+        return (0..<Int(a.count)).map { i in
+            let e = a.items[i]
+            return VaultEntry(
+                originalPath: String(cString: e.original_path),
+                vaultPath: String(cString: e.vault_path),
+                protection: ProtectionLevel(rawValue: e.protection) ?? .locked,
+                encryptedAt: String(cString: e.encrypted_at),
+                sizeBytes: e.size_bytes,
+                isDirectory: e.is_directory,
+                isUnlocked: e.is_unlocked
+            )
+        }
+    }
+
+    static func vaultChangePassphrase(securityDir: String, oldPassphrase: String, newPassphrase: String) -> VaultResult {
+        let ptr = securityDir.withCString { d in
+            oldPassphrase.withCString { old in
+                newPassphrase.withCString { new in
+                    sec_vault_change_passphrase(d, old, new)
+                }
+            }
+        }
+        return vaultResultFromFFI(ptr)
+    }
+
+    private static func vaultResultFromFFI(_ ptr: UnsafeMutablePointer<VaultResultFFI>?) -> VaultResult {
+        guard let r = ptr else {
+            return VaultResult(success: false, message: "FFI call failed", entriesAffected: 0)
+        }
+        defer { sec_free_vault_result(ptr) }
+        let p = r.pointee
+        return VaultResult(
+            success: p.success,
+            message: String(cString: p.message),
+            entriesAffected: Int(p.entries_affected)
+        )
+    }
+
+    // MARK: - Helpers
+
     private static func threatsFromFFI(_ ptr: UnsafeMutablePointer<ThreatsArrayFFI>?) -> [Threat] {
         guard let arr = ptr else { return [] }
         defer { sec_free_threats(ptr) }

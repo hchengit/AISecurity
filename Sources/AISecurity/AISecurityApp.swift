@@ -98,6 +98,18 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
         menu.addItem(.separator())
 
+        // Vault
+        let vaultHeader = NSMenuItem(title: "\u{1F512} Vault", action: nil, keyEquivalent: "")
+        vaultHeader.isEnabled = false
+        menu.addItem(vaultHeader)
+        menu.addItem(makeItem("Protect Files...", action: #selector(vaultProtectFiles)))
+        menu.addItem(makeItem("View Protected Files", action: #selector(vaultViewFiles)))
+        menu.addItem(makeItem("Unlock Files...", action: #selector(vaultUnlockFiles)))
+        menu.addItem(makeItem("Lock Open Files", action: #selector(vaultLockFiles)))
+        menu.addItem(makeItem("Change Passphrase...", action: #selector(vaultChangePassphrase)))
+
+        menu.addItem(.separator())
+
         if running {
             menu.addItem(makeItem("Stop Agent", action: #selector(stopAgent)))
         } else {
@@ -166,8 +178,175 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         rebuildMenu()
     }
 
+    // MARK: - Vault Actions
+
+    private func ensureVaultSetup() -> Bool {
+        let mgr = VaultManager.shared
+        if mgr.isSetup { return true }
+
+        // First-time setup wizard
+        guard let passphrase = VaultDialogs.runSetupWizard() else { return false }
+        let result = mgr.setup()
+        guard result.success else {
+            VaultDialogs.showError(result.message)
+            return false
+        }
+        guard mgr.setInitialPassphrase(passphrase) else {
+            VaultDialogs.showError("Failed to set vault passphrase.")
+            return false
+        }
+        return true
+    }
+
+    @objc private func vaultProtectFiles() {
+        guard ensureVaultSetup() else { return }
+
+        // Pick protection level
+        guard let protection = VaultDialogs.pickProtectionLevel() else { return }
+
+        // File picker
+        let panel = NSOpenPanel()
+        panel.title = "Select Files to Protect"
+        panel.message = "Choose files or folders to add to your vault."
+        panel.allowsMultipleSelection = true
+        panel.canChooseDirectories = true
+        panel.canChooseFiles = true
+        panel.canCreateDirectories = false
+
+        guard panel.runModal() == .OK, !panel.urls.isEmpty else { return }
+        let paths = panel.urls.map { $0.path }
+
+        // Confirm
+        guard VaultDialogs.confirmEncrypt(paths: paths, protection: protection) else { return }
+
+        // Authenticate + add
+        VaultManager.shared.withAuth(
+            reason: "Authenticate to protect files",
+            passphrasePrompt: "Enter Vault Passphrase",
+            onPassphrase: { passphrase in
+                let result = VaultManager.shared.addFiles(paths, protection: protection, passphrase: passphrase)
+                if result.success {
+                    VaultDialogs.showSuccess(result.message)
+                } else {
+                    VaultDialogs.showError(result.message)
+                }
+            },
+            onCancel: {},
+            onError: { VaultDialogs.showError($0) }
+        )
+    }
+
+    @objc private func vaultViewFiles() {
+        guard ensureVaultSetup() else { return }
+
+        VaultManager.shared.withAuth(
+            reason: "Authenticate to view vault",
+            passphrasePrompt: "Enter Vault Passphrase",
+            onPassphrase: { passphrase in
+                let entries = VaultManager.shared.listEntries(passphrase: passphrase)
+                if entries.isEmpty {
+                    VaultDialogs.showSuccess("Your vault is empty. Use 'Protect Files...' to add files.")
+                } else {
+                    let lines = entries.map { e in
+                        let status = e.isUnlocked ? "(unlocked)" : "(locked)"
+                        let name = (e.originalPath as NSString).lastPathComponent
+                        return "\(e.protection.label)  \(name)  \(status)"
+                    }
+                    let alert = NSAlert()
+                    alert.messageText = "Protected Files (\(entries.count))"
+                    alert.informativeText = lines.joined(separator: "\n")
+                    alert.alertStyle = .informational
+                    alert.addButton(withTitle: "OK")
+                    alert.runModal()
+                }
+            },
+            onCancel: {},
+            onError: { VaultDialogs.showError($0) }
+        )
+    }
+
+    @objc private func vaultUnlockFiles() {
+        guard ensureVaultSetup() else { return }
+
+        VaultManager.shared.withAuth(
+            reason: "Authenticate to unlock files",
+            passphrasePrompt: "Enter Vault Passphrase",
+            onPassphrase: { passphrase in
+                let entries = VaultManager.shared.listEntries(passphrase: passphrase)
+                    .filter { $0.protection == .locked && !$0.isUnlocked }
+
+                if entries.isEmpty {
+                    VaultDialogs.showSuccess("No locked files to unlock.")
+                    return
+                }
+
+                guard VaultDialogs.confirmDecrypt(count: entries.count) else { return }
+
+                let paths = entries.map { $0.originalPath }
+                let result = VaultManager.shared.unlockFiles(paths, passphrase: passphrase)
+                if result.success {
+                    VaultDialogs.showSuccess(result.message)
+                } else {
+                    VaultDialogs.showError(result.message)
+                }
+            },
+            onCancel: {},
+            onError: { VaultDialogs.showError($0) }
+        )
+    }
+
+    @objc private func vaultLockFiles() {
+        guard ensureVaultSetup() else { return }
+
+        VaultManager.shared.withAuth(
+            reason: "Authenticate to lock files",
+            passphrasePrompt: "Enter Vault Passphrase",
+            onPassphrase: { passphrase in
+                let entries = VaultManager.shared.listEntries(passphrase: passphrase)
+                    .filter { $0.protection == .locked && $0.isUnlocked }
+
+                if entries.isEmpty {
+                    VaultDialogs.showSuccess("No unlocked files to lock.")
+                    return
+                }
+
+                let paths = entries.map { $0.originalPath }
+                let result = VaultManager.shared.lockFiles(paths, passphrase: passphrase)
+                if result.success {
+                    VaultDialogs.showSuccess(result.message)
+                } else {
+                    VaultDialogs.showError(result.message)
+                }
+            },
+            onCancel: {},
+            onError: { VaultDialogs.showError($0) }
+        )
+    }
+
+    @objc private func vaultChangePassphrase() {
+        guard ensureVaultSetup() else { return }
+
+        VaultManager.shared.authGate.authenticate(reason: "Authenticate to change vault passphrase") { success, error in
+            guard success else {
+                if let e = error { VaultDialogs.showError(e) }
+                return
+            }
+
+            guard let passes = VaultDialogs.promptChangePassphrase() else { return }
+            let result = VaultManager.shared.changePassphrase(old: passes.old, new: passes.new)
+            if result.success {
+                VaultDialogs.showSuccess(result.message)
+            } else {
+                VaultDialogs.showError(result.message)
+            }
+        }
+    }
+
+    // MARK: - App Lifecycle
+
     @objc private func quitApp() {
         daemon?.stop()
+        VaultManager.shared.clearPassphrase()
         NSApplication.shared.terminate(nil)
     }
 }

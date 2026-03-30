@@ -93,6 +93,36 @@ typedef struct ScanPolicyFFI {
 } ScanPolicyFFI;
 
 /**
+ * FFI-safe vault operation result.
+ */
+typedef struct VaultResultFFI {
+    bool success;
+    char *message;
+    uint32_t entries_affected;
+} VaultResultFFI;
+
+/**
+ * FFI-safe vault entry.
+ */
+typedef struct VaultEntryFFI {
+    char *original_path;
+    char *vault_path;
+    uint8_t protection;
+    char *encrypted_at;
+    uint64_t size_bytes;
+    bool is_directory;
+    bool is_unlocked;
+} VaultEntryFFI;
+
+/**
+ * FFI-safe vault entry array.
+ */
+typedef struct VaultEntryArrayFFI {
+    struct VaultEntryFFI *items;
+    uint32_t count;
+} VaultEntryArrayFFI;
+
+/**
  * Initialize with an optional config path. Returns true on success.
  */
 bool sec_init(const char *configPath);
@@ -148,5 +178,76 @@ void sec_free_sanitization_result(struct SanitizationResultFFI *ptr);
 void sec_free_threats(struct ThreatsArrayFFI *ptr);
 
 void sec_free_scan_policy(struct ScanPolicyFFI *ptr);
+
+/**
+ * Check if vault has been set up.
+ */
+bool sec_vault_is_setup(const char *securityDir);
+
+/**
+ * First-time vault setup — generates salt, creates manifest, writes recovery file.
+ */
+struct VaultResultFFI *sec_vault_setup(const char *securityDir);
+
+/**
+ * Set the initial vault passphrase (first-time only).
+ */
+bool sec_vault_set_passphrase(const char *securityDir, const char *passphrase);
+
+/**
+ * Verify vault passphrase.
+ */
+bool sec_vault_verify_passphrase(const char *securityDir, const char *passphrase);
+
+/**
+ * Add files to vault. `paths` is a colon-separated list. `protection`: 0=locked, 1=read_only, 2=local_only.
+ */
+struct VaultResultFFI *sec_vault_add(const char *securityDir,
+                                     const char *paths,
+                                     uint8_t protection,
+                                     const char *passphrase);
+
+/**
+ * Unlock (decrypt) vault entries. `paths` is colon-separated.
+ */
+struct VaultResultFFI *sec_vault_unlock(const char *securityDir,
+                                        const char *paths,
+                                        const char *passphrase);
+
+/**
+ * Lock (re-encrypt) previously unlocked entries. `paths` is colon-separated.
+ */
+struct VaultResultFFI *sec_vault_lock(const char *securityDir,
+                                      const char *paths,
+                                      const char *passphrase);
+
+/**
+ * Remove entries from vault (decrypt and restore). `paths` is colon-separated.
+ */
+struct VaultResultFFI *sec_vault_remove(const char *securityDir,
+                                        const char *paths,
+                                        const char *passphrase);
+
+/**
+ * List all vault entries.
+ */
+struct VaultEntryArrayFFI *sec_vault_list(const char *securityDir, const char *passphrase);
+
+/**
+ * Change vault passphrase.
+ */
+struct VaultResultFFI *sec_vault_change_passphrase(const char *securityDir,
+                                                   const char *oldPassphrase,
+                                                   const char *newPassphrase);
+
+/**
+ * Free a VaultResultFFI.
+ */
+void sec_free_vault_result(struct VaultResultFFI *ptr);
+
+/**
+ * Free a VaultEntryArrayFFI.
+ */
+void sec_free_vault_entries(struct VaultEntryArrayFFI *ptr);
 
 #endif  /* SECURITY_CORE_H */

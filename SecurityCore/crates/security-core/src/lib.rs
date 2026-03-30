@@ -14,3 +14,4 @@ pub mod key_filter;
 pub mod wasm_sandbox;
 pub mod tls_transport;
 pub mod process_manager;
+pub mod vault;
