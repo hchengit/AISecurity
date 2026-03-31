@@ -37,21 +37,41 @@ enum VaultDialogs {
         \u{26A0} IMPORTANT: If you forget this passphrase, your encrypted files \
         CANNOT be recovered. There is no reset option.
 
-        We recommend writing it down and storing it in a safe place.
+        Aim for 90%+ on the strength meter below. We recommend writing \
+        it down and storing it in a safe place.
         """
         passAlert.alertStyle = .informational
         passAlert.addButton(withTitle: "Set Passphrase")
         passAlert.addButton(withTitle: "Cancel")
 
-        let container = NSView(frame: NSRect(x: 0, y: 0, width: 320, height: 68))
+        let container = NSView(frame: NSRect(x: 0, y: 0, width: 320, height: 168))
 
-        let pass1 = NSSecureTextField(frame: NSRect(x: 0, y: 38, width: 320, height: 24))
+        let pass1 = NSSecureTextField(frame: NSRect(x: 0, y: 138, width: 320, height: 24))
         pass1.placeholderString = "Enter passphrase"
         container.addSubview(pass1)
 
-        let pass2 = NSSecureTextField(frame: NSRect(x: 0, y: 6, width: 320, height: 24))
+        let pass2 = NSSecureTextField(frame: NSRect(x: 0, y: 106, width: 320, height: 24))
         pass2.placeholderString = "Confirm passphrase"
         container.addSubview(pass2)
+
+        // Strength indicator
+        let (strengthView, updateStrength) = makeStrengthView(width: 320)
+        strengthView.frame.origin = NSPoint(x: 0, y: 46)
+        container.addSubview(strengthView)
+
+        // Educational tip
+        let eduLabel = NSTextField(wrappingLabelWithString:
+            "\u{1F4A1} Tip: 4 random words like \"maple anchor freight violin\" gives 90%+ strength " +
+            "and would take millions of years to crack. Length beats complexity.")
+        eduLabel.frame = NSRect(x: 0, y: 0, width: 320, height: 40)
+        eduLabel.font = .systemFont(ofSize: 10)
+        eduLabel.textColor = .tertiaryLabelColor
+        container.addSubview(eduLabel)
+
+        // Wire up real-time strength updates via a delegate
+        let strengthDelegate = PassphraseStrengthDelegate(update: updateStrength)
+        pass1.delegate = strengthDelegate
+        objc_setAssociatedObject(passAlert, "strengthDelegate", strengthDelegate, .OBJC_ASSOCIATION_RETAIN)
 
         passAlert.accessoryView = container
         passAlert.window.initialFirstResponder = pass1
@@ -188,6 +208,20 @@ enum VaultDialogs {
 
     // MARK: - Protection Level Picker
 
+    /// Delegate for real-time passphrase strength updates as user types.
+    private class PassphraseStrengthDelegate: NSObject, NSTextFieldDelegate {
+        let update: (String) -> Void
+
+        init(update: @escaping (String) -> Void) {
+            self.update = update
+        }
+
+        func controlTextDidChange(_ obj: Notification) {
+            guard let field = obj.object as? NSTextField else { return }
+            update(field.stringValue)
+        }
+    }
+
     /// Helper that enforces mutual exclusivity between Locked and Read-only checkboxes.
     private class ProtectionPickerDelegate: NSObject {
         let lockedBox: NSButton
@@ -307,19 +341,28 @@ enum VaultDialogs {
         alert.addButton(withTitle: "Change")
         alert.addButton(withTitle: "Cancel")
 
-        let container = NSView(frame: NSRect(x: 0, y: 0, width: 320, height: 102))
+        let container = NSView(frame: NSRect(x: 0, y: 0, width: 320, height: 162))
 
-        let oldField = NSSecureTextField(frame: NSRect(x: 0, y: 72, width: 320, height: 24))
+        let oldField = NSSecureTextField(frame: NSRect(x: 0, y: 132, width: 320, height: 24))
         oldField.placeholderString = "Current passphrase"
         container.addSubview(oldField)
 
-        let newField = NSSecureTextField(frame: NSRect(x: 0, y: 40, width: 320, height: 24))
+        let newField = NSSecureTextField(frame: NSRect(x: 0, y: 100, width: 320, height: 24))
         newField.placeholderString = "New passphrase"
         container.addSubview(newField)
 
-        let confirmField = NSSecureTextField(frame: NSRect(x: 0, y: 8, width: 320, height: 24))
+        let confirmField = NSSecureTextField(frame: NSRect(x: 0, y: 68, width: 320, height: 24))
         confirmField.placeholderString = "Confirm new passphrase"
         container.addSubview(confirmField)
+
+        // Strength indicator for new passphrase
+        let (strengthView, updateStrength) = makeStrengthView(width: 320)
+        strengthView.frame.origin = NSPoint(x: 0, y: 8)
+        container.addSubview(strengthView)
+
+        let strengthDelegate = PassphraseStrengthDelegate(update: updateStrength)
+        newField.delegate = strengthDelegate
+        objc_setAssociatedObject(alert, "strengthDelegate", strengthDelegate, .OBJC_ASSOCIATION_RETAIN)
 
         alert.accessoryView = container
         alert.window.initialFirstResponder = oldField
@@ -348,6 +391,109 @@ enum VaultDialogs {
             }
             return (old: oldPass, new: newPass)
         }
+    }
+
+    // MARK: - Passphrase Strength
+
+    /// Estimate passphrase strength as a percentage (0–100).
+    /// 8 chars ≈ 20%, 12 chars ≈ 45%, 16 chars ≈ 70%, 20+ chars or 4+ words ≈ 90%+.
+    static func passphraseStrength(_ passphrase: String) -> Int {
+        let len = passphrase.count
+        guard len > 0 else { return 0 }
+
+        var score: Double = 0
+
+        // Length is the dominant factor
+        score += min(Double(len), 30) * 2.5  // up to 75 points from length
+
+        // Character variety adds modest bonus
+        let hasLower = passphrase.rangeOfCharacter(from: .lowercaseLetters) != nil
+        let hasUpper = passphrase.rangeOfCharacter(from: .uppercaseLetters) != nil
+        let hasDigit = passphrase.rangeOfCharacter(from: .decimalDigits) != nil
+        let hasSymbol = passphrase.rangeOfCharacter(from: CharacterSet.alphanumerics.inverted) != nil
+        let variety = [hasLower, hasUpper, hasDigit, hasSymbol].filter { $0 }.count
+        score += Double(variety) * 3  // up to 12 points
+
+        // Word-based bonus: spaces indicate multi-word passphrase
+        let wordCount = passphrase.split(separator: " ").filter { $0.count >= 3 }.count
+        if wordCount >= 4 { score += 20 }       // 4+ words is excellent
+        else if wordCount >= 3 { score += 12 }   // 3 words is good
+
+        // Penalize common patterns
+        let lower = passphrase.lowercased()
+        let commonPatterns = ["password", "123456", "qwerty", "abc123", "letmein", "admin", "welcome"]
+        if commonPatterns.contains(where: { lower.contains($0) }) {
+            score = min(score, 15)
+        }
+
+        return min(100, max(0, Int(score)))
+    }
+
+    /// Human-readable strength label + color.
+    static func strengthLabel(_ score: Int) -> (text: String, color: NSColor) {
+        switch score {
+        case 0..<25:   return ("Weak",       NSColor.systemRed)
+        case 25..<50:  return ("Fair",       NSColor.systemOrange)
+        case 50..<75:  return ("Good",       NSColor.systemYellow)
+        case 75..<90:  return ("Strong",     NSColor.systemGreen)
+        default:       return ("Excellent",  NSColor.systemGreen)
+        }
+    }
+
+    /// Build the strength bar view (progress bar + label + educational tip).
+    static func makeStrengthView(width: CGFloat) -> (view: NSView, update: (String) -> Void) {
+        let container = NSView(frame: NSRect(x: 0, y: 0, width: width, height: 52))
+
+        // Progress bar background
+        let barBg = NSView(frame: NSRect(x: 0, y: 36, width: width, height: 6))
+        barBg.wantsLayer = true
+        barBg.layer?.backgroundColor = NSColor.separatorColor.cgColor
+        barBg.layer?.cornerRadius = 3
+        container.addSubview(barBg)
+
+        // Progress bar fill
+        let barFill = NSView(frame: NSRect(x: 0, y: 36, width: 0, height: 6))
+        barFill.wantsLayer = true
+        barFill.layer?.cornerRadius = 3
+        container.addSubview(barFill)
+
+        // Strength label
+        let label = NSTextField(labelWithString: "")
+        label.frame = NSRect(x: 0, y: 18, width: width, height: 14)
+        label.font = .systemFont(ofSize: 11, weight: .medium)
+        container.addSubview(label)
+
+        // Tip text
+        let tip = NSTextField(wrappingLabelWithString: "")
+        tip.frame = NSRect(x: 0, y: 0, width: width, height: 14)
+        tip.font = .systemFont(ofSize: 10)
+        tip.textColor = .secondaryLabelColor
+        container.addSubview(tip)
+
+        let update: (String) -> Void = { passphrase in
+            let score = passphraseStrength(passphrase)
+            let (text, color) = strengthLabel(score)
+
+            barFill.frame.size.width = width * CGFloat(score) / 100.0
+            barFill.layer?.backgroundColor = color.cgColor
+
+            label.stringValue = "Strength: \(text) (\(score)%)"
+            label.textColor = color
+
+            if score < 25 {
+                tip.stringValue = "Too short — try 4 random words like: maple anchor freight violin"
+            } else if score < 50 {
+                tip.stringValue = "Getting there — longer is better. Try adding more words."
+            } else if score < 75 {
+                tip.stringValue = "Good length. 4+ random words reaches 90%+ (would take millions of years to crack)."
+            } else if score < 90 {
+                tip.stringValue = "Strong passphrase. Very difficult to brute-force even with modern hardware."
+            } else {
+                tip.stringValue = "Excellent — this would take millions of years to crack."
+            }
+        }
+
+        return (container, update)
     }
 
     // MARK: - Helpers

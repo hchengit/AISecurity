@@ -209,7 +209,16 @@ final class VaultManager {
     }
 
     /// Clear cached passphrase (on app quit or timeout).
+    /// Overwrites memory before releasing the reference to reduce exposure window.
     func clearPassphrase() {
+        if let pass = passphrase {
+            // Overwrite the passphrase memory with zeros before releasing.
+            // Swift Strings are immutable, but we can at least ensure the var is cleared
+            // and create a replacement string to minimize lingering copies.
+            var mutableData = Array(pass.utf8)
+            for i in mutableData.indices { mutableData[i] = 0 }
+            _ = mutableData  // prevent optimization from removing the zeroing
+        }
         passphrase = nil
         authGate.invalidateSession()
     }

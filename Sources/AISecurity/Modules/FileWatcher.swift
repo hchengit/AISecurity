@@ -202,10 +202,11 @@ final class FileWatcher: @unchecked Sendable {
     }
 
     private func handleFileEvent(_ filePath: String, watchType: String) {
-        let fm = FileManager.default
-        guard fm.fileExists(atPath: filePath),
-              let attrs = try? fm.attributesOfItem(atPath: filePath),
-              let type = attrs[.type] as? FileAttributeType, type == .typeRegular else { return }
+        // Use lstat to avoid following symlinks (TOCTOU-safe, single syscall)
+        var statBuf = stat()
+        guard lstat(filePath, &statBuf) == 0 else { return }
+        // Reject symlinks — only handle regular files
+        guard (statBuf.st_mode & S_IFMT) == S_IFREG else { return }
 
         if watchType == "PROTECTED" {
             if isMacOSRoutine(filePath) {

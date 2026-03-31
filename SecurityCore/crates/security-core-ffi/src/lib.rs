@@ -507,7 +507,7 @@ pub extern "C" fn sec_vault_add(
     let paths_str = match unsafe { from_c_str(paths) } { Some(p) => p, None => return ptr::null_mut() };
     let pass = match unsafe { from_c_str(passphrase) } { Some(p) => p, None => return ptr::null_mut() };
 
-    let path_list: Vec<&str> = paths_str.split(':').collect();
+    let path_list: Vec<&str> = paths_str.split('\n').collect();
     let prot = u8_to_protection(protection);
     let v = vault::Vault::new(&dir);
 
@@ -536,7 +536,7 @@ pub extern "C" fn sec_vault_unlock(
     let paths_str = match unsafe { from_c_str(paths) } { Some(p) => p, None => return ptr::null_mut() };
     let pass = match unsafe { from_c_str(passphrase) } { Some(p) => p, None => return ptr::null_mut() };
 
-    let path_list: Vec<&str> = paths_str.split(':').collect();
+    let path_list: Vec<&str> = paths_str.split('\n').collect();
     let v = vault::Vault::new(&dir);
 
     match v.unlock(&path_list, &pass) {
@@ -560,7 +560,7 @@ pub extern "C" fn sec_vault_lock(
     let paths_str = match unsafe { from_c_str(paths) } { Some(p) => p, None => return ptr::null_mut() };
     let pass = match unsafe { from_c_str(passphrase) } { Some(p) => p, None => return ptr::null_mut() };
 
-    let path_list: Vec<&str> = paths_str.split(':').collect();
+    let path_list: Vec<&str> = paths_str.split('\n').collect();
     let v = vault::Vault::new(&dir);
 
     match v.lock(&path_list, &pass) {
@@ -584,7 +584,7 @@ pub extern "C" fn sec_vault_remove(
     let paths_str = match unsafe { from_c_str(paths) } { Some(p) => p, None => return ptr::null_mut() };
     let pass = match unsafe { from_c_str(passphrase) } { Some(p) => p, None => return ptr::null_mut() };
 
-    let path_list: Vec<&str> = paths_str.split(':').collect();
+    let path_list: Vec<&str> = paths_str.split('\n').collect();
     let v = vault::Vault::new(&dir);
 
     match v.remove(&path_list, &pass) {
@@ -668,7 +668,7 @@ pub extern "C" fn sec_vault_toggle_local_only(
     let paths_str = match unsafe { from_c_str(paths) } { Some(p) => p, None => return ptr::null_mut() };
     let pass = match unsafe { from_c_str(passphrase) } { Some(p) => p, None => return ptr::null_mut() };
 
-    let path_list: Vec<&str> = paths_str.split(':').collect();
+    let path_list: Vec<&str> = paths_str.split('\n').collect();
     let v = vault::Vault::new(&dir);
 
     match v.toggle_local_only(&path_list, &pass) {

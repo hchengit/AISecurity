@@ -6,8 +6,10 @@
 
 use aes_gcm::aead::{Aead, KeyInit, OsRng};
 use aes_gcm::{Aes256Gcm, Nonce};
+use hmac::Hmac;
+use pbkdf2::pbkdf2;
 use rand::RngCore;
-use sha2::{Digest, Sha256};
+use sha2::Sha256;
 
 /// AAD tags for different encryption contexts — prevents ciphertext reuse across contexts.
 pub mod aad {
@@ -207,13 +209,23 @@ impl Encryptor {
     }
 }
 
-/// Derive a 256-bit key from a passphrase via SHA-256.
+/// PBKDF2 iteration count — 100,000 iterations per OWASP recommendation.
+const PBKDF2_ITERATIONS: u32 = 100_000;
+
+/// Fixed salt for PBKDF2 key derivation (vault operations add their own per-vault salt on top).
+/// This prevents rainbow table attacks on the passphrase-to-key derivation step.
+const PBKDF2_SALT: &[u8] = b"securitycore:pbkdf2:v1:salt";
+
+/// Derive a 256-bit key from a passphrase via PBKDF2-HMAC-SHA256 (100k iterations).
+/// Replaces single-pass SHA-256 to resist brute-force attacks.
 fn derive_key(passphrase: &str) -> [u8; 32] {
-    let mut hasher = Sha256::new();
-    hasher.update(passphrase.as_bytes());
-    let result = hasher.finalize();
     let mut key = [0u8; 32];
-    key.copy_from_slice(&result);
+    pbkdf2::<Hmac<Sha256>>(
+        passphrase.as_bytes(),
+        PBKDF2_SALT,
+        PBKDF2_ITERATIONS,
+        &mut key,
+    ).expect("PBKDF2 key derivation");
     key
 }
 

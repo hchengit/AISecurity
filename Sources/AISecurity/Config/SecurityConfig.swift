@@ -133,6 +133,9 @@ struct SecurityConfig: Sendable {
             return nil
         }
 
+        // Verify config file ownership and permissions (security hardening)
+        Self.verifyConfigIntegrity(secDir: secDir, configPath: configPath)
+
         return try? TOMLTable(string: contents)
     }
 
@@ -174,6 +177,54 @@ struct SecurityConfig: Sendable {
             }
         }
         return result.isEmpty ? nil : result
+    }
+
+    // ── Config Integrity Check ──────────────────────────────────────
+
+    /// Verify config file ownership and permissions to detect tampering.
+    /// Alerts if config is writable by group/other or owned by another user.
+    private static func verifyConfigIntegrity(secDir: String, configPath: String) {
+        let fm = FileManager.default
+
+        // Check security directory permissions
+        for path in [secDir, configPath] {
+            guard let attrs = try? fm.attributesOfItem(atPath: path) else { continue }
+
+            // Verify owner is current user
+            if let ownerID = attrs[.ownerAccountID] as? NSNumber {
+                let currentUID = getuid()
+                if ownerID.uint32Value != currentUID {
+                    NSLog("[AISecurity] WARNING: %@ owned by uid %d, expected %d — possible tampering",
+                          path, ownerID.uint32Value, currentUID)
+                }
+            }
+
+            // Check permissions — should be 0700 (dir) or 0600 (file)
+            if let posix = attrs[.posixPermissions] as? NSNumber {
+                let mode = posix.uint16Value
+                let groupOtherBits = mode & 0o077
+                if groupOtherBits != 0 {
+                    NSLog("[AISecurity] WARNING: %@ is accessible by group/other (mode %o) — hardening to owner-only", path, mode)
+                    // Auto-harden: strip group/other permissions
+                    let isDir = (attrs[.type] as? FileAttributeType) == .typeDirectory
+                    let safeMode: UInt16 = isDir ? 0o700 : 0o600
+                    try? fm.setAttributes([.posixPermissions: NSNumber(value: safeMode)], ofItemAtPath: path)
+                }
+            }
+        }
+
+        // Verify notification config permissions too
+        let notifConfigPath = (secDir as NSString).appendingPathComponent("notification-config.json")
+        if fm.fileExists(atPath: notifConfigPath) {
+            if let attrs = try? fm.attributesOfItem(atPath: notifConfigPath),
+               let posix = attrs[.posixPermissions] as? NSNumber {
+                let mode = posix.uint16Value
+                if mode & 0o077 != 0 {
+                    NSLog("[AISecurity] WARNING: notification-config.json is accessible by group/other — hardening")
+                    try? fm.setAttributes([.posixPermissions: NSNumber(value: UInt16(0o600))], ofItemAtPath: notifConfigPath)
+                }
+            }
+        }
     }
 
     // ── Init with TOML + env var support ────────────────────────────

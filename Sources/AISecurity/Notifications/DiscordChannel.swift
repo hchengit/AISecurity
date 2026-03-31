@@ -106,6 +106,19 @@ enum DiscordChannel {
             return
         }
 
+        // Security: Only allow HTTPS URLs to prevent SSRF and credential leakage
+        guard url.scheme?.lowercased() == "https" else {
+            completion(false, "Only HTTPS webhook URLs are allowed")
+            return
+        }
+        // Block localhost/internal addresses
+        if let host = url.host?.lowercased(),
+           host == "localhost" || host.hasPrefix("127.") || host.hasPrefix("10.")
+           || host.hasPrefix("192.168.") || host == "0.0.0.0" || host == "::1" {
+            completion(false, "Local/internal webhook URLs are not allowed")
+            return
+        }
+
         var request = URLRequest(url: url)
         request.httpMethod = "POST"
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")

@@ -71,9 +71,34 @@ struct PathResolver: Sendable {
             return path
         }
 
+        /// Validate a resolved path is safe — reject traversal, symlinks to suspicious targets, and /tmp.
+        func validatePath(_ path: String, envKey: String) -> String {
+            // Reject paths with traversal components
+            if path.contains("/../") || path.hasSuffix("/..") {
+                NSLog("[AISecurity] WARNING: Rejecting suspicious path traversal in %@: %@", envKey, path)
+                return resolve("~/.mac-security")
+            }
+            // Reject /tmp as a security directory target (logs/config would be world-readable)
+            if envKey == "MACSEC_SECURITY_DIR" || envKey == "MACSEC_LOG_DIR" || envKey == "MACSEC_QUARANTINE_DIR" {
+                if path.hasPrefix("/tmp") || path.hasPrefix("/var/tmp") {
+                    NSLog("[AISecurity] WARNING: Rejecting insecure temp path in %@: %@", envKey, path)
+                    return resolve("~/.mac-security")
+                }
+            }
+            // Reject symlinks pointing outside home
+            let fm = FileManager.default
+            if let dest = try? fm.destinationOfSymbolicLink(atPath: path) {
+                if !dest.hasPrefix(home) {
+                    NSLog("[AISecurity] WARNING: Rejecting symlink to outside home in %@: %@ → %@", envKey, path, dest)
+                    return resolve("~/.mac-security")
+                }
+            }
+            return path
+        }
+
         func envOrConfig(_ envKey: String, config: String?, fallback: String) -> String {
             if let env = ProcessInfo.processInfo.environment[envKey], !env.isEmpty {
-                return resolve(env)
+                return validatePath(resolve(env), envKey: envKey)
             }
             if let cfg = config {
                 return resolve(cfg)

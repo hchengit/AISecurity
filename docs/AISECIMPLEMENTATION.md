@@ -1,7 +1,7 @@
 # AISecurity — Cross-Platform Assessment & Implementation Plan
 
 **Date:** 2026-03-28
-**Status:** Phase 8 complete (external notifications + rate limiting + auth hardening)
+**Status:** Phase 9 in progress (security hardening — self-protection + attack surface reduction)
 **Last Updated:** 2026-03-30
 
 ---
@@ -306,7 +306,36 @@ of WHAT it does with that access. That's the gap AISecurity fills.
 | Email test delivery (Gmail) | ✅ Done | Tested — HTML email via SMTP/curl — 2026-03-30 |
 | VAULT_FILE_ACCESS → external notification end-to-end | ✅ Done | Tested — touch .vault → in-app + Telegram + Discord + Email — 2026-03-30 |
 
-### Phase 9: Linux Completion
+### Phase 9: Security Hardening — Self-Protection & Attack Surface Reduction
+
+| Component | Status | Location |
+|-----------|--------|----------|
+| **P0 — Critical (app can be defeated trivially)** | | |
+| Daemon always-restart (KeepAlive → true) | ✅ Done | `install.sh` — LaunchAgent plist — 2026-03-30 |
+| Symlink resolution in vault (canonicalize all paths) | ✅ Done | `vault.rs` — add/lock/unlock/remove + secure_delete — 2026-03-30 |
+| Config integrity checks (ownership, permissions, tamper alert) | ✅ Done | `SecurityConfig.swift` — verify 0600 + owner on load, auto-harden — 2026-03-30 |
+| Self-monitoring (watch own binary, config dir, logs dir) | ✅ Done | `SecurityDaemon.swift` — DispatchSource on app bundle, config, logs + external alert — 2026-03-30 |
+| **P1 — High (exploitable with moderate effort)** | | |
+| PBKDF2 key derivation (replace single SHA-256) | ✅ Done | `encryption.rs` — PBKDF2-HMAC-SHA256, 100k iterations — 2026-03-30 |
+| Notification credentials → macOS Keychain | ✅ Done | `NotificationConfig.swift` — SecItemAdd/CopyMatching + auto-migration from JSON — 2026-03-30 |
+| FFI null pointer safety (Swift side) | ✅ Done | `SecurityCoreBridge.swift` — safeString() guard on all String(cString:) calls — 2026-03-30 |
+| Notification content sanitization (email header + log injection) | ✅ Done | `EmailChannel.swift` — sanitizeHeader(), escapeHTML() — 2026-03-30 |
+| Passphrase memory zeroing (Data + explicit wipe) | ✅ Done | `VaultManager.swift` — clearPassphrase() overwrites before release — 2026-03-30 |
+| Passphrase strength indicator (real-time bar + educational tips) | ✅ Done | `VaultDialogs.swift` — setup wizard + change passphrase; 8 chars ≈ 20%, 4 words ≈ 90%+ — 2026-03-30 |
+| FFI path separator fix (colon → newline delimiter) | ✅ Done | `security-core-ffi/src/lib.rs` + `SecurityCoreBridge.swift` — `\n` separator — 2026-03-30 |
+| **P2 — Medium (defense-in-depth)** | | |
+| Pin dependency versions (exact in Package.swift + Cargo.toml) | ✅ Done | `Package.swift` exact: "0.6.0", `Cargo.toml` all exact versions — 2026-03-30 |
+| Webhook URL validation (HTTPS only, no localhost/internal) | ✅ Done | `DiscordChannel.swift` + `TelegramChannel.swift` — scheme + host checks — 2026-03-30 |
+| Env var path validation (reject traversal, symlinks, /tmp) | ✅ Done | `PathResolver.swift` — validatePath() rejects /../, /tmp, external symlinks — 2026-03-30 |
+| TOCTOU fix in FileWatcher (symlink-safe lstat) | ✅ Done | `FileWatcher.swift` — lstat() replaces fileExists+attributesOfItem — 2026-03-30 |
+| **Verification** | | |
+| Symlink attack test (ln -s /etc/passwd → vault add) | ⬜ Not started | — |
+| Config tampering test (disable scanner → alert fires) | ⬜ Not started | — |
+| Daemon kill test (killall → auto-restart) | ⬜ Not started | — |
+| Credential storage test (Keychain read/write cycle) | ⬜ Not started | — |
+| PBKDF2 key derivation test (existing vault still decrypts after migration) | ⬜ Not started | — |
+
+### Phase 10: Linux Completion
 
 | Component | Status | Location |
 |-----------|--------|----------|
@@ -339,7 +368,7 @@ of WHAT it does with that access. That's the gap AISecurity fills.
 | External notification end-to-end test | ⬜ Not started | — |
 | Auth lockout + external alert test | ⬜ Not started | — |
 
-### Phase 10: Commercial Release Path
+### Phase 11: Commercial Release Path
 
 | Component | Status | Notes |
 |-----------|--------|-------|

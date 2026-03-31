@@ -106,7 +106,13 @@ enum TelegramChannel {
 
     private static func post(token: String, method: String, body: [String: Any],
                              completion: @escaping (Bool, String?) -> Void) {
-        let urlString = "https://api.telegram.org/bot\(token)/\(method)"
+        // URL-encode token and method to prevent path traversal
+        guard let safeToken = token.addingPercentEncoding(withAllowedCharacters: .alphanumerics),
+              let safeMethod = method.addingPercentEncoding(withAllowedCharacters: .alphanumerics) else {
+            completion(false, "Invalid token or method format")
+            return
+        }
+        let urlString = "https://api.telegram.org/bot\(safeToken)/\(safeMethod)"
         guard let url = URL(string: urlString) else {
             completion(false, "Invalid URL")
             return

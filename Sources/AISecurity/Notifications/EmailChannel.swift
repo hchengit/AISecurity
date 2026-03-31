@@ -12,7 +12,7 @@ enum EmailChannel {
             return
         }
 
-        let subject = "\(severityEmoji(alert.severity)) AISecurity: \(alert.type)"
+        let subject = sanitizeHeader("\(severityEmoji(alert.severity)) AISecurity: \(alert.type)")
         let htmlBody = buildHTML(alert)
         let plainBody = buildPlainText(alert)
 
@@ -96,8 +96,8 @@ enum EmailChannel {
             <span style="display:inline-block; padding: 5px 14px; background: \(sevColor); color: white; border-radius: 20px; font-size: 12px; font-weight: bold;">
               \(sevEmoji) \(sevLabel)
             </span>
-            <h2 style="margin: 15px 0 10px; font-size: 20px; color: #333;">\(alert.type)</h2>
-            <p style="font-size: 15px; color: #555; line-height: 1.5;">\(alert.message)</p>
+            <h2 style="margin: 15px 0 10px; font-size: 20px; color: #333;">\(escapeHTML(alert.type))</h2>
+            <p style="font-size: 15px; color: #555; line-height: 1.5;">\(escapeHTML(alert.message))</p>
             \(findingsHTML)
             \(threatsHTML)
             \(fileHTML)
@@ -161,6 +161,22 @@ enum EmailChannel {
         }
     }
 
+    // MARK: - Header Sanitization
+
+    /// Strip CR/LF from header values to prevent email header injection.
+    private static func sanitizeHeader(_ value: String) -> String {
+        value.replacingOccurrences(of: "\r", with: "")
+             .replacingOccurrences(of: "\n", with: " ")
+    }
+
+    /// Sanitize content for safe inclusion in email body — escape HTML entities.
+    private static func escapeHTML(_ text: String) -> String {
+        text.replacingOccurrences(of: "&", with: "&amp;")
+            .replacingOccurrences(of: "<", with: "&lt;")
+            .replacingOccurrences(of: ">", with: "&gt;")
+            .replacingOccurrences(of: "\"", with: "&quot;")
+    }
+
     // MARK: - SMTP via curl
 
     private static func sendMail(to: String, from: String, password: String,
@@ -169,10 +185,13 @@ enum EmailChannel {
         DispatchQueue.global(qos: .utility).async {
             // Build RFC 2822 MIME message
             let boundary = "AISecurity-\(UUID().uuidString)"
+            let safeFrom = sanitizeHeader(from)
+            let safeTo = sanitizeHeader(to)
+            let safeSubject = sanitizeHeader(subject)
             let message = """
-            From: "AISecurity" <\(from)>
-            To: \(to)
-            Subject: \(subject)
+            From: "AISecurity" <\(safeFrom)>
+            To: \(safeTo)
+            Subject: \(safeSubject)
             MIME-Version: 1.0
             Content-Type: multipart/alternative; boundary="\(boundary)"
 

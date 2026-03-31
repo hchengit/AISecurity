@@ -170,7 +170,10 @@ final class SecurityDaemon: ObservableObject {
             scheduledScanTimer = timer
         }
 
-        // 7. Status file writer (every 10s)
+        // 7. Self-protection monitor (watch own binary, config, logs)
+        startSelfProtectionMonitor()
+
+        // 8. Status file writer (every 10s)
         startStatusWriter()
 
         isRunning = true
@@ -194,6 +197,8 @@ final class SecurityDaemon: ObservableObject {
         scheduledScanTimer = nil
         statusWriterTimer?.cancel()
         statusWriterTimer = nil
+        selfProtectionSources.forEach { $0.cancel() }
+        selfProtectionSources.removeAll()
         isRunning = false
         logger.info("\u{1F4F4} Mac Security Agent stopped")
         onStateChange?()
@@ -292,6 +297,62 @@ final class SecurityDaemon: ObservableObject {
         if let data = try? JSONSerialization.data(withJSONObject: status, options: .prettyPrinted) {
             try? data.write(to: URL(fileURLWithPath: path))
         }
+    }
+
+    // MARK: - Self-Protection Monitor
+
+    private var selfProtectionSources: [DispatchSourceFileSystemObject] = []
+
+    /// Monitor critical app files for tampering: binary, config, logs directory.
+    private func startSelfProtectionMonitor() {
+        let criticalPaths = [
+            config.securityDir,                                                           // config directory
+            (config.securityDir as NSString).appendingPathComponent("config.toml"),        // config file
+            (config.securityDir as NSString).appendingPathComponent("notification-config.json"), // credentials
+            config.audit.logDir,                                                          // logs directory
+        ]
+
+        // Also monitor the app bundle if it exists
+        let appBundlePath = Bundle.main.bundlePath
+        let allPaths = criticalPaths + [appBundlePath]
+
+        for path in allPaths {
+            guard FileManager.default.fileExists(atPath: path) else { continue }
+            let fd = open(path, O_EVTONLY)
+            guard fd >= 0 else { continue }
+
+            let source = DispatchSource.makeFileSystemObjectSource(
+                fileDescriptor: fd,
+                eventMask: [.write, .delete, .rename, .attrib],
+                queue: DispatchQueue.global(qos: .utility)
+            )
+
+            source.setEventHandler { [weak self] in
+                let flags = source.data
+                var changes: [String] = []
+                if flags.contains(.write) { changes.append("modified") }
+                if flags.contains(.delete) { changes.append("deleted") }
+                if flags.contains(.rename) { changes.append("renamed") }
+                if flags.contains(.attrib) { changes.append("permissions changed") }
+
+                let alert = SecurityAlert(
+                    type: "SELF_PROTECTION",
+                    severity: .critical,
+                    message: "\u{1F6A8} AISecurity self-protection: \(path) was \(changes.joined(separator: ", "))",
+                    filePath: path
+                )
+                self?.logger.alert(alert)
+                self?.onAlert?(alert)
+                // Also send external notification for critical self-protection alerts
+                NotificationManager.shared.send(alert)
+            }
+
+            source.setCancelHandler { close(fd) }
+            source.resume()
+            selfProtectionSources.append(source)
+        }
+
+        logger.info("\u{1F6E1} Self-protection active: monitoring \(selfProtectionSources.count) critical paths")
     }
 
     // MARK: - Manual Scan

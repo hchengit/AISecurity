@@ -113,6 +113,7 @@ pub struct VaultResult {
 #[derive(Debug)]
 pub enum VaultError {
     Io(std::io::Error),
+    IoError(String),
     Encryption(EncryptionError),
     InvalidPassphrase,
     FileNotFound(String),
@@ -125,6 +126,7 @@ impl std::fmt::Display for VaultError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Io(e) => write!(f, "I/O error: {}", e),
+            Self::IoError(msg) => write!(f, "I/O error: {}", msg),
             Self::Encryption(e) => write!(f, "Encryption error: {}", e),
             Self::InvalidPassphrase => write!(f, "Invalid passphrase"),
             Self::FileNotFound(p) => write!(f, "File not found: {}", p),
@@ -219,16 +221,30 @@ impl Vault {
                 return Err(VaultError::FileNotFound(path_str.to_string()));
             }
 
+            // Resolve symlinks and canonicalize to prevent symlink attacks
+            let canonical = path.canonicalize().map_err(|e| {
+                VaultError::IoError(format!("Cannot resolve path {}: {}", path_str, e))
+            })?;
+            let canonical_str = canonical.to_string_lossy().to_string();
+
+            // Reject symlinks — require the real path
+            if canonical_str != *path_str && path.read_link().is_ok() {
+                return Err(VaultError::IoError(format!(
+                    "Refusing symlink: {} → {}. Use the real path instead.",
+                    path_str, canonical_str
+                )));
+            }
+
             // Check not already in vault
-            if manifest.entries.iter().any(|e| e.original_path == *path_str) {
+            if manifest.entries.iter().any(|e| e.original_path == canonical_str) {
                 continue; // skip silently
             }
 
-            if path.is_dir() {
+            if canonical.is_dir() {
                 // Recursively add directory contents
-                affected += self.add_directory(path, protection, &encryptor, &mut manifest)?;
+                affected += self.add_directory(&canonical, protection, &encryptor, &mut manifest)?;
             } else {
-                self.add_single_file(path, protection, &encryptor, &mut manifest)?;
+                self.add_single_file(&canonical, protection, &encryptor, &mut manifest)?;
                 affected += 1;
             }
         }
@@ -526,6 +542,10 @@ impl Vault {
         let entries = fs::read_dir(dir)?;
         for entry in entries.flatten() {
             let path = entry.path();
+            // Skip symlinks inside directories to prevent symlink attacks
+            if path.read_link().is_ok() {
+                continue;
+            }
             if path.is_dir() {
                 count += self.add_directory(&path, protection, encryptor, manifest)?;
             } else if path.is_file() {
@@ -652,7 +672,15 @@ SUPPORT:
 // ─── Utility functions ──────────────────────────────────────────────────────
 
 /// Secure delete: overwrite with random bytes 3 times, then unlink.
+/// Rejects symlinks to prevent overwriting unintended targets.
 fn secure_delete(path: &Path) -> Result<(), std::io::Error> {
+    // Reject symlinks — prevent overwriting symlink targets
+    if path.read_link().is_ok() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("Refusing to secure-delete symlink: {}", path.display()),
+        ));
+    }
     let size = fs::metadata(path)?.len() as usize;
     if size > 0 {
         for _ in 0..3 {

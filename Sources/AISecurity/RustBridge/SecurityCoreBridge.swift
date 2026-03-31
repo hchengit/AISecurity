@@ -48,8 +48,8 @@ enum SecurityCoreBridge {
             severity: severityFromI8(p.severity),
             layersFired: Int(p.layers_fired),
             layers: .init(l1: p.l1, l2: p.l2, l3: p.l3, l4: p.l4, l5: p.l5, l6: p.l6),
-            label: String(cString: p.label),
-            confidence: String(cString: p.confidence)
+            label: safeString(p.label),
+            confidence: safeString(p.confidence)
         )
     }
 
@@ -78,12 +78,12 @@ enum SecurityCoreBridge {
         return (0..<Int(a.count)).map { i in
             let f = a.items[i]
             return Finding(
-                type: String(cString: f.finding_type),
-                label: String(cString: f.label),
+                type: safeString(f.finding_type),
+                label: safeString(f.label),
                 severity: severityFromI8(f.severity) ?? .high,
-                category: String(cString: f.category),
-                source: String(cString: f.source),
-                matchPreview: String(cString: f.match_preview),
+                category: safeString(f.category),
+                source: safeString(f.source),
+                matchPreview: safeString(f.match_preview),
                 offset: Int(f.offset)
             )
         }
@@ -130,10 +130,10 @@ enum SecurityCoreBridge {
         }
         defer { sec_free_sanitization_result(ptr) }
         let p = r.pointee
-        let changesJSON = String(cString: p.changes_json)
+        let changesJSON = safeString(p.changes_json)
         let changes = (try? JSONDecoder().decode([String].self, from: Data(changesJSON.utf8))) ?? []
         return SanitizationResult(
-            sanitized: String(cString: p.sanitized),
+            sanitized: safeString(p.sanitized),
             modified: p.modified,
             changes: changes
         )
@@ -181,6 +181,18 @@ enum SecurityCoreBridge {
 
     private static func optionalString(_ ptr: UnsafeMutablePointer<CChar>?) -> String? {
         guard let ptr = ptr else { return nil }
+        return String(cString: ptr)
+    }
+
+    /// Safe C string conversion — returns empty string instead of crashing on null.
+    private static func safeString(_ ptr: UnsafePointer<CChar>?) -> String {
+        guard let ptr = ptr else { return "" }
+        return String(cString: ptr)
+    }
+
+    /// Safe C string conversion for mutable pointers.
+    private static func safeString(_ ptr: UnsafeMutablePointer<CChar>?) -> String {
+        guard let ptr = ptr else { return "" }
         return String(cString: ptr)
     }
 
@@ -261,7 +273,7 @@ enum SecurityCoreBridge {
     }
 
     static func vaultAdd(securityDir: String, paths: [String], protection: ProtectionLevel, passphrase: String) -> VaultResult {
-        let joined = paths.joined(separator: ":")
+        let joined = paths.joined(separator: "\n")
         let ptr = securityDir.withCString { d in
             joined.withCString { p in
                 passphrase.withCString { pass in
@@ -273,7 +285,7 @@ enum SecurityCoreBridge {
     }
 
     static func vaultUnlock(securityDir: String, paths: [String], passphrase: String) -> VaultResult {
-        let joined = paths.joined(separator: ":")
+        let joined = paths.joined(separator: "\n")
         let ptr = securityDir.withCString { d in
             joined.withCString { p in
                 passphrase.withCString { pass in
@@ -285,7 +297,7 @@ enum SecurityCoreBridge {
     }
 
     static func vaultLock(securityDir: String, paths: [String], passphrase: String) -> VaultResult {
-        let joined = paths.joined(separator: ":")
+        let joined = paths.joined(separator: "\n")
         let ptr = securityDir.withCString { d in
             joined.withCString { p in
                 passphrase.withCString { pass in
@@ -297,7 +309,7 @@ enum SecurityCoreBridge {
     }
 
     static func vaultRemove(securityDir: String, paths: [String], passphrase: String) -> VaultResult {
-        let joined = paths.joined(separator: ":")
+        let joined = paths.joined(separator: "\n")
         let ptr = securityDir.withCString { d in
             joined.withCString { p in
                 passphrase.withCString { pass in
@@ -321,10 +333,10 @@ enum SecurityCoreBridge {
         return (0..<Int(a.count)).map { i in
             let e = a.items[i]
             return VaultEntry(
-                originalPath: String(cString: e.original_path),
-                vaultPath: String(cString: e.vault_path),
+                originalPath: safeString(e.original_path),
+                vaultPath: safeString(e.vault_path),
                 protection: ProtectionLevel(rawValue: e.protection) ?? .locked,
-                encryptedAt: String(cString: e.encrypted_at),
+                encryptedAt: safeString(e.encrypted_at),
                 sizeBytes: e.size_bytes,
                 isDirectory: e.is_directory,
                 isUnlocked: e.is_unlocked
@@ -344,7 +356,7 @@ enum SecurityCoreBridge {
     }
 
     static func vaultToggleLocalOnly(securityDir: String, paths: [String], passphrase: String) -> VaultResult {
-        let joined = paths.joined(separator: ":")
+        let joined = paths.joined(separator: "\n")
         let ptr = securityDir.withCString { d in
             joined.withCString { p in
                 passphrase.withCString { pass in
@@ -363,7 +375,7 @@ enum SecurityCoreBridge {
         let p = r.pointee
         return VaultResult(
             success: p.success,
-            message: String(cString: p.message),
+            message: safeString(p.message),
             entriesAffected: Int(p.entries_affected)
         )
     }
@@ -378,10 +390,10 @@ enum SecurityCoreBridge {
         return (0..<Int(a.count)).map { i in
             let t = a.items[i]
             return Threat(
-                type: String(cString: t.threat_type),
-                label: String(cString: t.label),
+                type: safeString(t.threat_type),
+                label: safeString(t.label),
                 severity: severityFromI8(t.severity) ?? .high,
-                category: String(cString: t.category)
+                category: safeString(t.category)
             )
         }
     }
