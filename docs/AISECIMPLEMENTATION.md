@@ -1,8 +1,108 @@
 # AISecurity — Cross-Platform Assessment & Implementation Plan
 
 **Date:** 2026-03-28
-**Status:** Phase 7 complete + fine-tuning (Vault enhancements, combo protections, UX fixes)
+**Status:** Phase 8 complete (external notifications + rate limiting + auth hardening)
 **Last Updated:** 2026-03-30
+
+---
+
+## Product Philosophy
+
+### Why this app exists
+
+AI agents are becoming mainstream. People run them to manage files, send emails, browse the
+web, write code, and automate workflows. But agents are **probabilistic, not deterministic** —
+they don't follow rigid rules, they make judgment calls. And if an agent is prompted in a
+sneaky way (prompt injection, social engineering, malicious instructions hidden in data it
+processes), it can be tricked into doing things the user never intended:
+
+- Exfiltrating sensitive files over the network
+- Reading contacts and sending messages on the user's behalf
+- Accessing keychain passwords via automation
+- Modifying or deleting protected data
+- Copying crypto wallet keys or financial documents
+
+**The user needs a security layer that watches what agents do — and can apply the brakes.**
+
+### Design principles
+
+**1. Monitor first, block second.**
+AISecurity's default posture is **observe and alert**, not block. Users should see what's
+happening on their system and decide what to do about it. The app should never silently
+prevent something the user actually wants to happen.
+
+**2. User controls the dial, not us.**
+Different users have different risk tolerances. Someone running a trusted coding assistant
+needs less protection than someone running an autonomous agent with internet access.
+AISecurity should let users configure:
+- Which directories to monitor (or not)
+- Which alert types trigger external notifications (or not)
+- Whether vault files are encrypted, read-only, or just monitored
+- Whether to block access or just alert
+- How aggressive rate limiting should be
+
+**3. Don't be annoying.**
+A security tool that spams alerts gets disabled. Every notification sent must be
+genuinely useful. Routine OS operations are silenced. External notifications are
+rate-limited. The user should trust that when AISecurity alerts, it matters.
+
+**4. Transparency over magic.**
+Show the user exactly what's being monitored, what was detected, which process did it,
+and what action was taken. No hidden behavior. Security tools must be trustworthy —
+and trust comes from transparency.
+
+**5. Agents are tools, not enemies.**
+We're not trying to stop people from using AI agents. We're giving them the confidence
+to use agents safely — knowing that if something goes wrong, they'll know about it
+and can respond.
+
+### Threat model: AI agents on your Mac
+
+| Threat | How it happens | What AISecurity does |
+|--------|---------------|---------------------|
+| **File exfiltration** | Agent uploads sensitive files to external server | Local-only vault protection alerts on network exfiltration attempts |
+| **Contact scraping** | Agent reads Address Book to harvest emails/phones | FileWatcher alerts on AddressBook access |
+| **Keychain access** | Agent uses Accessibility perms to click "Allow" on keychain prompts | FileWatcher alerts on keychain file access; Phase 10: ES framework blocks unauthorized process |
+| **Prompt injection** | Malicious instructions hidden in emails/files trick agent | PromptInjectionGuard detects 8 categories of injection |
+| **Sensitive data in clipboard** | Agent copies API keys, passwords, crypto seeds | Clipboard monitor detects and alerts |
+| **Malware delivery** | Agent downloads malicious files to Downloads | FileWatcher + ExternalFileSanitizer detect and quarantine |
+| **Vault breach** | Agent or attacker tries to access encrypted vault files | Per-file DispatchSource + CRITICAL alert + external notification |
+| **Brute force** | Repeated passphrase attempts on vault | 3-attempt lockout + external alert |
+
+### How Apple protects sensitive data (and where the gaps are)
+
+**Keychain / Passwords app:**
+- Same data, different UI. Passwords app (macOS 15+) is a frontend for the Keychain system
+- **Strong protections:** AES-256 encryption at rest, per-item ACLs (each entry specifies which
+  apps can read it), user prompt on unauthorized access, Secure Enclave (Apple Silicon stores
+  encryption key in hardware — disk cloning won't help)
+- **The gap:** An AI agent with Accessibility permissions could automate clicking "Allow" on
+  keychain access dialogs. The `security` CLI can dump keychain data if the Mac is unlocked.
+  A sophisticated agent could read decrypted passwords from process memory.
+- **What we do now:** FileWatcher monitors `~/Library/Keychains/` for file access
+- **Phase 10 (Endpoint Security):** Detect exactly which process reads keychain files; block
+  non-Apple, non-browser processes from accessing keychain data
+
+**Contacts / Address Book:**
+- Stored in `~/Library/Application Support/AddressBook/`
+- macOS shows a permission prompt when apps first request Contacts access
+- **The gap:** Once an app has Contacts permission, it can read everything silently. An agent
+  with Contacts access could harvest names, emails, phone numbers, addresses — enough to
+  impersonate the user or run social engineering campaigns
+- **What we do:** FileWatcher monitors AddressBook directory for unauthorized access
+
+**Photos:**
+- Protected by Apple's Photos framework + TCC (Transparency, Consent, and Control)
+- Apps must request permission; user grants "full access" or "limited access"
+- **What we do:** FileWatcher monitors Photos Library and Pictures directory
+
+**Calendar, Notes, Reminders:**
+- Each has its own TCC permission gate
+- **What we do:** FileWatcher monitors all three database directories
+
+**The common thread:** Apple's TCC permission system is the first line of defense. But once
+an app has permission (which agents often need to function), there's no ongoing monitoring
+of WHAT it does with that access. That's the gap AISecurity fills.
 
 ---
 
@@ -1481,7 +1581,53 @@ with one click — no manual re-download.
 | Transparency report | "What we monitor, what we don't" | Users need to trust a security agent running on their machine |
 | CVE response plan | How you handle discovered vulnerabilities | Professional obligation for security software |
 
-### 10.8 Implementation Tracker
+### 10.8 Security Profiles (the dial)
+
+Users should be able to choose a security posture that matches their use case. Three
+built-in profiles, plus full custom control:
+
+**Relaxed — "I trust my agent, just keep an eye on things"**
+| Setting | Value |
+|---------|-------|
+| File monitoring | Downloads only |
+| Vault | Available but optional |
+| External notifications | Off |
+| Clipboard monitoring | Off |
+| Prompt injection guard | Off |
+| Protected path alerts | Log only (no popup) |
+| Auto-quarantine | Off |
+
+**Balanced — "I use agents but want to know what they're doing" (default)**
+| Setting | Value |
+|---------|-------|
+| File monitoring | Downloads + Desktop + Documents |
+| Vault | Available, recommended for sensitive files |
+| External notifications | CRITICAL only (Telegram) |
+| Clipboard monitoring | On |
+| Prompt injection guard | On |
+| Protected path alerts | Popup for CRITICAL, log for HIGH |
+| Auto-quarantine | On for known malware patterns |
+
+**Strict — "I run autonomous agents and need full control"**
+| Setting | Value |
+|---------|-------|
+| File monitoring | All configured directories + all protected paths |
+| Vault | Encrypted by default for sensitive directories |
+| External notifications | CRITICAL + HIGH (all channels) |
+| Clipboard monitoring | On |
+| Prompt injection guard | On (aggressive) |
+| Protected path alerts | Popup for CRITICAL + HIGH, external notification |
+| Auto-quarantine | On, including suspicious files |
+| Vault access blocking | On (Phase 10, Endpoint Security — blocks unauthorized processes) |
+
+**Custom — "Let me configure everything myself"**
+Full access to all toggles in config.toml or a settings UI.
+
+**Implementation:** A single "Security Level" slider or radio button in the menu bar
+settings. Changing the profile updates config.toml and restarts relevant modules.
+Power users can still edit config.toml directly for fine-grained control.
+
+### 10.9 Implementation Tracker
 
 | Component | Status | Notes |
 |-----------|--------|-------|
@@ -1504,6 +1650,10 @@ with one click — no manual re-download.
 | **Legal** | | |
 | Privacy policy | ⬜ Not started | — |
 | Terms of service | ⬜ Not started | — |
+| **Security Profiles** | | |
+| Profile selector UI (Relaxed / Balanced / Strict / Custom) | ⬜ Not started | Menu bar settings |
+| Profile → config.toml mapping + module restart | ⬜ Not started | — |
+| Per-profile notification routing | ⬜ Not started | — |
 | **Business** | | |
 | Choose business model (open source + premium vs direct sale) | ⬜ Not started | — |
 | Payment integration (Gumroad/Paddle/Stripe) | ⬜ Not started | — |
