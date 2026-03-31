@@ -41,6 +41,17 @@ final class FileWatcher: @unchecked Sendable {
             // Notes — routine database changes
             #"NoteStore\.sqlite"#,         // Apple Notes database + journal files
 
+            // Contacts/AddressBook — routine database journal writes
+            #"/AddressBook/.*\.(?:db-wal|db-shm|db-lock|abcddb-wal|abcddb-shm)$"#,
+            #"AddressBook-v\d+\.abcddb-journal"#,
+
+            // Calendars — routine database journal writes
+            #"/Calendars/.*\.(?:db-wal|db-shm|db-lock|sqlite-wal|sqlite-shm)$"#,
+            #"/Calendars/Calendar Cache"#,
+
+            // Reminders — routine database journal writes
+            #"/Reminders/.*\.(?:db-wal|db-shm|db-lock|sqlite-wal|sqlite-shm)$"#,
+
             // Safari — all routine operations (bookmarks, history, databases, plists, caches)
             #"/Safari/"#,
 
