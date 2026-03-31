@@ -239,6 +239,28 @@
 | External notification end-to-end test | ⬜ Not started | — |
 | Auth lockout + external alert test | ⬜ Not started | — |
 
+### Phase 10: Commercial Release Path
+
+| Component | Status | Notes |
+|-----------|--------|-------|
+| **Distribution** | | |
+| App notarization (notarytool) | ⬜ Not started | Submit .dmg to Apple for malware scan |
+| .dmg installer creation | ⬜ Not started | Package .app into installable .dmg |
+| GitHub Releases hosting | ⬜ Not started | Upload .dmg for public download |
+| **Endpoint Security Framework** | | |
+| Request ES entitlement from Apple | ⬜ Not started | Email Apple with security tool use case |
+| Migrate FileWatcher to ES framework | ⬜ Not started | Per-process file access monitoring |
+| Vault access blocking (AUTH events) | ⬜ Not started | Block unauthorized vault file access in real-time |
+| **Auto-Update** | | |
+| Sparkle SPM integration | ⬜ Not started | Auto-update framework for non-App-Store apps |
+| Appcast XML + EdDSA signing | ⬜ Not started | Host update feed, sign releases |
+| **Onboarding** | | |
+| First-run welcome wizard | ⬜ Not started | Permissions guide + feature overview |
+| **Legal & Business** | | |
+| Privacy policy + terms of service | ⬜ Not started | Required for public distribution |
+| Business model decision | ⬜ Not started | Open source + premium vs direct sale |
+| Landing page / marketing site | ⬜ Not started | — |
+
 ---
 
 ## 0b. Codebase Audit Results
@@ -1306,6 +1328,187 @@ cargo run -p security-linux -- --tray
 # Enter wrong passphrase 3 times → lockout message + external alert
 ```
 
+## 10. Phase 10: Commercial Release Path
+
+**Goal:** Prepare AISecurity for public distribution — either as open source with a paid tier,
+or as a direct-sale product. The App Store is NOT viable for security tools (sandboxing blocks
+file monitoring, Mail access, Messages DB, etc.). Every serious macOS security tool distributes
+outside the App Store.
+
+### 10.1 Why Not the App Store?
+
+Apple's App Store requires sandboxing, which blocks:
+- File monitoring across Downloads/Desktop/Documents
+- Reading Mail.app `.emlx` files and Messages `chat.db`
+- Accessing Keychains, SSH keys, crypto wallets
+- Most Full Disk Access operations
+
+**How real security tools ship:** Little Snitch, Malwarebytes, Objective-See (LuLu, KnockKnock),
+BlockBlock — all distribute via direct download + Apple notarization. Users download a `.dmg`,
+drag to Applications, and grant permissions manually.
+
+### 10.2 Distribution: Notarization (required)
+
+**What it is:** Apple scans your app binary for malware and issues a "ticket" that tells macOS
+"this app was checked by Apple." Without it, macOS shows a scary "unidentified developer" warning
+and may refuse to open the app entirely.
+
+**What you need:**
+- Apple Developer account ($99/year — you already have one for code signing)
+- Your app is already code-signed with a Developer ID
+
+**Steps:**
+| Step | What | How |
+|------|------|-----|
+| 1 | Build release binary | `swift build -c release` (already done in install.sh) |
+| 2 | Create .dmg installer | Use `create-dmg` tool or `hdiutil` to package the .app |
+| 3 | Submit for notarization | `xcrun notarytool submit AISecurity.dmg --apple-id YOU --team-id TEAM` |
+| 4 | Wait for Apple scan | Usually 5-15 minutes |
+| 5 | Staple the ticket | `xcrun stapler staple AISecurity.dmg` — embeds approval in the file |
+| 6 | Distribute | Upload .dmg to GitHub releases, your website, or Gumroad |
+
+**Verification:** Users can install without any "unidentified developer" warnings.
+
+### 10.3 Endpoint Security Framework (recommended upgrade)
+
+**What it is:** Apple's modern API (macOS 10.15+) specifically for security tools. It replaces
+our current `DispatchSource` file monitoring with a kernel-level event stream that:
+- Tells you WHICH PROCESS accessed a file (PID, path, code signature)
+- Can BLOCK file operations in real-time (not just detect after the fact)
+- Monitors process execution, file access, mounts, signals — everything
+- Is what professional endpoint security tools use
+
+**Why we want it:**
+- Current DispatchSource only detects directory-level creates/deletes, not reads
+- Endpoint Security sees EVERY file open, read, write, rename, unlink — per-process
+- We could show "Preview.app tried to open A1.png.vault" instead of just "file modified"
+- Can actively block unauthorized access to vault files (not just alert)
+
+**What changes:**
+| Current (DispatchSource) | Upgrade (Endpoint Security) |
+|---|---|
+| Directory-level events only | Per-file, per-process events |
+| Detect creates/deletes/renames | Detect opens, reads, writes, unlinks |
+| Cannot identify which app | Reports exact process (PID, path, signature) |
+| Cannot block access | Can block + allow in real-time |
+| No special entitlement needed | Requires Endpoint Security entitlement from Apple |
+
+**Catch:** Requires requesting a special entitlement from Apple — you email them explaining
+your use case. They review and grant it (usually within a week for legitimate security tools).
+Without it, the `es_new_client()` API call will fail.
+
+**Implementation:**
+```swift
+import EndpointSecurity
+
+// Request authorization
+var client: OpaquePointer?
+let result = es_new_client(&client) { client, message in
+    switch message.pointee.event_type {
+    case ES_EVENT_TYPE_NOTIFY_OPEN:
+        // A process opened a file — check if it's vault-protected
+    case ES_EVENT_TYPE_AUTH_OPEN:
+        // A process WANTS to open a file — we can BLOCK it
+    default: break
+    }
+}
+```
+
+### 10.4 Auto-Update (Sparkle)
+
+**What it is:** Sparkle is the standard macOS framework for auto-updating apps distributed
+outside the App Store. When you release a new version, users get a notification and can update
+with one click — no manual re-download.
+
+**How it works:**
+1. You host an "appcast" XML file on your server (like an RSS feed of versions)
+2. Sparkle checks this feed periodically
+3. When a new version is found, it shows an update dialog
+4. User clicks "Install" — Sparkle downloads, verifies signature, replaces the app
+
+**Steps:**
+| Step | What |
+|------|------|
+| 1 | Add Sparkle SPM dependency to Package.swift |
+| 2 | Generate EdDSA signing key pair (Sparkle uses EdDSA, not RSA) |
+| 3 | Add `SUFeedURL` to Info.plist pointing to your appcast URL |
+| 4 | On each release: sign the .dmg with your EdDSA key, update appcast.xml |
+| 5 | Host appcast.xml + .dmg on GitHub Pages, S3, or your own site |
+
+### 10.5 First-Run Onboarding
+
+**What it is:** A step-by-step welcome flow for new users that guides them through:
+
+1. **Welcome** — what AISecurity does, what it monitors
+2. **Grant Permissions** — Full Disk Access, Notification permission (with direct links to System Settings)
+3. **Vault Setup** — create passphrase (already built)
+4. **Notification Setup** — Telegram/Discord/Email (already built)
+5. **What to Expect** — "You'll see alerts for: malware, sensitive data exposure, vault access.
+   You won't be spammed — only real threats trigger notifications."
+
+### 10.6 Business Models
+
+**Option A: Open Source + Premium Features (recommended to start)**
+| Tier | Price | Features |
+|------|-------|----------|
+| Free (open source) | $0 | File monitoring, malware detection, clipboard guard, vault (local) |
+| Pro | $5-10/month or $49/year | External notifications (Telegram/Discord/Email), auto-update, priority support |
+| Team | $10-20/seat/month | Central logging dashboard, fleet management, shared threat intel |
+
+**Pros:** Builds trust (open source security tool = auditable), attracts contributors, GitHub stars drive organic growth.
+
+**Option B: Direct Sale**
+| Product | Price | What |
+|---------|-------|------|
+| AISecurity | $29-49 one-time | Full app, all features, 1 year of updates |
+| Updates | $19/year renewal | Continued updates after first year |
+
+**Distribution:** Gumroad, Paddle, or Stripe + your own site.
+
+**Option C: Enterprise/MSP**
+- Sell to managed service providers (MSPs) who manage fleets of Macs
+- Central dashboard showing all endpoints' threat status
+- The TLS transport + logging infrastructure is already built (Phase 5)
+- Price: $5-15/endpoint/month
+
+### 10.7 Legal & Trust
+
+| Item | What | Why |
+|------|------|-----|
+| Privacy policy | What data you collect (none? local-only?) | Required for distribution, builds trust |
+| Terms of service | Liability limitations, no warranty | Standard for software products |
+| Security audit | Third-party code review | Security tools MUST be trustworthy — an audit proves it |
+| Transparency report | "What we monitor, what we don't" | Users need to trust a security agent running on their machine |
+| CVE response plan | How you handle discovered vulnerabilities | Professional obligation for security software |
+
+### 10.8 Implementation Tracker
+
+| Component | Status | Notes |
+|-----------|--------|-------|
+| **Distribution** | | |
+| Apple Developer account | ✅ Already have | Used for code signing |
+| App notarization (notarytool) | ⬜ Not started | Submit .dmg to Apple for scanning |
+| .dmg installer creation | ⬜ Not started | create-dmg or hdiutil |
+| GitHub Releases hosting | ⬜ Not started | Upload .dmg to releases page |
+| **Endpoint Security** | | |
+| Request ES entitlement from Apple | ⬜ Not started | Email Apple with use case description |
+| Migrate FileWatcher to ES framework | ⬜ Not started | Replace DispatchSource with es_new_client |
+| Per-process vault access blocking | ⬜ Not started | AUTH events to block unauthorized access |
+| **Auto-Update** | | |
+| Sparkle SPM integration | ⬜ Not started | Add dependency, generate EdDSA key |
+| Appcast XML hosting | ⬜ Not started | GitHub Pages or S3 |
+| Update signing workflow | ⬜ Not started | Sign .dmg with EdDSA on each release |
+| **Onboarding** | | |
+| First-run welcome wizard | ⬜ Not started | Multi-step NSWindow flow |
+| Permission grant guide (FDA, notifications) | ⬜ Not started | Direct links to System Settings |
+| **Legal** | | |
+| Privacy policy | ⬜ Not started | — |
+| Terms of service | ⬜ Not started | — |
+| **Business** | | |
+| Choose business model (open source + premium vs direct sale) | ⬜ Not started | — |
+| Payment integration (Gumroad/Paddle/Stripe) | ⬜ Not started | — |
+| Landing page / marketing site | ⬜ Not started | — |
+
 ---
 
 ## Execution Timeline
@@ -1353,6 +1556,14 @@ Mac Portability    -->  Rust Core Library     -->  macOS FFI Integration
                                                 File browser widget
                                                 System tray (ksni)
                                                 Rust notification channels
+
+                                              Phase 10 (Weeks 24-28)
+                                              Commercial Release
+                                                Notarization + .dmg
+                                                Endpoint Security framework
+                                                Sparkle auto-update
+                                                First-run onboarding
+                                                Business model + legal
 ```
 
 ## Key Architectural Decisions
