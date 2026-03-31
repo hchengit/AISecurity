@@ -8,30 +8,36 @@ enum FinderTags {
     static let readOnlyTag = "AISecurity Read-Only"
     static let localOnlyTag = "AISecurity Local-Only"
 
-    /// Add a vault tag to a file or folder.
+    /// Add vault tag(s) to a file or folder based on protection level.
     static func addTag(_ path: String, protection: SecurityCoreBridge.ProtectionLevel) {
-        let tag: String
-        switch protection {
-        case .locked: tag = vaultTag
-        case .readOnly: tag = readOnlyTag
-        case .localOnly: tag = localOnlyTag
+        let url = URL(fileURLWithPath: path)
+
+        // Determine which tags to apply based on protection components
+        if protection.isLocked {
+            addFinderTag(url: url, tag: vaultTag)
+        }
+        if protection.isReadOnly {
+            addFinderTag(url: url, tag: readOnlyTag)
+        }
+        if protection.isLocalOnly {
+            addFinderTag(url: url, tag: localOnlyTag)
         }
 
-        let url = URL(fileURLWithPath: path)
-        addFinderTag(url: url, tag: tag)
-
         // For locked files, also tag the .vault file
-        if protection == .locked {
+        if protection.isLocked {
             let vaultURL = URL(fileURLWithPath: path + ".vault")
             if FileManager.default.fileExists(atPath: vaultURL.path) {
-                addFinderTag(url: vaultURL, tag: tag)
+                addFinderTag(url: vaultURL, tag: vaultTag)
+                if protection.isLocalOnly {
+                    addFinderTag(url: vaultURL, tag: localOnlyTag)
+                }
             }
         }
 
         // If it's a directory, tag the folder itself
         var isDir: ObjCBool = false
         if FileManager.default.fileExists(atPath: path, isDirectory: &isDir), isDir.boolValue {
-            addFinderTag(url: url, tag: tag)
+            addFinderTag(url: url, tag: vaultTag)
         }
     }
 

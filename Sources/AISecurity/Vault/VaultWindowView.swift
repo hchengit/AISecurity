@@ -8,16 +8,27 @@ struct VaultWindowView: View {
     let passphrase: String
     @State private var entries: [SecurityCoreBridge.VaultEntry] = []
     @State private var selectedPaths: Set<String> = []
+    @State private var expandedFolders: Set<String> = [] // tracks which folders are expanded
     @State private var fileMonitors: [String: Any] = [:] // for temporary unlock tracking
 
+    // MARK: - Grouped entries by protection section
+
     private var lockedEntries: [SecurityCoreBridge.VaultEntry] {
-        entries.filter { $0.protection == .locked }
+        entries.filter { $0.protection.isLocked }
     }
     private var readOnlyEntries: [SecurityCoreBridge.VaultEntry] {
-        entries.filter { $0.protection == .readOnly }
+        entries.filter { $0.protection.isReadOnly }
     }
     private var localOnlyEntries: [SecurityCoreBridge.VaultEntry] {
         entries.filter { $0.protection == .localOnly }
+    }
+
+    /// Group entries by their parent folder, sorted by folder name.
+    private func folderGroups(_ sectionEntries: [SecurityCoreBridge.VaultEntry]) -> [(folder: String, entries: [SecurityCoreBridge.VaultEntry])] {
+        let grouped = Dictionary(grouping: sectionEntries) { entry in
+            (entry.originalPath as NSString).deletingLastPathComponent
+        }
+        return grouped.sorted { $0.key < $1.key }.map { (folder: $0.key, entries: $0.value) }
     }
 
     var body: some View {
@@ -53,55 +64,26 @@ struct VaultWindowView: View {
                 List(selection: $selectedPaths) {
                     // Locked (Encrypted) section
                     if !lockedEntries.isEmpty {
-                        Section {
-                            ForEach(lockedEntries, id: \.originalPath) { entry in
-                                entryRow(entry)
-                                    .tag(entry.originalPath)
-                            }
-                        } header: {
-                            HStack {
-                                Image(systemName: "lock.fill")
-                                    .foregroundColor(.red)
-                                Text("Encrypted (\(lockedEntries.count))")
-                                    .font(.headline)
-                            }
-                        }
+                        sectionHeader(icon: "lock.fill", iconColor: .red,
+                                      title: "Encrypted", count: lockedEntries.count)
+                        sectionFolders(title: "Encrypted", sectionEntries: lockedEntries)
                     }
 
                     // Read-Only section
                     if !readOnlyEntries.isEmpty {
-                        Section {
-                            ForEach(readOnlyEntries, id: \.originalPath) { entry in
-                                entryRow(entry)
-                                    .tag(entry.originalPath)
-                            }
-                        } header: {
-                            HStack {
-                                Image(systemName: "book.closed.fill")
-                                    .foregroundColor(.blue)
-                                Text("Read-Only (\(readOnlyEntries.count))")
-                                    .font(.headline)
-                            }
-                        }
+                        sectionHeader(icon: "book.closed.fill", iconColor: .blue,
+                                      title: "Read-Only", count: readOnlyEntries.count)
+                        sectionFolders(title: "Read-Only", sectionEntries: readOnlyEntries)
                     }
 
-                    // Local-Only section
+                    // Local-Only section (pure local-only, no combo)
                     if !localOnlyEntries.isEmpty {
-                        Section {
-                            ForEach(localOnlyEntries, id: \.originalPath) { entry in
-                                entryRow(entry)
-                                    .tag(entry.originalPath)
-                            }
-                        } header: {
-                            HStack {
-                                Image(systemName: "network.slash")
-                                    .foregroundColor(.orange)
-                                Text("Local-Only (\(localOnlyEntries.count))")
-                                    .font(.headline)
-                            }
-                        }
+                        sectionHeader(icon: "network.slash", iconColor: .orange,
+                                      title: "Local-Only", count: localOnlyEntries.count)
+                        sectionFolders(title: "Local-Only", sectionEntries: localOnlyEntries)
                     }
                 }
+                .listStyle(.plain)
 
                 Divider()
 
@@ -128,6 +110,16 @@ struct VaultWindowView: View {
                     .tint(.orange)
                     .help("Permanently decrypt and remove from vault.")
 
+                    Button {
+                        toggleLocalOnly()
+                    } label: {
+                        Label("Toggle Local-Only", systemImage: "network.slash")
+                    }
+                    .buttonStyle(.bordered)
+                    .tint(.purple)
+                    .help("Add or remove local-only network monitoring for selected items.")
+                    .disabled(onlyPureLocalOnlySelected)
+
                     Spacer()
 
                     Text(label)
@@ -151,15 +143,78 @@ struct VaultWindowView: View {
                 .padding()
             }
         }
-        .frame(minWidth: 650, minHeight: 450)
+        .frame(minWidth: 700, minHeight: 500)
         .onAppear { reload() }
     }
+
+    // MARK: - Flat Section Header + Folder Groups (avoids Section+DisclosureGroup nesting bug)
+
+    /// Non-selectable header row for a protection category.
+    @ViewBuilder
+    private func sectionHeader(icon: String, iconColor: Color, title: String, count: Int) -> some View {
+        HStack {
+            Image(systemName: icon)
+                .foregroundColor(iconColor)
+            Text("\(title) (\(count))")
+                .font(.headline)
+            Spacer()
+        }
+        .padding(.top, 8)
+        .padding(.bottom, 2)
+        .listRowSeparator(.hidden)
+    }
+
+    /// Folder disclosure groups for a protection section — placed directly in the List (no Section wrapper).
+    @ViewBuilder
+    private func sectionFolders(title: String, sectionEntries: [SecurityCoreBridge.VaultEntry]) -> some View {
+        let groups = folderGroups(sectionEntries)
+        ForEach(groups, id: \.folder) { group in
+            DisclosureGroup(
+                isExpanded: Binding(
+                    get: { expandedFolders.contains("\(title):\(group.folder)") },
+                    set: { expanded in
+                        let key = "\(title):\(group.folder)"
+                        if expanded { expandedFolders.insert(key) }
+                        else { expandedFolders.remove(key) }
+                    }
+                )
+            ) {
+                ForEach(group.entries, id: \.originalPath) { entry in
+                    entryRow(entry)
+                        .tag(entry.originalPath)
+                }
+            } label: {
+                HStack(spacing: 8) {
+                    Image(systemName: "folder.fill")
+                        .foregroundColor(.accentColor)
+                        .frame(width: 16)
+                    Text(shortenedFolder(group.folder))
+                        .font(.body)
+                    Spacer()
+                    Text("\(group.entries.count) file\(group.entries.count == 1 ? "" : "s")")
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+                }
+            }
+        }
+    }
+
+    // MARK: - Computed helpers
 
     private var selectedLockedCount: Int {
         if selectedPaths.isEmpty {
             return lockedEntries.count
         }
         return lockedEntries.filter { selectedPaths.contains($0.originalPath) }.count
+    }
+
+    /// True if all selected items are pure local-only (no combo), meaning toggle would be meaningless.
+    private var onlyPureLocalOnlySelected: Bool {
+        let targets = targetPaths()
+        if targets.isEmpty { return false }
+        return targets.allSatisfy { p in
+            entries.first(where: { $0.originalPath == p })?.protection == .localOnly
+        }
     }
 
     // MARK: - Entry Row
@@ -172,21 +227,14 @@ struct VaultWindowView: View {
                 .foregroundColor(iconColor(for: entry))
                 .frame(width: 20)
 
-            VStack(alignment: .leading, spacing: 2) {
-                Text((entry.originalPath as NSString).lastPathComponent)
-                    .font(.body)
-                    .lineLimit(1)
-
-                Text(parentPath(entry.originalPath))
-                    .font(.caption)
-                    .foregroundColor(.secondary)
-                    .lineLimit(1)
-            }
+            Text((entry.originalPath as NSString).lastPathComponent)
+                .font(.body)
+                .lineLimit(1)
 
             Spacer()
 
-            // Status badge
-            statusBadge(entry)
+            // Status badges
+            statusBadges(entry)
 
             // Size
             Text(formatSize(entry.sizeBytes))
@@ -198,40 +246,35 @@ struct VaultWindowView: View {
     }
 
     @ViewBuilder
-    private func statusBadge(_ entry: SecurityCoreBridge.VaultEntry) -> some View {
-        if entry.protection == .locked && entry.isUnlocked {
-            Text("DECRYPTED")
-                .font(.caption2.bold())
-                .padding(.horizontal, 6)
-                .padding(.vertical, 2)
-                .background(Color.green.opacity(0.2))
-                .foregroundColor(.green)
-                .clipShape(RoundedRectangle(cornerRadius: 4))
-        } else if entry.protection == .locked {
-            Text("ENCRYPTED")
-                .font(.caption2.bold())
-                .padding(.horizontal, 6)
-                .padding(.vertical, 2)
-                .background(Color.red.opacity(0.2))
-                .foregroundColor(.red)
-                .clipShape(RoundedRectangle(cornerRadius: 4))
-        } else if entry.protection == .readOnly {
-            Text("READ-ONLY")
-                .font(.caption2.bold())
-                .padding(.horizontal, 6)
-                .padding(.vertical, 2)
-                .background(Color.blue.opacity(0.2))
-                .foregroundColor(.blue)
-                .clipShape(RoundedRectangle(cornerRadius: 4))
-        } else {
-            Text("MONITORED")
-                .font(.caption2.bold())
-                .padding(.horizontal, 6)
-                .padding(.vertical, 2)
-                .background(Color.orange.opacity(0.2))
-                .foregroundColor(.orange)
-                .clipShape(RoundedRectangle(cornerRadius: 4))
+    private func statusBadges(_ entry: SecurityCoreBridge.VaultEntry) -> some View {
+        HStack(spacing: 4) {
+            // Primary status badge
+            if entry.protection.isLocked && entry.isUnlocked {
+                badge("DECRYPTED", color: .green)
+            } else if entry.protection.isLocked {
+                badge("ENCRYPTED", color: .red)
+            } else if entry.protection.isReadOnly {
+                badge("READ-ONLY", color: .blue)
+            } else if entry.protection == .localOnly {
+                badge("MONITORED", color: .orange)
+            }
+
+            // Local-only indicator for combo protections
+            if entry.protection.isLocalOnly && entry.protection != .localOnly {
+                badge("LOCAL", color: .orange)
+            }
         }
+    }
+
+    @ViewBuilder
+    private func badge(_ text: String, color: Color) -> some View {
+        Text(text)
+            .font(.caption2.bold())
+            .padding(.horizontal, 6)
+            .padding(.vertical, 2)
+            .background(color.opacity(0.2))
+            .foregroundColor(color)
+            .clipShape(RoundedRectangle(cornerRadius: 4))
     }
 
     // MARK: - Actions
@@ -246,10 +289,10 @@ struct VaultWindowView: View {
     private func temporaryUnlock() {
         let paths = targetPaths()
         let lockedPaths = paths.filter { p in
-            entries.first(where: { $0.originalPath == p })?.protection == .locked
+            entries.first(where: { $0.originalPath == p })?.protection.isLocked == true
         }
         let readOnlyPaths = paths.filter { p in
-            entries.first(where: { $0.originalPath == p })?.protection == .readOnly
+            entries.first(where: { $0.originalPath == p })?.protection.isReadOnly == true
         }
         let localOnlyPaths = paths.filter { p in
             entries.first(where: { $0.originalPath == p })?.protection == .localOnly
@@ -269,13 +312,23 @@ struct VaultWindowView: View {
 
             // Decrypt any that are still encrypted
             if !needsDecrypt.isEmpty {
+                VaultOperationScope.begin()
                 let result = SecurityCoreBridge.vaultUnlock(
                     securityDir: securityDir, paths: needsDecrypt, passphrase: passphrase)
                 if result.success && result.entriesAffected > 0 {
                     messages.append("\(result.entriesAffected) file(s) decrypted")
+                    // Hide .vault files in Finder while originals are temporarily open
+                    for path in needsDecrypt {
+                        let vaultFile = path + ".vault"
+                        if FileManager.default.fileExists(atPath: vaultFile) {
+                            let url = URL(fileURLWithPath: vaultFile)
+                            try? (url as NSURL).setResourceValue(true, forKey: .isHiddenKey)
+                        }
+                    }
                 } else if !result.success {
                     messages.append("Decrypt failed: \(result.message)")
                 }
+                VaultOperationScope.end()
             }
 
             // Open all files (both newly decrypted and already open)
@@ -344,14 +397,78 @@ struct VaultWindowView: View {
 
         guard alert.runModal() == .alertFirstButtonReturn else { return }
 
+        VaultOperationScope.begin()
         let result = SecurityCoreBridge.vaultRemove(
             securityDir: securityDir, paths: paths, passphrase: passphrase)
         if result.success {
             for path in paths { FinderTags.removeTag(path) }
+            VaultManager.shared.refreshWatchedPaths(passphrase: passphrase)
             VaultDialogs.showSuccess(result.message)
         } else {
             VaultDialogs.showError(result.message)
         }
+        VaultOperationScope.end()
+        reload()
+    }
+
+    private func toggleLocalOnly() {
+        let paths = targetPaths()
+        // Filter out pure local-only entries (toggle is meaningless for them)
+        let toggleable = paths.filter { p in
+            guard let entry = entries.first(where: { $0.originalPath == p }) else { return false }
+            return entry.protection != .localOnly
+        }
+        guard !toggleable.isEmpty else { return }
+
+        // Describe what will happen
+        let adding = toggleable.filter { p in
+            guard let entry = entries.first(where: { $0.originalPath == p }) else { return false }
+            return !entry.protection.isLocalOnly
+        }
+        let removing = toggleable.filter { p in
+            guard let entry = entries.first(where: { $0.originalPath == p }) else { return false }
+            return entry.protection.isLocalOnly
+        }
+
+        var desc: [String] = []
+        if !adding.isEmpty { desc.append("\(adding.count) item(s) will gain local-only monitoring") }
+        if !removing.isEmpty { desc.append("\(removing.count) item(s) will lose local-only monitoring") }
+
+        let alert = NSAlert()
+        alert.messageText = "Toggle Local-Only Monitoring?"
+        alert.informativeText = desc.joined(separator: "\n") + "\n\nLocal-only monitoring alerts you when any process tries to send protected files over the network."
+        alert.alertStyle = .informational
+        alert.addButton(withTitle: "Toggle")
+        alert.addButton(withTitle: "Cancel")
+
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+
+        VaultOperationScope.begin()
+        let result = SecurityCoreBridge.vaultToggleLocalOnly(
+            securityDir: securityDir, paths: toggleable, passphrase: passphrase)
+        if result.success {
+            // Update Finder tags for changed entries
+            for path in toggleable {
+                if let entry = entries.first(where: { $0.originalPath == path }) {
+                    // Re-apply tag based on new protection (toggle flips it)
+                    let newProt: SecurityCoreBridge.ProtectionLevel
+                    switch entry.protection {
+                    case .locked: newProt = .lockedLocal
+                    case .lockedLocal: newProt = .locked
+                    case .readOnly: newProt = .readOnlyLocal
+                    case .readOnlyLocal: newProt = .readOnly
+                    default: continue
+                    }
+                    FinderTags.removeTag(path)
+                    FinderTags.addTag(path, protection: newProt)
+                }
+            }
+            VaultManager.shared.refreshWatchedPaths(passphrase: passphrase)
+            VaultDialogs.showSuccess(result.message)
+        } else {
+            VaultDialogs.showError(result.message)
+        }
+        VaultOperationScope.end()
         reload()
     }
 
@@ -378,8 +495,18 @@ struct VaultWindowView: View {
         let toReEncrypt = paths.filter { !stillOpen.contains($0) && FileManager.default.fileExists(atPath: $0) }
 
         if !toReEncrypt.isEmpty {
+            VaultOperationScope.begin()
             let _ = SecurityCoreBridge.vaultLock(
                 securityDir: securityDir, paths: toReEncrypt, passphrase: passphrase)
+            // Unhide .vault files now that originals are re-encrypted
+            for path in toReEncrypt {
+                let vaultFile = path + ".vault"
+                if FileManager.default.fileExists(atPath: vaultFile) {
+                    let url = URL(fileURLWithPath: vaultFile)
+                    try? (url as NSURL).setResourceValue(false, forKey: .isHiddenKey)
+                }
+            }
+            VaultOperationScope.end()
         }
 
         if !stillOpen.isEmpty {
@@ -411,6 +538,25 @@ struct VaultWindowView: View {
 
     private func reload() {
         entries = SecurityCoreBridge.vaultList(securityDir: securityDir, passphrase: passphrase)
+        // Auto-expand all folders on first load
+        if expandedFolders.isEmpty {
+            for entry in entries {
+                let folder = (entry.originalPath as NSString).deletingLastPathComponent
+                let sectionTitle: String
+                if entry.protection.isLocked { sectionTitle = "Encrypted" }
+                else if entry.protection.isReadOnly { sectionTitle = "Read-Only" }
+                else { sectionTitle = "Local-Only" }
+                expandedFolders.insert("\(sectionTitle):\(folder)")
+            }
+        }
+    }
+
+    private func shortenedFolder(_ folder: String) -> String {
+        let home = FileManager.default.homeDirectoryForCurrentUser.path
+        if folder.hasPrefix(home) {
+            return "~" + folder.dropFirst(home.count)
+        }
+        return folder
     }
 
     private func fileIcon(for path: String) -> String {
@@ -432,11 +578,11 @@ struct VaultWindowView: View {
     }
 
     private func iconColor(for entry: SecurityCoreBridge.VaultEntry) -> Color {
-        switch entry.protection {
-        case .locked: return entry.isUnlocked ? .green : .red
-        case .readOnly: return .blue
-        case .localOnly: return .orange
+        if entry.protection.isLocked {
+            return entry.isUnlocked ? .green : .red
         }
+        if entry.protection.isReadOnly { return .blue }
+        return .orange
     }
 
     private func parentPath(_ path: String) -> String {

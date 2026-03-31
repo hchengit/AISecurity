@@ -407,7 +407,7 @@ pub struct VaultResultFFI {
 pub struct VaultEntryFFI {
     pub original_path: *mut c_char,
     pub vault_path: *mut c_char,
-    pub protection: u8, // 0=locked, 1=read_only, 2=local_only
+    pub protection: u8, // 0=locked, 1=read_only, 2=local_only, 3=read_only_local, 4=locked_local
     pub encrypted_at: *mut c_char,
     pub size_bytes: u64,
     pub is_directory: bool,
@@ -426,6 +426,8 @@ fn protection_to_u8(p: vault::ProtectionLevel) -> u8 {
         vault::ProtectionLevel::Locked => 0,
         vault::ProtectionLevel::ReadOnly => 1,
         vault::ProtectionLevel::LocalOnly => 2,
+        vault::ProtectionLevel::ReadOnlyLocal => 3,
+        vault::ProtectionLevel::LockedLocal => 4,
     }
 }
 
@@ -433,6 +435,8 @@ fn u8_to_protection(v: u8) -> vault::ProtectionLevel {
     match v {
         1 => vault::ProtectionLevel::ReadOnly,
         2 => vault::ProtectionLevel::LocalOnly,
+        3 => vault::ProtectionLevel::ReadOnlyLocal,
+        4 => vault::ProtectionLevel::LockedLocal,
         _ => vault::ProtectionLevel::Locked,
     }
 }
@@ -491,7 +495,7 @@ pub extern "C" fn sec_vault_verify_passphrase(
     vault::Vault::new(&dir).verify_passphrase(&pass).unwrap_or(false)
 }
 
-/// Add files to vault. `paths` is a colon-separated list. `protection`: 0=locked, 1=read_only, 2=local_only.
+/// Add files to vault. `paths` is a colon-separated list. `protection`: 0=locked, 1=read_only, 2=local_only, 3=read_only_local, 4=locked_local.
 #[no_mangle]
 pub extern "C" fn sec_vault_add(
     security_dir: *const c_char,
@@ -644,6 +648,30 @@ pub extern "C" fn sec_vault_change_passphrase(
 
     let v = vault::Vault::new(&dir);
     match v.change_passphrase(&old_pass, &new_pass) {
+        Ok(r) => Box::into_raw(Box::new(VaultResultFFI {
+            success: r.success, message: to_c_string(&r.message), entries_affected: r.entries_affected as u32,
+        })),
+        Err(e) => Box::into_raw(Box::new(VaultResultFFI {
+            success: false, message: to_c_string(&format!("{}", e)), entries_affected: 0,
+        })),
+    }
+}
+
+/// Toggle local-only monitoring on vault entries. `paths` is colon-separated.
+#[no_mangle]
+pub extern "C" fn sec_vault_toggle_local_only(
+    security_dir: *const c_char,
+    paths: *const c_char,
+    passphrase: *const c_char,
+) -> *mut VaultResultFFI {
+    let dir = match unsafe { from_c_str(security_dir) } { Some(d) => d, None => return ptr::null_mut() };
+    let paths_str = match unsafe { from_c_str(paths) } { Some(p) => p, None => return ptr::null_mut() };
+    let pass = match unsafe { from_c_str(passphrase) } { Some(p) => p, None => return ptr::null_mut() };
+
+    let path_list: Vec<&str> = paths_str.split(':').collect();
+    let v = vault::Vault::new(&dir);
+
+    match v.toggle_local_only(&path_list, &pass) {
         Ok(r) => Box::into_raw(Box::new(VaultResultFFI {
             success: r.success, message: to_c_string(&r.message), entries_affected: r.entries_affected as u32,
         })),

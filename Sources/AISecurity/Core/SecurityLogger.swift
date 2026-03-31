@@ -49,6 +49,8 @@ final class SecurityLogger: @unchecked Sendable {
         print("[ALERT] \(securityAlert.timestamp) \u{1F6A8} \(display)", to: &StderrOutputStream.shared)
         writeAlert(securityAlert)
         notify(message: display, severity: securityAlert.severity)
+        // Send to external channels (Telegram, Discord, Email) based on severity
+        NotificationManager.shared.send(securityAlert)
     }
 
     func getRecentAlerts(limit: Int = 50) -> [SecurityAlert] {

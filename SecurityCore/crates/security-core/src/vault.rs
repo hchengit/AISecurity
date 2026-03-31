@@ -33,6 +33,27 @@ pub enum ProtectionLevel {
     ReadOnly,
     /// Read/write allowed locally. Network exfiltration triggers alert.
     LocalOnly,
+    /// Read-only + network exfiltration monitoring.
+    ReadOnlyLocal,
+    /// Encrypted in-place + network exfiltration monitoring.
+    LockedLocal,
+}
+
+impl ProtectionLevel {
+    /// Whether this protection includes encryption.
+    pub fn is_locked(&self) -> bool {
+        matches!(self, Self::Locked | Self::LockedLocal)
+    }
+
+    /// Whether this protection includes read-only.
+    pub fn is_read_only(&self) -> bool {
+        matches!(self, Self::ReadOnly | Self::ReadOnlyLocal)
+    }
+
+    /// Whether this protection includes local-only monitoring.
+    pub fn is_local_only(&self) -> bool {
+        matches!(self, Self::LocalOnly | Self::ReadOnlyLocal | Self::LockedLocal)
+    }
 }
 
 impl std::fmt::Display for ProtectionLevel {
@@ -41,6 +62,8 @@ impl std::fmt::Display for ProtectionLevel {
             Self::Locked => write!(f, "locked"),
             Self::ReadOnly => write!(f, "read-only"),
             Self::LocalOnly => write!(f, "local-only"),
+            Self::ReadOnlyLocal => write!(f, "read-only + local-only"),
+            Self::LockedLocal => write!(f, "locked + local-only"),
         }
     }
 }
@@ -229,7 +252,7 @@ impl Vault {
             if let Some(entry) = manifest.entries.iter_mut().find(|e| {
                 e.original_path == *path_str || e.vault_path == *path_str
             }) {
-                if entry.protection != ProtectionLevel::Locked {
+                if !entry.protection.is_locked() {
                     continue;
                 }
                 if entry.is_unlocked {
@@ -272,7 +295,7 @@ impl Vault {
             if let Some(entry) = manifest.entries.iter_mut().find(|e| {
                 e.original_path == *path_str || e.vault_path == *path_str
             }) {
-                if entry.protection != ProtectionLevel::Locked || !entry.is_unlocked {
+                if !entry.protection.is_locked() || !entry.is_unlocked {
                     continue;
                 }
 
@@ -314,8 +337,9 @@ impl Vault {
             }) {
                 let entry = &manifest.entries[idx];
 
-                match entry.protection {
-                    ProtectionLevel::Locked if !entry.is_unlocked => {
+                // Handle encrypted component
+                if entry.protection.is_locked() {
+                    if !entry.is_unlocked {
                         // Decrypt first
                         let vault_path = Path::new(&entry.vault_path);
                         if vault_path.exists() {
@@ -325,25 +349,24 @@ impl Vault {
                             fs::write(&entry.original_path, &plaintext)?;
                             fs::remove_file(vault_path)?;
                         }
-                    }
-                    ProtectionLevel::Locked if entry.is_unlocked => {
+                    } else {
                         // Already decrypted, just remove .vault file
                         let vault_path = Path::new(&entry.vault_path);
                         if vault_path.exists() { let _ = fs::remove_file(vault_path); }
                     }
-                    ProtectionLevel::ReadOnly => {
-                        // Restore write permissions
-                        #[cfg(unix)]
-                        {
-                            use std::os::unix::fs::PermissionsExt;
-                            let path = Path::new(&entry.original_path);
-                            if path.exists() {
-                                let perms = std::fs::Permissions::from_mode(0o644);
-                                let _ = fs::set_permissions(path, perms);
-                            }
+                }
+
+                // Handle read-only component
+                if entry.protection.is_read_only() {
+                    #[cfg(unix)]
+                    {
+                        use std::os::unix::fs::PermissionsExt;
+                        let path = Path::new(&entry.original_path);
+                        if path.exists() {
+                            let perms = std::fs::Permissions::from_mode(0o644);
+                            let _ = fs::set_permissions(path, perms);
                         }
                     }
-                    _ => {}
                 }
 
                 manifest.entries.remove(idx);
@@ -373,7 +396,7 @@ impl Vault {
 
         // Re-encrypt all locked files
         for entry in &manifest.entries {
-            if entry.protection == ProtectionLevel::Locked && !entry.is_unlocked {
+            if entry.protection.is_locked() && !entry.is_unlocked {
                 let vault_path = Path::new(&entry.vault_path);
                 if !vault_path.exists() { continue; }
 
@@ -392,6 +415,43 @@ impl Vault {
         Ok(VaultResult {
             success: true,
             message: format!("Passphrase changed. {} encrypted file(s) re-keyed.", affected),
+            entries_affected: affected,
+        })
+    }
+
+    /// Toggle local-only monitoring on/off for existing entries.
+    /// Locked → LockedLocal or LockedLocal → Locked.
+    /// ReadOnly → ReadOnlyLocal or ReadOnlyLocal → ReadOnly.
+    /// LocalOnly is removed entirely (use `remove` instead).
+    pub fn toggle_local_only(
+        &self,
+        paths: &[&str],
+        passphrase: &str,
+    ) -> Result<VaultResult, VaultError> {
+        let mut manifest = self.load_manifest(passphrase)?;
+        let mut affected = 0;
+
+        for path_str in paths {
+            if let Some(entry) = manifest.entries.iter_mut().find(|e| {
+                e.original_path == *path_str || e.vault_path == *path_str
+            }) {
+                let new_prot = match entry.protection {
+                    ProtectionLevel::Locked => ProtectionLevel::LockedLocal,
+                    ProtectionLevel::LockedLocal => ProtectionLevel::Locked,
+                    ProtectionLevel::ReadOnly => ProtectionLevel::ReadOnlyLocal,
+                    ProtectionLevel::ReadOnlyLocal => ProtectionLevel::ReadOnly,
+                    ProtectionLevel::LocalOnly => continue, // can't toggle; it IS local-only
+                };
+                entry.protection = new_prot;
+                affected += 1;
+            }
+        }
+
+        self.save_manifest_passphrase(&manifest, passphrase)?;
+
+        Ok(VaultResult {
+            success: true,
+            message: format!("{} entry(ies) updated", affected),
             entries_affected: affected,
         })
     }
@@ -422,28 +482,28 @@ impl Vault {
         let vault_path = format!("{}.vault", path_str);
         let now = chrono::Utc::now().to_rfc3339();
 
-        match protection {
-            ProtectionLevel::Locked => {
-                let encrypted = encryptor.encrypt(&content, VAULT_AAD)?;
-                fs::write(&vault_path, encrypted.to_bytes())?;
-                secure_delete(path)?;
-            }
-            ProtectionLevel::ReadOnly => {
-                #[cfg(unix)]
-                {
-                    use std::os::unix::fs::PermissionsExt;
-                    let perms = std::fs::Permissions::from_mode(0o444);
-                    fs::set_permissions(path, perms)?;
-                }
-            }
-            ProtectionLevel::LocalOnly => {
-                // No file modification — just add to monitoring list
+        // Apply encryption if protection includes locking
+        if protection.is_locked() {
+            let encrypted = encryptor.encrypt(&content, VAULT_AAD)?;
+            fs::write(&vault_path, encrypted.to_bytes())?;
+            secure_delete(path)?;
+        }
+
+        // Apply read-only permissions if protection includes read-only
+        if protection.is_read_only() {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let perms = std::fs::Permissions::from_mode(0o444);
+                fs::set_permissions(path, perms)?;
             }
         }
 
+        // LocalOnly: no file modification — monitoring handled by Swift layer
+
         manifest.entries.push(VaultEntry {
             original_path: path_str,
-            vault_path: if protection == ProtectionLevel::Locked { vault_path } else { String::new() },
+            vault_path: if protection.is_locked() { vault_path } else { String::new() },
             protection,
             encrypted_at: now,
             size_bytes: size,

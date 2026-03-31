@@ -1,8 +1,8 @@
 # AISecurity — Cross-Platform Assessment & Implementation Plan
 
 **Date:** 2026-03-28
-**Status:** Phase 7 in progress (Vault — file/folder protection with encryption + auth)
-**Last Updated:** 2026-03-29
+**Status:** Phase 7 complete + fine-tuning (Vault enhancements, combo protections, UX fixes)
+**Last Updated:** 2026-03-30
 
 ---
 
@@ -17,7 +17,7 @@
 | Full codebase audit (both repos) | ✅ Done | See §0b below |
 | ElizaOS Rust security research | ✅ Done | See §0c below |
 | SecurityCore Rust workspace | ✅ Done | `SecurityCore/` |
-| Remote repo (GitHub) | ⬜ Not started | — |
+| Remote repo (GitHub) | ✅ Done | `github.com/hchengit/AISecurity` — 2026-03-30 |
 
 ### Phase 1: Mac Portability
 
@@ -116,19 +116,27 @@
 | Vault manifest persistence (JSON, itself encrypted) | ✅ Done | `vault.json.enc` — AES-256-GCM with VAULT_MANIFEST_AAD |
 | Vault status queries (list, verify integrity) | ✅ Done | `vault.rs` — list(), verify_passphrase() |
 | 3 protection levels (locked/read-only/local-only) | ✅ Done | `vault.rs` — ProtectionLevel enum + per-level enforcement |
+| 5 protection levels (+ read-only+local, locked+local combos) | ✅ Done | `vault.rs` — ReadOnlyLocal, LockedLocal variants + is_locked()/is_read_only()/is_local_only() helpers |
+| Toggle local-only on existing entries | ✅ Done | `vault.rs` — toggle_local_only() flips combo protections |
 | Passphrase change (re-encrypt all files + manifest) | ✅ Done | `vault.rs` — change_passphrase() |
 | 6 Rust tests passing | ✅ Done | roundtrip, wrong passphrase, change passphrase, read-only, list |
 | **Vault FFI + Swift Bridge** | | |
-| FFI exports for vault operations (C ABI) | ✅ Done | 11 exports: setup, add, unlock, lock, remove, list, change_passphrase, etc. |
-| SecurityCoreBridge.swift vault wrappers | ✅ Done | All 11 vault operations wrapped with Swift types |
+| FFI exports for vault operations (C ABI) | ✅ Done | 12 exports: setup, add, unlock, lock, remove, list, change_passphrase, toggle_local_only, etc. |
+| FFI support for 5 protection levels (0-4 mapping) | ✅ Done | `protection_to_u8()` / `u8_to_protection()` updated for combo variants |
+| SecurityCoreBridge.swift vault wrappers | ✅ Done | All 12 vault operations wrapped with Swift types |
 | **Authentication Gate (macOS)** | | |
 | LocalAuthentication (Touch ID / system password) | ✅ Done | `Vault/AuthGate.swift` — LAContext.deviceOwnerAuthentication |
 | Auth session caching (5-minute window) | ✅ Done | `AuthGate.swift` — configurable sessionTimeout |
+| Cancel vs error distinction (no error dialog on cancel) | ✅ Done | `AuthGate.swift` — LAError.userCancel/appCancel/systemCancel → silent dismiss |
+| Session invalidation after passphrase change | ✅ Done | `VaultManager.swift` — forces fresh Touch ID for next sensitive op |
 | **Authentication Gate (Linux)** | | |
 | PAM / polkit owner verification | ⬜ Not started | `security-linux/src/auth.rs` |
 | **Menu Bar UI (macOS)** | | |
 | "Protect Files..." menu item with NSOpenPanel (multi-select) | ✅ Done | `AISecurityApp.swift` — files + folders, protection level picker |
-| Vault status panel (list protected files) | ✅ Done | `AISecurityApp.swift` — shows all entries with status |
+| Vault status panel (list protected files) | ✅ Done | `VaultWindowView.swift` — shows all entries with status |
+| Vault window: folder-grouped display (collapsible) | ✅ Done | `VaultWindowView.swift` — DisclosureGroup per folder, auto-expand |
+| Vault window: Toggle Local-Only button | ✅ Done | `VaultWindowView.swift` — add/remove local-only monitoring on existing entries |
+| Vault window: combo protection badges (e.g. READ-ONLY + LOCAL) | ✅ Done | `VaultWindowView.swift` — dual badges for combo protections |
 | "Unlock Files..." / "Lock Open Files" menu items | ✅ Done | `AISecurityApp.swift` — auth-gated |
 | "Change Passphrase..." menu item | ✅ Done | `AISecurityApp.swift` — old/new/confirm flow |
 | **User Education & Safety** | | |
@@ -138,18 +146,98 @@
 | Pre-decrypt confirmation | ✅ Done | `VaultDialogs.swift` — confirmDecrypt() |
 | Recovery instructions saved to `VAULT-RECOVERY.txt` | ✅ Done | `vault.rs` — write_recovery_file() at setup |
 | Passphrase change workflow (old → new → confirm) | ✅ Done | `VaultDialogs.swift` — promptChangePassphrase() |
-| Protection level picker (locked/read-only/local-only) | ✅ Done | `VaultDialogs.swift` — pickProtectionLevel() |
+| Protection level picker (checkbox UI, combos) | ✅ Done | `VaultDialogs.swift` — Locked/Read-only mutually exclusive checkboxes + independent Local-only checkbox |
+| Confirmation dialogs for 5 protection levels | ✅ Done | `VaultDialogs.swift` — level-specific text for all combos |
 | **FileWatcher Integration** | | |
-| Alert on unauthorized access attempts to vault files | ⬜ Not started | `FileWatcher.swift` |
-| Block-and-notify when non-authenticated process touches vault entries | ⬜ Not started | `FileWatcher.swift` |
+| Alert on unauthorized access attempts to vault files | ✅ Done | `FileWatcher.swift` — per-file DispatchSource + VAULT_FILE_ACCESS alert (CRITICAL) + in-app dialog |
+| Block-and-notify when non-authenticated process touches vault entries | ✅ Done | `VaultManager.swift` — watched-paths cache, `VaultOperationScope` suppression, NotificationCenter reload |
+| Thread-safe debounce timers (crash fix) | ✅ Done | `FileWatcher.swift` — NSLock protecting concurrent dictionary access |
 | **Linux TUI** | | |
 | Vault management screen in ratatui TUI | ⬜ Not started | `tui.rs` |
 | File browser with checkbox selection | ⬜ Not started | `tui.rs` |
 | **Verification** | | |
 | Rust unit tests (6 tests passing) | ✅ Done | encrypt/decrypt roundtrip, wrong passphrase, change, read-only, list |
 | macOS build + install + run | ✅ Done | Installed to /Applications, shield icon with Vault menu — 2026-03-29 |
-| Auth gate test (Touch ID / password prompt) | ⬜ Pending user test | Click "Protect Files..." to trigger |
-| Passphrase change test | ⬜ Pending user test | Click "Change Passphrase..." to test |
+| Auth gate test (Touch ID / password prompt) | ✅ Done | Tested — Touch ID prompt, cancel handling, session caching all working — 2026-03-30 |
+| Passphrase change test | ✅ Done | Tested — change works, Touch ID required each time (session invalidation fix) — 2026-03-30 |
+| Vault folder grouping test | ✅ Done | Tested — folders as collapsible groups in all sections — 2026-03-30 |
+| Combo protection test (read-only + local-only) | ✅ Done | Tested — checkbox picker, dual badges, toggle button all working — 2026-03-30 |
+| Finder tags for combo protections | ✅ Done | `FinderTags.swift` — multi-tag support for combo levels — 2026-03-30 |
+
+### Phase 8: External Notifications (Telegram, Discord, Email)
+
+| Component | Status | Location |
+|-----------|--------|----------|
+| **Notification Manager (Swift)** | | |
+| NotificationManager — channel routing + severity filtering | ✅ Done | `Sources/AISecurity/Notifications/NotificationManager.swift` |
+| NotificationConfig — JSON persistence for channel credentials | ✅ Done | `Sources/AISecurity/Notifications/NotificationConfig.swift` |
+| Severity routing (CRITICAL→all, HIGH→Telegram+Discord+Email, MEDIUM→local only) | ✅ Done | `NotificationManager.swift` |
+| **Telegram Channel** | | |
+| Telegram Bot API integration (sendMessage with MarkdownV2) | ✅ Done | `Sources/AISecurity/Notifications/TelegramChannel.swift` |
+| Bot token + chat ID configuration | ✅ Done | `NotificationConfig.swift` |
+| Formatted alert messages (severity badge, file path, findings) | ✅ Done | `TelegramChannel.swift` |
+| Test message send | ✅ Done | `TelegramChannel.swift` |
+| **Discord Channel** | | |
+| Discord webhook integration (POST embeds) | ✅ Done | `Sources/AISecurity/Notifications/DiscordChannel.swift` |
+| Webhook URL configuration | ✅ Done | `NotificationConfig.swift` |
+| Rich embed formatting (color-coded severity, fields) | ✅ Done | `DiscordChannel.swift` |
+| Test message send | ✅ Done | `DiscordChannel.swift` |
+| **Email Channel** | | |
+| SMTP email via Gmail App Password (raw socket TLS on port 587) | ✅ Done | `Sources/AISecurity/Notifications/EmailChannel.swift` |
+| Gmail address + app password configuration | ✅ Done | `NotificationConfig.swift` |
+| HTML + plain text email templates | ✅ Done | `EmailChannel.swift` |
+| Test email send | ✅ Done | `EmailChannel.swift` |
+| **Setup Wizard (macOS)** | | |
+| Notification setup dialog (accessible from menu bar) | ✅ Done | `Sources/AISecurity/Notifications/NotificationSetupDialog.swift` |
+| Telegram setup instructions (BotFather flow, get chat ID) | ✅ Done | `NotificationSetupDialog.swift` |
+| Discord setup instructions (create webhook) | ✅ Done | `NotificationSetupDialog.swift` |
+| Email setup instructions (Gmail 2FA + app password) | ✅ Done | `NotificationSetupDialog.swift` |
+| Per-channel test button (send test notification) | ✅ Done | `NotificationSetupDialog.swift` |
+| Per-channel enable/disable toggle | ✅ Done | `NotificationSetupDialog.swift` |
+| **Integration** | | |
+| Hook into SecurityLogger.alert() for CRITICAL/HIGH alerts | ✅ Done | `SecurityLogger.swift` + `NotificationManager.swift` |
+| Hook into FileWatcher VAULT_FILE_ACCESS alerts | ✅ Done | `SecurityDaemon.swift` — in-app dialog + external channels |
+| Menu bar item: "Notification Settings..." | ✅ Done | `AISecurityApp.swift` — under Notifications section |
+| **Linux** | | |
+| Same channel implementations via Rust HTTP (reqwest) | ⬜ Not started | `security-linux/src/notifications/` |
+| **Verification** | | |
+| Telegram test message delivery | ✅ Done | Tested — bot sends formatted alerts — 2026-03-30 |
+| Discord test embed delivery | ✅ Done | Tested — webhook sends color-coded embeds — 2026-03-30 |
+| Email test delivery (Gmail) | ✅ Done | Tested — HTML email via SMTP/curl — 2026-03-30 |
+| VAULT_FILE_ACCESS → external notification end-to-end | ✅ Done | Tested — touch .vault → in-app + Telegram + Discord + Email — 2026-03-30 |
+
+### Phase 9: Linux Completion
+
+| Component | Status | Location |
+|-----------|--------|----------|
+| **Linux Auth Gate** | | |
+| PAM authentication for vault operations | ⬜ Not started | `security-linux/src/auth.rs` |
+| Auth session caching (5-minute window) | ⬜ Not started | `security-linux/src/auth.rs` |
+| 3-attempt lockout with external alert | ⬜ Not started | `security-linux/src/auth.rs` |
+| **Vault TUI Screen** | | |
+| Vault list tab in ratatui TUI (table with badges) | ⬜ Not started | `security-linux/src/tui.rs` |
+| Folder grouping (collapsible tree) | ⬜ Not started | `security-linux/src/tui.rs` |
+| Vault actions: unlock, release, toggle local-only | ⬜ Not started | `security-linux/src/tui.rs` |
+| Auth prompt (masked password input + attempt counter) | ⬜ Not started | `security-linux/src/tui.rs` |
+| Protection level picker popup | ⬜ Not started | `security-linux/src/tui.rs` |
+| **File Browser Widget** | | |
+| Filesystem navigator (arrow keys, space select, enter) | ⬜ Not started | `security-linux/src/tui_file_browser.rs` |
+| Multi-select with checkboxes | ⬜ Not started | `security-linux/src/tui_file_browser.rs` |
+| **System Tray** | | |
+| ksni StatusNotifierItem (GNOME/KDE/XFCE) | ⬜ Not started | `security-linux/src/tray.rs` |
+| Shield icon + right-click menu | ⬜ Not started | `security-linux/src/tray.rs` |
+| **External Notifications (Rust)** | | |
+| Telegram channel (reqwest + MarkdownV2) | ⬜ Not started | `security-linux/src/notifications/telegram.rs` |
+| Discord channel (reqwest + embeds) | ⬜ Not started | `security-linux/src/notifications/discord.rs` |
+| Email channel (lettre SMTP) | ⬜ Not started | `security-linux/src/notifications/email.rs` |
+| NotificationManager + rate limiting | ⬜ Not started | `security-linux/src/notifications/mod.rs` |
+| Config persistence (shared JSON format) | ⬜ Not started | `security-linux/src/notifications/config.rs` |
+| **Verification** | | |
+| PAM auth test | ⬜ Not started | — |
+| TUI vault screen test | ⬜ Not started | — |
+| System tray test | ⬜ Not started | — |
+| External notification end-to-end test | ⬜ Not started | — |
+| Auth lockout + external alert test | ⬜ Not started | — |
 
 ---
 
@@ -923,6 +1011,303 @@ echo "secret data" > /tmp/test-vault.txt
 
 ---
 
+## 8. Phase 8: External Notifications (Telegram, Discord, Email)
+
+**Goal:** Send CRITICAL and HIGH security alerts to external channels so the user is notified
+even when away from their Mac. Telegram is the primary channel (most users have it). Discord
+and Email are secondary. Configuration via setup wizard accessible from menu bar.
+
+**Reference:** NodeProject dashboard notifications (`~/NodeProject/dashboard/backend/src/notifications/`)
+— same channel APIs, ported from TypeScript to Swift using URLSession.
+
+### 8.1 Architecture
+
+```
+Sources/AISecurity/Notifications/
+  NotificationManager.swift       # Routes alerts to enabled channels by severity
+  NotificationConfig.swift        # JSON persistence: ~/.mac-security/notification-config.json
+  TelegramChannel.swift           # Telegram Bot API (sendMessage)
+  DiscordChannel.swift            # Discord webhook (POST embed)
+  EmailChannel.swift              # SMTP via Gmail App Password (raw TLS socket)
+  NotificationSetupDialog.swift   # macOS setup wizard with per-channel instructions
+```
+
+### 8.2 Channel Configuration (persisted to `~/.mac-security/notification-config.json`)
+
+```json
+{
+  "telegram": {
+    "botToken": "123456789:ABCdef...",
+    "chatId": "987654321",
+    "enabled": true,
+    "updatedAt": "2026-03-30T..."
+  },
+  "discord": {
+    "webhookUrl": "https://discord.com/api/webhooks/ID/TOKEN",
+    "enabled": false,
+    "updatedAt": "2026-03-30T..."
+  },
+  "email": {
+    "userEmail": "user@gmail.com",
+    "appPassword": "xxxx xxxx xxxx xxxx",
+    "enabled": true,
+    "updatedAt": "2026-03-30T..."
+  }
+}
+```
+
+### 8.3 Severity Routing
+
+| Severity | Local (macOS notification) | Telegram | Discord | Email |
+|----------|:---:|:---:|:---:|:---:|
+| CRITICAL | Yes | Yes | Yes | Yes |
+| HIGH | Yes | Yes | Yes | No |
+| MEDIUM | Yes | No | No | No |
+| LOW | No | No | No | No |
+
+### 8.4 Telegram Integration
+
+**API:** `https://api.telegram.org/bot<TOKEN>/sendMessage`
+
+**Swift implementation:** URLSession POST with JSON body:
+```swift
+{
+  "chat_id": chatId,
+  "text": markdownMessage,
+  "parse_mode": "MarkdownV2"
+}
+```
+
+**Message format:**
+```
+🛡 *AISecurity Alert*
+🚨 *CRITICAL*
+
+━━━━━━━━━━━━━━━━━━
+
+📋 *What Happened:*
+Unauthorized access to vault\-protected file: A1\.png\.vault
+
+🔍 *Details:*
+• Encrypted vault file modified
+• Category: vault\_protection
+
+📁 *File:* `/Users/alice/Downloads/A1.png.vault`
+⏰ *Time:* 2026\-03\-30 14:15:19
+```
+
+**Setup instructions (shown in wizard):**
+1. Open Telegram, search `@BotFather`
+2. Send `/newbot`, follow prompts to create bot
+3. Copy the Bot Token
+4. Start a chat with your new bot (send any message)
+5. Open: `https://api.telegram.org/bot<TOKEN>/getUpdates`
+6. Find `"chat":{"id":NUMBERS}` — that's your Chat ID
+7. Enter Bot Token and Chat ID below
+
+### 8.5 Discord Integration
+
+**API:** POST to webhook URL with JSON embed
+
+**Swift implementation:** URLSession POST:
+```swift
+{
+  "username": "AISecurity",
+  "embeds": [{
+    "title": "🚨 Vault File Access Detected",
+    "color": 16711680,
+    "description": "Unauthorized access to vault-protected file",
+    "fields": [
+      { "name": "File", "value": "A1.png.vault", "inline": true },
+      { "name": "Severity", "value": "CRITICAL", "inline": true }
+    ],
+    "timestamp": "2026-03-30T14:15:19Z"
+  }]
+}
+```
+
+**Color mapping:** CRITICAL=0xFF0000, HIGH=0xFFA500, MEDIUM=0xFFFF00, LOW=0x00FF00
+
+**Setup instructions (shown in wizard):**
+1. Open Discord, go to your server
+2. Server Settings → Integrations → Webhooks → New Webhook
+3. Name it "AISecurity Alerts", select channel
+4. Copy Webhook URL, paste below
+
+### 8.6 Email Integration (Gmail)
+
+**SMTP:** Connect to `smtp.gmail.com:587` via TLS, authenticate with Gmail App Password.
+
+**Swift implementation:** Use `Network.framework` NWConnection for TLS socket, or shell out to
+`/usr/bin/curl --url 'smtps://smtp.gmail.com:465'` with `--mail-from` / `--mail-rcpt` as a
+simpler first pass.
+
+**Setup instructions (shown in wizard):**
+1. Go to `myaccount.google.com/security`
+2. Enable 2-Step Verification (required for app passwords)
+3. Go to `myaccount.google.com/apppasswords`
+4. Generate app password for "Mail" / "Other (AISecurity)"
+5. Copy the 16-character password
+6. Enter your Gmail address and App Password below
+
+### 8.7 Setup Wizard UI (macOS)
+
+**Menu bar:** Add "Notification Settings..." under the existing menu items.
+
+**Dialog:** NSTabView or stacked NSAlert panels for each channel:
+- Tab 1: Telegram (token + chat ID fields, setup instructions, test button)
+- Tab 2: Discord (webhook URL field, setup instructions, test button)
+- Tab 3: Email (Gmail + app password fields, setup instructions, test button)
+- Each tab has enable/disable toggle + "Test" button
+- "Test" sends a test notification to verify credentials work
+
+### 8.8 Integration Points
+
+1. **SecurityLogger.alert()** → after logging, call `NotificationManager.shared.send(alert)`
+2. **SecurityDaemon** → VAULT_FILE_ACCESS in-app dialog + external notification
+3. **NotificationManager** checks severity routing table, sends to enabled channels in parallel
+4. Delivery failures logged but don't block — fire-and-forget with error logging
+
+### 8.9 Verification
+
+```bash
+# 1. Configure Telegram via setup wizard
+# 2. touch ~/Downloads/A1.png.vault → should get Telegram message
+# 3. Configure Discord webhook → test button sends embed
+# 4. Configure Gmail → test button sends email
+# 5. Verify CRITICAL alerts reach all enabled channels
+```
+
+## 9. Phase 9: Linux Completion
+
+**Goal:** Complete all remaining Linux-specific features — vault auth, TUI vault management,
+system tray, and external notification channels via Rust. Test on Linux PC.
+
+### 9.1 Linux Auth Gate (PAM)
+
+**File:** `SecurityCore/crates/security-linux/src/auth.rs`
+
+Verify current user password via PAM `auth` stack before vault operations.
+Same 5-minute session cache as macOS AuthGate. Same 3-attempt lockout.
+
+```rust
+// PAM authentication via pam crate
+use pam::Authenticator;
+
+pub fn authenticate(username: &str, password: &str) -> Result<(), String> {
+    let mut auth = Authenticator::with_password("security-core")
+        .map_err(|e| format!("PAM init failed: {}", e))?;
+    auth.get_handler().set_credentials(username, password);
+    auth.authenticate()
+        .map_err(|e| format!("Authentication failed: {}", e))
+}
+```
+
+**Dependencies:** `pam = "0.8"` or `pam-sys = "1"`
+
+### 9.2 Vault TUI Screen (ratatui)
+
+**File:** `SecurityCore/crates/security-linux/src/tui.rs` (extend existing)
+
+Add vault management tab to the existing ratatui TUI:
+
+| Screen | Description |
+|--------|-------------|
+| Vault list | Table: filename, folder, protection level, size, status badges |
+| Folder grouping | Group entries by parent directory (collapsible) |
+| File browser | Navigate filesystem with arrow keys, space to select, Enter to confirm |
+| Protection picker | Popup: Locked / Read-only / Local-only + Local-only checkbox |
+| Auth prompt | Password input field (masked) with attempt counter |
+| Actions | Unlock temporarily, Release protection, Toggle local-only |
+
+**Key bindings:**
+- `v` — switch to vault tab
+- `a` — add files (opens file browser)
+- `u` — unlock selected
+- `r` — release selected
+- `l` — toggle local-only
+- `p` — change passphrase
+- `Enter` — expand/collapse folder
+- `Space` — select/deselect
+
+### 9.3 File Browser Widget
+
+**File:** `SecurityCore/crates/security-linux/src/tui_file_browser.rs`
+
+Ratatui widget for filesystem navigation:
+- Arrow keys: navigate directories and files
+- Space: toggle selection (checkbox)
+- Enter: open directory / confirm selection
+- Backspace: go up one directory
+- Shows: filename, size, type icon, selection checkbox
+- Starts at `$HOME`
+- Multi-select support for batch vault operations
+
+### 9.4 System Tray (ksni)
+
+**File:** `SecurityCore/crates/security-linux/src/tray.rs`
+
+StatusNotifierItem for GNOME/KDE/XFCE panel:
+- Shield icon in system tray
+- Right-click menu: Start/Stop Agent, Open TUI, Vault, Quit
+- Tooltip: threat count, running status
+- Icon changes color on CRITICAL alert
+
+**Dependencies:** `ksni = "0.2"` (requires GTK icon assets)
+
+### 9.5 External Notifications (Rust)
+
+**Directory:** `SecurityCore/crates/security-linux/src/notifications/`
+
+Port the macOS Swift notification channels to Rust using `reqwest`:
+
+```
+notifications/
+  mod.rs                  # NotificationManager — routing + rate limiting
+  config.rs               # JSON config persistence (~/.mac-security/notification-config.json)
+  telegram.rs             # Telegram Bot API (sendMessage, MarkdownV2)
+  discord.rs              # Discord webhook (POST embed)
+  email.rs                # Gmail SMTP via lettre crate
+  rate_limiter.rs         # Per-type cooldown + per-file dedup + global throttle
+```
+
+**Dependencies:**
+```toml
+reqwest = { version = "0.12", features = ["json", "blocking"] }
+lettre = "0.11"          # SMTP email (replaces curl approach)
+```
+
+**Config:** Same JSON format as macOS (`notification-config.json`) — shared across platforms.
+
+**Rate limiting:** Same rules as macOS:
+- Per-type cooldown: 60 seconds
+- Per-file cooldown: 1 hour
+- Global throttle: 10 per 5-minute window
+
+### 9.6 Verification
+
+```bash
+# 1. PAM auth
+cargo test -p security-linux --test auth_test
+
+# 2. TUI vault screen
+cargo run -p security-linux -- --tui
+# Navigate to vault tab, add files, unlock, release
+
+# 3. System tray
+cargo run -p security-linux -- --tray
+# Verify icon appears, menu works
+
+# 4. External notifications
+# Configure via TUI settings or edit notification-config.json directly
+# touch a .vault file → Telegram/Discord/Email alert
+
+# 5. Auth rate limiting
+# Enter wrong passphrase 3 times → lockout message + external alert
+```
+
+---
+
 ## Execution Timeline
 
 ```
@@ -952,6 +1337,22 @@ Mac Portability    -->  Rust Core Library     -->  macOS FFI Integration
                                                 NSOpenPanel file picker
                                                 User education wizard
                                                 FileWatcher integration
+
+                                              Phase 8 (Weeks 19-20)
+                                              External Notifications
+                                                Telegram Bot API
+                                                Discord webhooks
+                                                Gmail SMTP email
+                                                Setup wizard UI
+                                                Severity routing
+
+                                              Phase 9 (Weeks 21-23)
+                                              Linux Completion
+                                                PAM vault auth + lockout
+                                                Vault TUI screen (ratatui)
+                                                File browser widget
+                                                System tray (ksni)
+                                                Rust notification channels
 ```
 
 ## Key Architectural Decisions

@@ -190,13 +190,32 @@ enum SecurityCoreBridge {
         case locked = 0
         case readOnly = 1
         case localOnly = 2
+        case readOnlyLocal = 3
+        case lockedLocal = 4
 
         var label: String {
             switch self {
             case .locked: return "Locked (encrypted)"
             case .readOnly: return "Read-only"
             case .localOnly: return "Local-only"
+            case .readOnlyLocal: return "Read-only + Local-only"
+            case .lockedLocal: return "Locked + Local-only"
             }
+        }
+
+        /// Whether this protection includes encryption.
+        var isLocked: Bool {
+            self == .locked || self == .lockedLocal
+        }
+
+        /// Whether this protection includes read-only.
+        var isReadOnly: Bool {
+            self == .readOnly || self == .readOnlyLocal
+        }
+
+        /// Whether this protection includes local-only monitoring.
+        var isLocalOnly: Bool {
+            self == .localOnly || self == .readOnlyLocal || self == .lockedLocal
         }
     }
 
@@ -318,6 +337,18 @@ enum SecurityCoreBridge {
             oldPassphrase.withCString { old in
                 newPassphrase.withCString { new in
                     sec_vault_change_passphrase(d, old, new)
+                }
+            }
+        }
+        return vaultResultFromFFI(ptr)
+    }
+
+    static func vaultToggleLocalOnly(securityDir: String, paths: [String], passphrase: String) -> VaultResult {
+        let joined = paths.joined(separator: ":")
+        let ptr = securityDir.withCString { d in
+            joined.withCString { p in
+                passphrase.withCString { pass in
+                    sec_vault_toggle_local_only(d, p, pass)
                 }
             }
         }

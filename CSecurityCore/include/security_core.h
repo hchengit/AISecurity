@@ -200,7 +200,7 @@ bool sec_vault_set_passphrase(const char *securityDir, const char *passphrase);
 bool sec_vault_verify_passphrase(const char *securityDir, const char *passphrase);
 
 /**
- * Add files to vault. `paths` is a colon-separated list. `protection`: 0=locked, 1=read_only, 2=local_only.
+ * Add files to vault. `paths` is a colon-separated list. `protection`: 0=locked, 1=read_only, 2=local_only, 3=read_only_local, 4=locked_local.
  */
 struct VaultResultFFI *sec_vault_add(const char *securityDir,
                                      const char *paths,
@@ -239,6 +239,13 @@ struct VaultEntryArrayFFI *sec_vault_list(const char *securityDir, const char *p
 struct VaultResultFFI *sec_vault_change_passphrase(const char *securityDir,
                                                    const char *oldPassphrase,
                                                    const char *newPassphrase);
+
+/**
+ * Toggle local-only monitoring on vault entries. `paths` is colon-separated.
+ */
+struct VaultResultFFI *sec_vault_toggle_local_only(const char *securityDir,
+                                                   const char *paths,
+                                                   const char *passphrase);
 
 /**
  * Free a VaultResultFFI.

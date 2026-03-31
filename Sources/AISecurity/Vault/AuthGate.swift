@@ -48,6 +48,10 @@ final class AuthGate {
                     self?.lastAuthTime = Date()
                     self?.lock.unlock()
                     completion(true, nil)
+                } else if let laError = authError as? LAError,
+                          laError.code == .userCancel || laError.code == .appCancel || laError.code == .systemCancel {
+                    // User (or system) cancelled — not an error
+                    completion(false, nil)
                 } else {
                     let msg = authError?.localizedDescription ?? "Authentication failed"
                     completion(false, msg)

@@ -154,6 +154,13 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
         menu.addItem(.separator())
 
+        let notifHeader = NSMenuItem(title: "\u{1F514} Notifications", action: nil, keyEquivalent: "")
+        notifHeader.isEnabled = false
+        menu.addItem(notifHeader)
+        menu.addItem(makeItem("Notification Settings...", action: #selector(openNotificationSettings)))
+
+        menu.addItem(.separator())
+
         if running {
             menu.addItem(makeItem("Stop Agent", action: #selector(stopAgent)))
         } else {
@@ -268,16 +275,18 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             reason: "Authenticate to protect files",
             passphrasePrompt: "Enter Vault Passphrase",
             onPassphrase: { passphrase in
+                VaultOperationScope.begin()
                 let result = VaultManager.shared.addFiles(paths, protection: protection, passphrase: passphrase)
                 if result.success {
-                    // Tag files/folders in Finder so they're visually marked
                     for path in paths {
                         FinderTags.addTag(path, protection: protection)
                     }
+                    VaultManager.shared.refreshWatchedPaths(passphrase: passphrase)
                     VaultDialogs.showSuccess(result.message)
                 } else {
                     VaultDialogs.showError(result.message)
                 }
+                VaultOperationScope.end()
             },
             onCancel: {},
             onError: { VaultDialogs.showError($0) }
@@ -293,6 +302,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             reason: "Authenticate to open vault",
             passphrasePrompt: "Enter Vault Passphrase",
             onPassphrase: { passphrase in
+                // Refresh watched-paths cache so FileWatcher can monitor vault files
+                VaultManager.shared.refreshWatchedPaths(passphrase: passphrase)
                 DispatchQueue.main.async {
                     WindowManager.shared.showVault(
                         securityDir: SecurityConfig.shared.securityDir,
@@ -308,6 +319,13 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     @objc private func vaultChangePassphrase() {
         guard ensureVaultSetup() else { return }
 
+        // Check lockout before prompting
+        if VaultManager.shared.isLockedOut {
+            let secs = VaultManager.shared.lockoutRemainingSeconds
+            VaultDialogs.showError("Vault locked out. Too many failed attempts.\nTry again in \(secs / 60)m \(secs % 60)s.")
+            return
+        }
+
         VaultManager.shared.authGate.authenticate(reason: "Authenticate to change vault passphrase") { success, error in
             guard success else {
                 if let e = error { VaultDialogs.showError(e) }
@@ -317,11 +335,19 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             guard let passes = VaultDialogs.promptChangePassphrase() else { return }
             let result = VaultManager.shared.changePassphrase(old: passes.old, new: passes.new)
             if result.success {
+                VaultManager.shared.refreshWatchedPaths(passphrase: passes.new)
                 VaultDialogs.showSuccess(result.message)
             } else {
                 VaultDialogs.showError(result.message)
             }
         }
+    }
+
+    // MARK: - Notification Settings
+
+    @objc private func openNotificationSettings() {
+        NSApplication.shared.activate(ignoringOtherApps: true)
+        NotificationSetupDialog.show()
     }
 
     // MARK: - App Lifecycle

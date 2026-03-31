@@ -28,7 +28,7 @@ final class SecurityDaemon: ObservableObject {
     private var detector: SensitiveDataDetector!
     private var guard_: PromptInjectionGuard!
     private var sanitizer: ExternalFileSanitizer!
-    private var watcher: FileWatcher!
+    private(set) var watcher: FileWatcher!
     private var emailScanner: EmailScanner!
     private var messagesScanner: MessagesScanner!
     private var modulesReady = false
@@ -116,6 +116,16 @@ final class SecurityDaemon: ObservableObject {
                 }
                 Task { @MainActor in
                     self.threatCount += 1
+                    // Show in-app alert for vault file access (macOS notifications may be suppressed)
+                    if alert.type == "VAULT_FILE_ACCESS" {
+                        let a = NSAlert()
+                        a.messageText = "\u{1F6A8} Vault File Access Detected"
+                        a.informativeText = alert.message
+                        a.alertStyle = .critical
+                        a.addButton(withTitle: "OK")
+                        NSApplication.shared.activate(ignoringOtherApps: true)
+                        a.runModal()
+                    }
                 }
             }
             watcher.start()

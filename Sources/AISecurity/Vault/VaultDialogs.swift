@@ -113,6 +113,9 @@ enum VaultDialogs {
         let count = paths.count
         let fileWord = count == 1 ? "file" : "files"
 
+        let pathList = paths.prefix(5).joined(separator: "\n")
+            + (count > 5 ? "\n... and \(count - 5) more" : "")
+
         switch protection {
         case .locked:
             alert.messageText = "Encrypt \(count) \(fileWord)?"
@@ -122,7 +125,7 @@ enum VaultDialogs {
 
             You will need your vault passphrase to access them again.
 
-            \(paths.prefix(5).joined(separator: "\n"))\(count > 5 ? "\n... and \(count - 5) more" : "")
+            \(pathList)
             """
         case .readOnly:
             alert.messageText = "Set \(count) \(fileWord) to read-only?"
@@ -131,7 +134,7 @@ enum VaultDialogs {
             Apps can still open and read them, but cannot modify them.
             You'll be alerted if anything tries to write to them.
 
-            \(paths.prefix(5).joined(separator: "\n"))\(count > 5 ? "\n... and \(count - 5) more" : "")
+            \(pathList)
             """
         case .localOnly:
             alert.messageText = "Monitor \(count) \(fileWord) for exfiltration?"
@@ -140,7 +143,27 @@ enum VaultDialogs {
             them normally, but you'll be alerted if any process attempts to upload \
             or send them over the network.
 
-            \(paths.prefix(5).joined(separator: "\n"))\(count > 5 ? "\n... and \(count - 5) more" : "")
+            \(pathList)
+            """
+        case .readOnlyLocal:
+            alert.messageText = "Set \(count) \(fileWord) to read-only + local-only?"
+            alert.informativeText = """
+            The selected \(fileWord) will be set to read-only (chmod 444) AND \
+            monitored for network exfiltration.
+            Apps can open but not modify them, and you'll be alerted if any \
+            process attempts to send them over the network.
+
+            \(pathList)
+            """
+        case .lockedLocal:
+            alert.messageText = "Encrypt \(count) \(fileWord) + monitor?"
+            alert.informativeText = """
+            The selected \(fileWord) will be encrypted with AES-256-GCM AND \
+            monitored for network exfiltration.
+            Original files will be securely deleted. When temporarily unlocked, \
+            you'll be alerted if any process tries to send them over the network.
+
+            \(pathList)
             """
         }
 
@@ -165,33 +188,112 @@ enum VaultDialogs {
 
     // MARK: - Protection Level Picker
 
-    /// Let user choose a protection level. Returns nil if cancelled.
+    /// Helper that enforces mutual exclusivity between Locked and Read-only checkboxes.
+    private class ProtectionPickerDelegate: NSObject {
+        let lockedBox: NSButton
+        let readOnlyBox: NSButton
+
+        init(locked: NSButton, readOnly: NSButton) {
+            self.lockedBox = locked
+            self.readOnlyBox = readOnly
+        }
+
+        @objc func lockedToggled(_ sender: NSButton) {
+            if sender.state == .on {
+                readOnlyBox.state = .off
+            }
+        }
+
+        @objc func readOnlyToggled(_ sender: NSButton) {
+            if sender.state == .on {
+                lockedBox.state = .off
+            }
+        }
+    }
+
+    /// Let user choose protection levels. Locked/Read-only are mutually exclusive; Local-only combines with either.
     static func pickProtectionLevel() -> SecurityCoreBridge.ProtectionLevel? {
         let alert = NSAlert()
         alert.messageText = "Choose Protection Level"
-        alert.informativeText = """
-        \u{1F512} Locked — Encrypt the file. Original securely deleted. \
-        Only your passphrase can decrypt it.
-
-        \u{1F4D6} Read-only — Apps can open but not modify. \
-        Alert on write attempts.
-
-        \u{1F310} Local-only — Normal read/write, but alert if any app \
-        tries to upload or send the file over the network.
-        """
+        alert.informativeText = "Locked and Read-only are mutually exclusive.\nLocal-only can be added to either, or used alone."
         alert.alertStyle = .informational
-        alert.addButton(withTitle: "Locked (Encrypt)")
-        alert.addButton(withTitle: "Read-only")
-        alert.addButton(withTitle: "Local-only")
+        alert.addButton(withTitle: "Protect")
         alert.addButton(withTitle: "Cancel")
 
+        // Use NSStackView for reliable auto-layout
+        let stack = NSStackView()
+        stack.orientation = .vertical
+        stack.alignment = .leading
+        stack.spacing = 8
+        stack.edgeInsets = NSEdgeInsets(top: 4, left: 0, bottom: 4, right: 0)
+
+        // Locked checkbox
+        let lockedBox = NSButton(checkboxWithTitle: "Locked (Encrypt) \u{2014} original securely deleted, passphrase to decrypt",
+                                 target: nil, action: nil)
+        lockedBox.font = .systemFont(ofSize: 13)
+        lockedBox.state = .on
+        stack.addArrangedSubview(lockedBox)
+
+        // Read-only checkbox (mutually exclusive with Locked)
+        let readOnlyBox = NSButton(checkboxWithTitle: "Read-only \u{2014} apps can open but not modify, alert on writes",
+                                   target: nil, action: nil)
+        readOnlyBox.font = .systemFont(ofSize: 13)
+        stack.addArrangedSubview(readOnlyBox)
+
+        // Separator
+        let sep = NSBox()
+        sep.boxType = .separator
+        sep.translatesAutoresizingMaskIntoConstraints = false
+        sep.heightAnchor.constraint(equalToConstant: 1).isActive = true
+        sep.widthAnchor.constraint(equalToConstant: 400).isActive = true
+        stack.addArrangedSubview(sep)
+
+        // Local-only checkbox (independent, can combine)
+        let localOnlyBox = NSButton(checkboxWithTitle: "Local-only \u{2014} alert on network exfiltration (can combine with above)",
+                                    target: nil, action: nil)
+        localOnlyBox.font = .systemFont(ofSize: 13)
+        stack.addArrangedSubview(localOnlyBox)
+
+        // Wire up mutual exclusivity between Locked and Read-only
+        let delegate = ProtectionPickerDelegate(locked: lockedBox, readOnly: readOnlyBox)
+        lockedBox.target = delegate
+        lockedBox.action = #selector(ProtectionPickerDelegate.lockedToggled(_:))
+        readOnlyBox.target = delegate
+        readOnlyBox.action = #selector(ProtectionPickerDelegate.readOnlyToggled(_:))
+
+        // Set explicit frame size so NSAlert respects it
+        stack.translatesAutoresizingMaskIntoConstraints = false
+        let wrapper = NSView(frame: NSRect(x: 0, y: 0, width: 420, height: 120))
+        wrapper.addSubview(stack)
+        stack.topAnchor.constraint(equalTo: wrapper.topAnchor).isActive = true
+        stack.leadingAnchor.constraint(equalTo: wrapper.leadingAnchor).isActive = true
+        stack.trailingAnchor.constraint(equalTo: wrapper.trailingAnchor).isActive = true
+
+        alert.accessoryView = wrapper
+        alert.layout()
+
+        // Keep delegate alive while alert is showing
+        objc_setAssociatedObject(alert, "protectionDelegate", delegate, .OBJC_ASSOCIATION_RETAIN)
+
         let response = alert.runModal()
-        switch response {
-        case .alertFirstButtonReturn: return .locked
-        case .alertSecondButtonReturn: return .readOnly
-        case .alertThirdButtonReturn: return .localOnly
-        default: return nil
+        guard response == .alertFirstButtonReturn else { return nil }
+
+        let isLocked = lockedBox.state == .on
+        let isReadOnly = readOnlyBox.state == .on
+        let isLocalOnly = localOnlyBox.state == .on
+
+        // Must select at least one
+        guard isLocked || isReadOnly || isLocalOnly else {
+            showError("Please select at least one protection level.")
+            return nil
         }
+
+        // Determine combined protection
+        if isLocked && isLocalOnly { return .lockedLocal }
+        if isLocked { return .locked }
+        if isReadOnly && isLocalOnly { return .readOnlyLocal }
+        if isReadOnly { return .readOnly }
+        return .localOnly
     }
 
     // MARK: - Change Passphrase
