@@ -12,6 +12,7 @@ use security_core::file_sanitizer;
 use security_core::sensitive_data;
 use security_core::severity::SeverityLevel;
 
+use crate::ext_notifications::NotificationManager;
 use crate::logger::SecurityLogger;
 use crate::notifications;
 
@@ -23,6 +24,7 @@ pub fn start(
     logger: Arc<SecurityLogger>,
     running: Arc<AtomicBool>,
     critical_only: bool,
+    ext_notif: Option<Arc<NotificationManager>>,
 ) {
     let mut inotify = match Inotify::init() {
         Ok(i) => i,
@@ -93,7 +95,7 @@ pub fn start(
             };
 
             let file_path = Path::new(dir).join(name);
-            scan_file(&file_path, &logger, &mut hash_cache, critical_only);
+            scan_file(&file_path, &logger, &mut hash_cache, critical_only, &ext_notif);
         }
     }
 
@@ -105,6 +107,7 @@ fn scan_file(
     logger: &SecurityLogger,
     cache: &mut HashMap<PathBuf, String>,
     critical_only: bool,
+    ext_notif: &Option<Arc<NotificationManager>>,
 ) {
     let metadata = match fs::metadata(path) {
         Ok(m) => m,
@@ -152,11 +155,12 @@ fn scan_file(
             if notifications::should_notify(threat.severity, critical_only) {
                 notifications::notify(&alert);
             }
+            if let Some(ref nm) = ext_notif { nm.send(&alert); }
         }
     }
 
     for warning in &file_result.warnings {
-        logger.warn(&format!("⚠️ Suspicious file: {} — {}", filename, warning.detail));
+        logger.warn(&format!("\u{26A0}\u{FE0F} Suspicious file: {} \u{2014} {}", filename, warning.detail));
     }
 
     // Scan for sensitive data
@@ -172,7 +176,7 @@ fn scan_file(
             "SENSITIVE_DATA_IN_FILE",
             max_sev,
             &format!(
-                "🔑 {} sensitive data finding(s) in: {}",
+                "\u{1F511} {} sensitive data finding(s) in: {}",
                 findings.len(),
                 filename
             ),
@@ -181,5 +185,6 @@ fn scan_file(
         if notifications::should_notify(max_sev, critical_only) {
             notifications::notify(&alert);
         }
+        if let Some(ref nm) = ext_notif { nm.send(&alert); }
     }
 }

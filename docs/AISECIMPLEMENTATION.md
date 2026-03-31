@@ -1,7 +1,7 @@
 # AISecurity — Cross-Platform Assessment & Implementation Plan
 
 **Date:** 2026-03-28
-**Status:** Phase 9 in progress (security hardening — self-protection + attack surface reduction)
+**Status:** Phase 10 in progress (Linux completion — PAM auth, vault TUI, notifications)
 **Last Updated:** 2026-03-30
 
 ---
@@ -340,27 +340,27 @@ of WHAT it does with that access. That's the gap AISecurity fills.
 | Component | Status | Location |
 |-----------|--------|----------|
 | **Linux Auth Gate** | | |
-| PAM authentication for vault operations | ⬜ Not started | `security-linux/src/auth.rs` |
-| Auth session caching (5-minute window) | ⬜ Not started | `security-linux/src/auth.rs` |
-| 3-attempt lockout with external alert | ⬜ Not started | `security-linux/src/auth.rs` |
+| PAM authentication for vault operations | ✅ Done | `security-linux/src/auth.rs` — PAM Client + password conv — 2026-03-31 |
+| Auth session caching (5-minute window) | ✅ Done | `security-linux/src/auth.rs` — Instant-based session with 300s timeout — 2026-03-31 |
+| 3-attempt lockout with external alert | ✅ Done | `security-linux/src/auth.rs` — MAX_FAILED_ATTEMPTS=3, 5-min lockout — 2026-03-31 |
 | **Vault TUI Screen** | | |
-| Vault list tab in ratatui TUI (table with badges) | ⬜ Not started | `security-linux/src/tui.rs` |
-| Folder grouping (collapsible tree) | ⬜ Not started | `security-linux/src/tui.rs` |
-| Vault actions: unlock, release, toggle local-only | ⬜ Not started | `security-linux/src/tui.rs` |
-| Auth prompt (masked password input + attempt counter) | ⬜ Not started | `security-linux/src/tui.rs` |
-| Protection level picker popup | ⬜ Not started | `security-linux/src/tui.rs` |
+| Vault list tab in ratatui TUI (table with badges) | ✅ Done | `security-linux/src/tui.rs` — multi-screen TUI (Alerts/Vault/FileBrowser/Auth) — 2026-03-31 |
+| Folder grouping (collapsible tree) | ✅ Done | `security-linux/src/tui.rs` — BTreeMap folder groups, Enter to expand/collapse — 2026-03-31 |
+| Vault actions: unlock, release, toggle local-only | ✅ Done | `security-linux/src/tui.rs` — u/l/t keys, auth-gated via PAM — 2026-03-31 |
+| Auth prompt (masked password input + attempt counter) | ✅ Done | `security-linux/src/tui.rs` — bullet-masked input, remaining attempts shown — 2026-03-31 |
+| Protection level picker popup | ✅ Done | `security-linux/src/tui.rs` — centered popup, mutual exclusivity for locked/read-only — 2026-03-31 |
 | **File Browser Widget** | | |
-| Filesystem navigator (arrow keys, space select, enter) | ⬜ Not started | `security-linux/src/tui_file_browser.rs` |
-| Multi-select with checkboxes | ⬜ Not started | `security-linux/src/tui_file_browser.rs` |
+| Filesystem navigator (arrow keys, space select, enter) | ✅ Done | `security-linux/src/tui_file_browser.rs` — dirs first, alphabetical, enter=open — 2026-03-31 |
+| Multi-select with checkboxes | ✅ Done | `security-linux/src/tui_file_browser.rs` — Space toggles, tracked in selected_paths — 2026-03-31 |
 | **System Tray** | | |
-| ksni StatusNotifierItem (GNOME/KDE/XFCE) | ⬜ Not started | `security-linux/src/tray.rs` |
-| Shield icon + right-click menu | ⬜ Not started | `security-linux/src/tray.rs` |
+| ksni StatusNotifierItem (GNOME/KDE/XFCE) | ⬜ Deferred | ksni dependency added, needs GTK icon assets |
+| Shield icon + right-click menu | ⬜ Deferred | Requires icon design + menu wiring |
 | **External Notifications (Rust)** | | |
-| Telegram channel (reqwest + MarkdownV2) | ⬜ Not started | `security-linux/src/notifications/telegram.rs` |
-| Discord channel (reqwest + embeds) | ⬜ Not started | `security-linux/src/notifications/discord.rs` |
-| Email channel (lettre SMTP) | ⬜ Not started | `security-linux/src/notifications/email.rs` |
-| NotificationManager + rate limiting | ⬜ Not started | `security-linux/src/notifications/mod.rs` |
-| Config persistence (shared JSON format) | ⬜ Not started | `security-linux/src/notifications/config.rs` |
+| Telegram channel (reqwest + MarkdownV2) | ✅ Done | `security-linux/src/ext_notifications/telegram.rs` — formatted alerts + test — 2026-03-31 |
+| Discord channel (reqwest + embeds) | ✅ Done | `security-linux/src/ext_notifications/discord.rs` — rich embeds + webhook validation — 2026-03-31 |
+| Email channel (lettre SMTP) | ✅ Done | `security-linux/src/ext_notifications/email.rs` — Gmail SMTP via lettre — 2026-03-31 |
+| NotificationManager + rate limiting | ✅ Done | `security-linux/src/ext_notifications/mod.rs` — 3-tier rate limiting (type/file/global) — 2026-03-31 |
+| Config persistence (shared JSON format) | ✅ Done | `security-linux/src/ext_notifications/config.rs` — shared JSON + 0600 perms — 2026-03-31 |
 | **Verification** | | |
 | PAM auth test | ⬜ Not started | — |
 | TUI vault screen test | ⬜ Not started | — |
