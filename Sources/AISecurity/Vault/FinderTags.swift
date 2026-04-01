@@ -53,9 +53,10 @@ enum FinderTags {
         }
     }
 
-    // MARK: - Deletion Protection (macOS immutable flag)
+    // MARK: - Deletion Protection (macOS immutable + Finder locked)
 
-    /// Set the macOS user-immutable flag (uchg) to prevent accidental deletion/rename/move.
+    /// Lock a file with the macOS user-immutable flag (uchg).
+    /// Finder shows "This item is locked" before allowing trash. Terminal gets "Operation not permitted".
     static func lockFile(_ path: String) {
         guard FileManager.default.fileExists(atPath: path) else { return }
         let process = Process()
@@ -67,7 +68,7 @@ enum FinderTags {
         process.waitUntilExit()
     }
 
-    /// Remove the macOS user-immutable flag so the file can be modified/deleted.
+    /// Unlock a file: remove the immutable flag.
     static func unlockFile(_ path: String) {
         guard FileManager.default.fileExists(atPath: path) else { return }
         let process = Process()

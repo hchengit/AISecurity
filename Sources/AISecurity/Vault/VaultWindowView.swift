@@ -9,6 +9,7 @@ struct VaultWindowView: View {
     @State private var entries: [SecurityCoreBridge.VaultEntry] = []
     @State private var selectedPaths: Set<String> = []
     @State private var expandedFolders: Set<String> = [] // tracks which folders are expanded
+    @State private var trashAlertShown: Set<String> = [] // prevent repeated trash restore dialogs
     @State private var fileMonitors: [String: Any] = [:] // for temporary unlock tracking
 
     // MARK: - Grouped entries by protection section
@@ -120,6 +121,15 @@ struct VaultWindowView: View {
                     .help("Add or remove local-only network monitoring for selected items.")
                     .disabled(onlyPureLocalOnlySelected)
 
+                    Button {
+                        changeProtection()
+                    } label: {
+                        Label("Change Protection", systemImage: "arrow.triangle.2.circlepath")
+                    }
+                    .buttonStyle(.bordered)
+                    .tint(.indigo)
+                    .help("Change protection level (e.g. read-only to encrypted).")
+
                     Spacer()
 
                     Text(label)
@@ -144,7 +154,10 @@ struct VaultWindowView: View {
             }
         }
         .frame(minWidth: 700, minHeight: 500)
-        .onAppear { reload() }
+        .onAppear {
+            reload()
+            checkTrashForVaultFiles()
+        }
     }
 
     // MARK: - Flat Section Header + Folder Groups (avoids Section+DisclosureGroup nesting bug)
@@ -478,6 +491,54 @@ struct VaultWindowView: View {
         reload()
     }
 
+    private func changeProtection() {
+        let paths = targetPaths()
+        guard !paths.isEmpty else { return }
+
+        // Pick new protection level
+        guard let newProtection = VaultDialogs.pickProtectionLevel() else { return }
+
+        let count = paths.count
+        let alert = NSAlert()
+        alert.messageText = "Change protection for \(count) item(s)?"
+        alert.informativeText = "Current protection will be released and files will be re-protected as: \(newProtection.label).\n\nThis requires decrypting and re-encrypting files."
+        alert.alertStyle = .warning
+        alert.addButton(withTitle: "Change")
+        alert.addButton(withTitle: "Cancel")
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+
+        VaultOperationScope.begin()
+        // Step 1: Remove deletion protection
+        for path in paths { FinderTags.unprotectFromDeletion(path) }
+
+        // Step 2: Remove from vault (decrypts if needed)
+        let removeResult = SecurityCoreBridge.vaultRemove(
+            securityDir: securityDir, paths: paths, passphrase: passphrase)
+        guard removeResult.success else {
+            VaultDialogs.showError("Failed to release: \(removeResult.message)")
+            VaultOperationScope.end()
+            reload()
+            return
+        }
+
+        // Step 3: Re-add with new protection
+        let addResult = SecurityCoreBridge.vaultAdd(
+            securityDir: securityDir, paths: paths, protection: newProtection, passphrase: passphrase)
+        if addResult.success {
+            for path in paths {
+                FinderTags.removeTag(path)
+                FinderTags.addTag(path, protection: newProtection)
+                FinderTags.protectFromDeletion(path, protection: newProtection)
+            }
+            VaultManager.shared.refreshWatchedPaths(passphrase: passphrase)
+            VaultDialogs.showSuccess("\(addResult.entriesAffected) file(s) changed to \(newProtection.label)")
+        } else {
+            VaultDialogs.showError("Re-protection failed: \(addResult.message)")
+        }
+        VaultOperationScope.end()
+        reload()
+    }
+
     /// Start a timer to re-encrypt temporarily unlocked files.
     private func startReEncryptTimer(paths: [String]) {
         // Check every 30 seconds if the files are still open
@@ -543,18 +604,54 @@ struct VaultWindowView: View {
 
     // MARK: - Helpers
 
+    /// One-time check for vault files in Trash (called on window open only).
+    private func checkTrashForVaultFiles() {
+        let fm = FileManager.default
+        let trashDir = (fm.homeDirectoryForCurrentUser.path as NSString).appendingPathComponent(".Trash")
+        var trashedFiles: [(expected: String, trashPath: String, fileName: String)] = []
+
+        for entry in entries {
+            let expectedPath = entry.protection.isLocked ? entry.vaultPath : entry.originalPath
+            guard !expectedPath.isEmpty, !fm.fileExists(atPath: expectedPath) else { continue }
+
+            let fileName = (expectedPath as NSString).lastPathComponent
+            let trashPath = (trashDir as NSString).appendingPathComponent(fileName)
+            if fm.fileExists(atPath: trashPath) {
+                trashedFiles.append((expected: expectedPath, trashPath: trashPath, fileName: fileName))
+            }
+        }
+
+        guard !trashedFiles.isEmpty else { return }
+
+        let fileList = trashedFiles.map(\.fileName).joined(separator: "\n")
+        let alert = NSAlert()
+        alert.messageText = "\(trashedFiles.count) vault file(s) found in Trash"
+        alert.informativeText = "These files are tracked in your vault but were moved to Trash:\n\n\(fileList)\n\nRestore them to their original locations?"
+        alert.alertStyle = .warning
+        alert.addButton(withTitle: "Restore All")
+        alert.addButton(withTitle: "Leave in Trash")
+
+        if alert.runModal() == .alertFirstButtonReturn {
+            for file in trashedFiles {
+                try? fm.moveItem(atPath: file.trashPath, toPath: file.expected)
+                FinderTags.lockFile(file.expected)
+            }
+            reload()
+        }
+    }
+
     private func reload() {
         entries = SecurityCoreBridge.vaultList(securityDir: securityDir, passphrase: passphrase)
-        // Auto-expand all folders on first load
-        if expandedFolders.isEmpty {
-            for entry in entries {
-                let folder = (entry.originalPath as NSString).deletingLastPathComponent
-                let sectionTitle: String
-                if entry.protection.isLocked { sectionTitle = "Encrypted" }
-                else if entry.protection.isReadOnly { sectionTitle = "Read-Only" }
-                else { sectionTitle = "Local-Only" }
-                expandedFolders.insert("\(sectionTitle):\(folder)")
-            }
+
+        // Always expand all folders after data changes
+        expandedFolders.removeAll()
+        for entry in entries {
+            let folder = (entry.originalPath as NSString).deletingLastPathComponent
+            let sectionTitle: String
+            if entry.protection.isLocked { sectionTitle = "Encrypted" }
+            else if entry.protection.isReadOnly { sectionTitle = "Read-Only" }
+            else { sectionTitle = "Local-Only" }
+            expandedFolders.insert("\(sectionTitle):\(folder)")
         }
     }
 

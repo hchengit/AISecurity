@@ -77,21 +77,59 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             return
         }
 
-        // Always require fresh auth for file opens (no session cache)
+        // Ask: temporary or permanent decrypt?
+        let choice = NSAlert()
+        choice.messageText = "Decrypt \(vaultFiles.count) file(s)?"
+        choice.informativeText = "Choose how to decrypt:"
+        choice.alertStyle = .informational
+        choice.addButton(withTitle: "Open Temporarily")  // first = default
+        choice.addButton(withTitle: "Decrypt Permanently")
+        choice.addButton(withTitle: "Cancel")
+        let choiceResponse = choice.runModal()
+        guard choiceResponse != .alertThirdButtonReturn else {
+            sender.reply(toOpenOrPrint: .cancel)
+            return
+        }
+        let isTemporary = (choiceResponse == .alertFirstButtonReturn)
+
+        // Always require fresh auth
         VaultManager.shared.clearPassphrase()
         VaultManager.shared.withAuth(
             reason: "Authenticate to decrypt files",
             passphrasePrompt: "Enter Vault Passphrase to Decrypt",
             onPassphrase: { passphrase in
+                VaultOperationScope.begin()
+                // Remove deletion protection before decrypt
+                for vf in vaultFiles { FinderTags.unprotectFromDeletion(String(vf.dropLast(".vault".count))) }
                 let result = VaultManager.shared.unlockFiles(vaultFiles, passphrase: passphrase)
+                VaultOperationScope.end()
                 if result.success {
-                    VaultDialogs.showSuccess(result.message)
-                    // Open the decrypted files in Finder
-                    for vf in vaultFiles {
-                        let original = String(vf.dropLast(".vault".count))
-                        if FileManager.default.fileExists(atPath: original) {
-                            NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: original)])
+                    let originalPaths = vaultFiles.map { String($0.dropLast(".vault".count)) }
+                    if isTemporary {
+                        // Hide .vault files and open originals — re-encrypt when closed
+                        for vf in vaultFiles {
+                            let url = URL(fileURLWithPath: vf)
+                            try? (url as NSURL).setResourceValue(true, forKey: .isHiddenKey)
                         }
+                        for orig in originalPaths {
+                            if FileManager.default.fileExists(atPath: orig) {
+                                NSWorkspace.shared.open(URL(fileURLWithPath: orig))
+                            }
+                        }
+                        VaultDialogs.showSuccess("\(result.entriesAffected) file(s) opened temporarily.\nThey will re-encrypt when you close them.")
+                    } else {
+                        // Permanent: remove from vault
+                        let removeResult = VaultManager.shared.removeFiles(originalPaths, passphrase: passphrase)
+                        if removeResult.success {
+                            for orig in originalPaths { FinderTags.removeTag(orig) }
+                            VaultManager.shared.refreshWatchedPaths(passphrase: passphrase)
+                        }
+                        for orig in originalPaths {
+                            if FileManager.default.fileExists(atPath: orig) {
+                                NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: orig)])
+                            }
+                        }
+                        VaultDialogs.showSuccess("\(result.entriesAffected) file(s) permanently decrypted and removed from vault.")
                     }
                 } else {
                     VaultDialogs.showError(result.message)
@@ -289,7 +327,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         // Confirm
         guard VaultDialogs.confirmEncrypt(paths: paths, protection: protection) else { return }
 
-        // Authenticate + add
+        // Authenticate + add (always require fresh auth for vault changes)
+        VaultManager.shared.clearPassphrase()
         VaultManager.shared.withAuth(
             reason: "Authenticate to protect files",
             passphrasePrompt: "Enter Vault Passphrase",

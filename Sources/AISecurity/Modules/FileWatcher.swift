@@ -1,5 +1,6 @@
 import Foundation
 import Combine
+import AppKit
 
 /// Monitors sensitive directories on macOS for unauthorized access and suspicious modifications.
 /// Replaces modules/file-watcher.js — uses DispatchSource for native file system events.
@@ -24,6 +25,7 @@ final class FileWatcher: @unchecked Sendable {
     private let config = SecurityConfig.shared
     private var vaultPaths: Set<String> = []  // cached vault-protected paths
     private var vaultObserver: NSObjectProtocol?
+    private var trashAlertShown: Set<String> = [] // prevent repeated trash restore dialogs
     /// Temporarily suppress vault alerts during our own vault operations.
     var suppressVaultAlerts = false
 
@@ -96,6 +98,11 @@ final class FileWatcher: @unchecked Sendable {
         for path in SensitiveDataDetector.protectedPaths {
             watchDirectory(path, type: "PROTECTED")
         }
+
+        // Watch Trash for vault files that get moved there
+        let trashDir = (FileManager.default.homeDirectoryForCurrentUser.path as NSString)
+            .appendingPathComponent(".Trash")
+        watchDirectory(trashDir, type: "TRASH")
 
         // Load vault-protected paths and watch their parent directories
         loadVaultPaths()
@@ -178,6 +185,22 @@ final class FileWatcher: @unchecked Sendable {
     }
 
     private func handleDirectoryEvent(_ dirPath: String, type: String) {
+        // Trash events: batch-check for vault files instead of per-file handling
+        if type == "TRASH" {
+            timerLock.lock()
+            let key = "__trash_batch__"
+            debounceTimers[key]?.cancel()
+            let work = DispatchWorkItem { [weak self] in
+                self?.handleTrashEvent()
+            }
+            debounceTimers[key] = work
+            timerLock.unlock()
+            // Longer debounce for Trash — Finder moves files in bursts
+            DispatchQueue.global(qos: .utility).asyncAfter(
+                deadline: .now() + .milliseconds(1000), execute: work)
+            return
+        }
+
         let fm = FileManager.default
         guard let entries = try? fm.contentsOfDirectory(atPath: dirPath) else { return }
 
@@ -201,12 +224,81 @@ final class FileWatcher: @unchecked Sendable {
         }
     }
 
+    /// Batch-check Trash for vault files. Shows ONE dialog listing all found files.
+    private func handleTrashEvent() {
+        guard !suppressVaultAlerts else { return }
+        let fm = FileManager.default
+        let trashDir = (fm.homeDirectoryForCurrentUser.path as NSString).appendingPathComponent(".Trash")
+        guard let trashEntries = try? fm.contentsOfDirectory(atPath: trashDir) else { return }
+
+        // Find vault files in Trash that we haven't already alerted on
+        var foundFiles: [(trashPath: String, fileName: String, originalPath: String?)] = []
+        for entry in trashEntries {
+            let trashPath = (trashDir as NSString).appendingPathComponent(entry)
+            guard !trashAlertShown.contains(trashPath) else { continue }
+
+            let isVaultFile = entry.hasSuffix(".vault")
+            let baseName = isVaultFile ? String(entry.dropLast(6)) : entry
+            let matchingVaultPath = vaultPaths.first(where: { path in
+                (path as NSString).lastPathComponent == entry ||
+                (path as NSString).lastPathComponent == baseName
+            })
+
+            if isVaultFile || matchingVaultPath != nil {
+                foundFiles.append((trashPath: trashPath, fileName: entry, originalPath: matchingVaultPath))
+                trashAlertShown.insert(trashPath)
+            }
+        }
+
+        guard !foundFiles.isEmpty else { return }
+
+        // Log one alert
+        let names = foundFiles.map(\.fileName).joined(separator: ", ")
+        let alert = SecurityAlert(
+            type: "VAULT_FILE_ACCESS",
+            severity: .critical,
+            message: "\u{1F6A8} Vault-protected file(s) moved to Trash: \(names)",
+            findings: [FindingDetail(
+                label: "\(foundFiles.count) protected file(s) in Trash",
+                category: "vault_protection",
+                severity: .critical
+            )]
+        )
+        logger.alert(alert)
+        onAlert?(alert)
+
+        // Show ONE dialog for all files
+        DispatchQueue.main.async { [weak self] in
+            let fileList = foundFiles.map(\.fileName).joined(separator: "\n")
+            let dialog = NSAlert()
+            dialog.messageText = "\u{1F6A8} \(foundFiles.count) Vault File(s) in Trash"
+            dialog.informativeText = "These protected files were moved to Trash:\n\n\(fileList)\n\nIf you empty the Trash, they may be permanently lost.\nTo safely delete: first release protection in the Vault."
+            dialog.alertStyle = .critical
+            dialog.addButton(withTitle: "Restore All")
+            dialog.addButton(withTitle: "Leave in Trash")
+            NSApplication.shared.activate(ignoringOtherApps: true)
+
+            if dialog.runModal() == .alertFirstButtonReturn {
+                for file in foundFiles {
+                    if let dest = file.originalPath, !FileManager.default.fileExists(atPath: dest) {
+                        try? FileManager.default.moveItem(atPath: file.trashPath, toPath: dest)
+                        FinderTags.lockFile(dest)
+                    }
+                    self?.trashAlertShown.remove(file.trashPath)
+                }
+            }
+        }
+    }
+
     private func handleFileEvent(_ filePath: String, watchType: String) {
         // Use lstat to avoid following symlinks (TOCTOU-safe, single syscall)
         var statBuf = stat()
         guard lstat(filePath, &statBuf) == 0 else { return }
         // Reject symlinks — only handle regular files
         guard (statBuf.st_mode & S_IFMT) == S_IFREG else { return }
+
+        // Vault files in Trash are handled by handleTrashEvent (batched, not per-file)
+        if watchType == "TRASH" { return }
 
         if watchType == "PROTECTED" {
             if isMacOSRoutine(filePath) {
