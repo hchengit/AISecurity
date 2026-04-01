@@ -395,6 +395,50 @@ of WHAT it does with that access. That's the gap AISecurity fills.
 | Forgot Passphrase recovery tested | ✅ Done | 12 words → new passphrase → new recovery key — 2026-04-01 |
 | Deletion protection tested | ✅ Done | Finder shows "item is locked" on delete attempt — 2026-04-01 |
 
+### Phase 11b: Vault Protection Redesign (Atomic Change Protection + Hard Delete Block)
+
+**Problem discovered:** The current `changeProtection()` uses a non-atomic remove+add pattern
+that corrupts the vault manifest — files show wrong badges, entries get duplicated or lost.
+Also, macOS Finder can override the `uchg` immutable flag with a user confirmation, allowing
+accidental deletion of vault-protected files.
+
+**Goal:** Atomic protection changes in Rust + hard deletion blocking via Endpoint Security
+(Phase 12) or, until then, stronger prevention + immediate recovery.
+
+| Component | Status | Location |
+|-----------|--------|----------|
+| **Rust: Atomic `change_protection()`** | | |
+| Add `Vault::change_protection(paths, new_protection, passphrase)` to Rust | ⬜ Not started | `vault.rs` |
+| Handle all 20 transitions atomically (single manifest load/save) | ⬜ Not started | `vault.rs` |
+| Fast path: Locked↔LockedLocal, ReadOnly↔ReadOnlyLocal (metadata only) | ⬜ Not started | `vault.rs` |
+| Decrypt→re-encrypt transitions (Locked→ReadOnly, etc.) | ⬜ Not started | `vault.rs` |
+| Encrypt transitions (ReadOnly→Locked, LocalOnly→Locked) | ⬜ Not started | `vault.rs` |
+| Rust unit tests for key transitions | ⬜ Not started | `vault.rs` |
+| **FFI + Swift Bridge** | | |
+| `sec_vault_change_protection()` FFI export | ⬜ Not started | `security-core-ffi/src/lib.rs` |
+| C header declaration (cbindgen) | ⬜ Not started | `security_core.h` |
+| `SecurityCoreBridge.vaultChangeProtection()` Swift wrapper | ⬜ Not started | `SecurityCoreBridge.swift` |
+| `VaultManager.changeProtection()` convenience method | ⬜ Not started | `VaultManager.swift` |
+| **Vault Window: Replace changeProtection()** | | |
+| Replace remove+add with single atomic call | ⬜ Not started | `VaultWindowView.swift` |
+| Update Finder tags + deletion protection after change | ⬜ Not started | `VaultWindowView.swift` |
+| **Hard Delete Prevention** | | |
+| Block Finder deletion entirely (not just warn) for vault files | ⬜ Not started | Needs Endpoint Security (Phase 12) or `schg` flag |
+| User guidance: "Release protection in Vault before deleting" | ⬜ Not started | Trash monitoring dialog |
+| **Transition Matrix** | | |
+
+All 20 protection transitions and their file operations:
+
+```
+From \ To        | Locked           | ReadOnly         | LocalOnly   | RO+Local         | Locked+Local
+─────────────────|──────────────────|──────────────────|─────────────|──────────────────|──────────────
+Locked           | -                | Decrypt, chmod444| Decrypt     | Decrypt, chmod444| Metadata only
+ReadOnly         | chmod644, Encrypt| -                | chmod644    | Metadata only    | chmod644, Encrypt
+LocalOnly        | Encrypt          | chmod444         | -           | chmod444         | Encrypt
+ReadOnly+Local   | chmod644, Encrypt| Metadata only    | chmod644    | -                | chmod644, Encrypt
+Locked+Local     | Metadata only    | Decrypt, chmod444| Decrypt     | Decrypt, chmod444| -
+```
+
 ### Phase 12: Commercial Release Path
 
 | Component | Status | Notes |
