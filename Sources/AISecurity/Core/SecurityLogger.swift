@@ -157,9 +157,15 @@ private struct LogEntry: Codable {
     let message: String
     let data: [String: String]
 
+    private static let localFormatter: ISO8601DateFormatter = {
+        let f = ISO8601DateFormatter()
+        f.timeZone = .current
+        return f
+    }()
+
     init(level: String, message: String, data: [String: String] = [:]) {
         self.level = level
-        self.timestamp = ISO8601DateFormatter().string(from: Date())
+        self.timestamp = Self.localFormatter.string(from: Date())
         self.message = message
         self.data = data
     }

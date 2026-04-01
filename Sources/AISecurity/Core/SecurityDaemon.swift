@@ -274,12 +274,13 @@ final class SecurityDaemon: ObservableObject {
     }
 
     private func writeStatus(to path: String) {
-        // Sync scanner counts to daemon's @Published properties so the menu picks them up
+        // Sync scanner counts to daemon's @Published properties and rebuild menu
         Task { @MainActor in
             self.emailsScanned = self.emailScanner.emailsScanned
             self.emailThreats = self.emailScanner.threatsFound
             self.messagesScanned = self.messagesScanner.messagesScanned
             self.messageThreats = self.messagesScanner.threatsFound
+            self.onStateChange?()
         }
 
         let status: [String: Any] = [
@@ -342,9 +343,9 @@ final class SecurityDaemon: ObservableObject {
                     filePath: path
                 )
                 self?.logger.alert(alert)
-                self?.onAlert?(alert)
-                // Also send external notification for critical self-protection alerts
-                NotificationManager.shared.send(alert)
+                Task { @MainActor in
+                    self?.threatCount += 1
+                }
             }
 
             source.setCancelHandler { close(fd) }

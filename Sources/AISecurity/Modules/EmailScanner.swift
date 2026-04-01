@@ -21,6 +21,7 @@ final class EmailScanner: @unchecked Sendable {
     private(set) var emailsScanned = 0
     private(set) var threatsFound = 0
     private(set) var byCategory: [String: Int] = [:]
+    private var lastResetDay: Int = 0  // day-of-year for daily counter reset
     var onAlert: AlertHandler?
 
     // MARK: - Attachment checks (stay in Swift — operate on parsed email structure)
@@ -145,8 +146,21 @@ final class EmailScanner: @unchecked Sendable {
     private func pollRecentEmails(windowMs: Int) {
         let cutoff = Date().timeIntervalSince1970 - Double(windowMs) / 1000.0 - 5.0
         let emlxFiles = findEmlxFiles(in: config.emailScanner.mailDir, limit: 2000)
-        var newCount = 0
 
+        if emlxFiles.isEmpty {
+            logger.warn("\u{1F4E7} Email poll: 0 .emlx files found — FDA may not be active")
+            return
+        }
+
+        // Reset daily counter at midnight
+        let today = Calendar.current.ordinality(of: .day, in: .year, for: Date()) ?? 0
+        if today != lastResetDay {
+            emailsScanned = 0
+            threatsFound = 0
+            lastResetDay = today
+        }
+
+        var newCount = 0
         for filePath in emlxFiles {
             guard let attrs = try? FileManager.default.attributesOfItem(atPath: filePath),
                   let mdate = attrs[.modificationDate] as? Date else { continue }
@@ -269,6 +283,10 @@ final class EmailScanner: @unchecked Sendable {
             onAlert?(alert)
         } else if !warnings.isEmpty {
             logger.warn("\u{26A0}\u{FE0F} Suspicious email from \(from.isEmpty ? "unknown" : from): \(subject)")
+        } else {
+            let sender = from.isEmpty ? "unknown" : from
+            let subj = subject.isEmpty ? "(no subject)" : subject
+            logger.info("\u{2705} Email clean: \(sender) — \(subj)")
         }
     }
 

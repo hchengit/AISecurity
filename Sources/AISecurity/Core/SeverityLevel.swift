@@ -54,7 +54,9 @@ struct SecurityAlert: Codable, Sendable {
         self.type = type
         self.severity = severity
         self.message = message
-        self.timestamp = ISO8601DateFormatter().string(from: Date())
+        let f = ISO8601DateFormatter()
+        f.timeZone = .current
+        self.timestamp = f.string(from: Date())
         self.filePath = filePath
         self.from = from
         self.to = to

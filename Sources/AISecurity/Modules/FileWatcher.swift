@@ -257,7 +257,7 @@ final class FileWatcher: @unchecked Sendable {
         // Scan file content for sensitive data
         let ext = (filePath as NSString).pathExtension.lowercased()
         let dotExt = ext.isEmpty ? "" : ".\(ext)"
-        let size = (attrs[.size] as? UInt64) ?? 0
+        let size = UInt64(statBuf.st_size)
 
         if scannableExtensions.contains(dotExt) && size < UInt64(config.fileWatcher.maxScanSizeBytes) {
             scanFileContent(filePath)

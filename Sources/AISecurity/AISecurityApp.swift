@@ -108,23 +108,40 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
     // MARK: - Build Menu
 
+    /// Check if the app has Full Disk Access by trying to read a protected directory.
+    private func checkFDA() -> Bool {
+        let testPath = (FileManager.default.homeDirectoryForCurrentUser.path as NSString)
+            .appendingPathComponent("Library/Mail")
+        return FileManager.default.isReadableFile(atPath: testPath)
+    }
+
     private func rebuildMenu() {
         guard let daemon = daemon else { return }
         let menu = NSMenu()
         menu.autoenablesItems = false
 
         let running = daemon.isRunning
+        let hasFDA = checkFDA()
 
-        // Status
-        let header = NSMenuItem(title: running ? "AISecurity Active" : "AISecurity Stopped",
-                                action: nil, keyEquivalent: "")
+        // Status header with FDA indicator
+        let statusText: String
+        if !running {
+            statusText = "\u{23F8}\u{FE0F}  AISecurity Sleeping"
+        } else if hasFDA {
+            statusText = "\u{1F7E2}  AISecurity Active"
+        } else {
+            statusText = "\u{1F534}  AISecurity Active (No FDA)"
+        }
+        let header = NSMenuItem(title: statusText, action: nil, keyEquivalent: "")
         header.isEnabled = false
         menu.addItem(header)
 
-        let modeItem = NSMenuItem(title: "Mode: \(daemon.mode.rawValue)",
-                                  action: nil, keyEquivalent: "")
-        modeItem.isEnabled = false
-        menu.addItem(modeItem)
+        // FDA warning if missing
+        if running && !hasFDA {
+            let fdaWarn = NSMenuItem(title: "    Grant Full Disk Access in System Settings", action: nil, keyEquivalent: "")
+            fdaWarn.isEnabled = false
+            menu.addItem(fdaWarn)
+        }
 
         menu.addItem(.separator())
 
@@ -162,12 +179,13 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         menu.addItem(.separator())
 
         if running {
-            menu.addItem(makeItem("Stop Agent", action: #selector(stopAgent)))
+            menu.addItem(makeItem("Sleep", action: #selector(pauseAgent)))
         } else {
-            menu.addItem(makeItem("Start Agent", action: #selector(startAgent)))
+            menu.addItem(makeItem("Wake", action: #selector(resumeAgent)))
         }
+        menu.addItem(makeItem("Restart", action: #selector(relaunchApp)))
 
-        let quit = makeItem("Quit AISecurity", action: #selector(quitApp))
+        let quit = makeItem("Shut Down", action: #selector(quitApp))
         quit.keyEquivalent = "q"
         menu.addItem(quit)
 
@@ -218,13 +236,13 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         WindowManager.shared.showLog(config: daemon.config)
     }
 
-    @objc private func startAgent() {
+    @objc private func resumeAgent() {
         if daemon == nil { daemon = SecurityDaemon() }
         daemon!.start()
         rebuildMenu()
     }
 
-    @objc private func stopAgent() {
+    @objc private func pauseAgent() {
         daemon?.stop()
         rebuildMenu()
     }
@@ -351,6 +369,28 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     // MARK: - App Lifecycle
+
+    @objc private func relaunchApp() {
+        daemon?.stop()
+        VaultManager.shared.clearPassphrase()
+
+        // Spawn a detached shell that waits for us to fully exit, then relaunches.
+        // This ensures macOS sees the process as quit (required for FDA to take effect).
+        let appPath = Bundle.main.bundlePath
+        let pid = ProcessInfo.processInfo.processIdentifier
+        let script = """
+        while kill -0 \(pid) 2>/dev/null; do sleep 0.5; done
+        sleep 1
+        open -a "\(appPath)"
+        """
+        let task = Process()
+        task.executableURL = URL(fileURLWithPath: "/bin/zsh")
+        task.arguments = ["-c", script]
+        try? task.run()
+
+        // Now actually quit
+        NSApplication.shared.terminate(nil)
+    }
 
     @objc private func quitApp() {
         daemon?.stop()
@@ -499,18 +539,33 @@ struct ThreatsWindowView: View {
                                 .tint(.orange)
                             }
                             .swipeActions(edge: .leading, allowsFullSwipe: false) {
-                                Button {
-                                    if alert.type == "EMAIL_THREAT_DETECTED" {
+                                // Open — only for emails and messages
+                                if alert.type == "EMAIL_THREAT_DETECTED" {
+                                    Button {
                                         openInMail(alert)
-                                    } else {
-                                        openMessages(alert)
+                                    } label: {
+                                        Label("Open", systemImage: "envelope")
                                     }
-                                } label: {
-                                    Label("Open", systemImage: alert.type == "EMAIL_THREAT_DETECTED" ? "envelope" : "message")
+                                    .tint(.blue)
+                                } else if alert.type == "MESSAGE_THREAT_DETECTED" {
+                                    Button {
+                                        openMessages(alert)
+                                    } label: {
+                                        Label("Open", systemImage: "message")
+                                    }
+                                    .tint(.blue)
+                                } else if let fp = alert.filePath {
+                                    Button {
+                                        showInFinder(fp)
+                                    } label: {
+                                        Label("Show", systemImage: "folder")
+                                    }
+                                    .tint(.blue)
                                 }
-                                .tint(.blue)
 
-                                if let sender = alert.from ?? alert.sender, !sender.isEmpty,
+                                // Trust — for emails and messages with a sender
+                                if (alert.type == "EMAIL_THREAT_DETECTED" || alert.type == "MESSAGE_THREAT_DETECTED"),
+                                   let sender = alert.from ?? alert.sender, !sender.isEmpty,
                                    whitelist != nil {
                                     Button {
                                         whitelistConfirmSender = sender
@@ -558,12 +613,26 @@ struct ThreatsWindowView: View {
 
     // MARK: - Threat Row
 
+    private func alertTypeLabel(_ type: String) -> (text: String, icon: String) {
+        switch type {
+        case "EMAIL_THREAT_DETECTED": return ("EMAIL", "envelope.fill")
+        case "MESSAGE_THREAT_DETECTED": return ("MESSAGE", "message.fill")
+        case "VAULT_FILE_ACCESS": return ("VAULT", "lock.shield")
+        case "SELF_PROTECTION": return ("SELF-PROTECT", "shield.lefthalf.filled")
+        case "EXTERNAL_FILE_THREAT": return ("MALWARE", "exclamationmark.triangle.fill")
+        case "SENSITIVE_DATA_IN_FILE": return ("SENSITIVE DATA", "doc.text.magnifyingglass")
+        case "PROTECTED_PATH_ACCESS": return ("PROTECTED PATH", "folder.badge.questionmark")
+        default: return ("ALERT", "exclamationmark.shield")
+        }
+    }
+
     @ViewBuilder
     private func threatRow(_ alert: SecurityAlert) -> some View {
+        let typeInfo = alertTypeLabel(alert.type)
         VStack(alignment: .leading, spacing: 4) {
             HStack {
                 SeverityBadge(severity: alert.severity)
-                Text(alert.type == "EMAIL_THREAT_DETECTED" ? "EMAIL" : "MESSAGE")
+                Text(typeInfo.text)
                     .font(.headline.monospaced())
                 Spacer()
                 Text(formatTimestamp(alert.timestamp))
@@ -573,13 +642,25 @@ struct ThreatsWindowView: View {
             Text(alert.message)
                 .font(.body)
                 .lineLimit(3)
-            if let from = alert.from ?? alert.sender {
+            if let from = alert.from ?? alert.sender, !from.isEmpty {
                 Label(from, systemImage: "person")
                     .font(.caption)
                     .foregroundColor(.secondary)
             }
-            if let subject = alert.subject {
+            if let subject = alert.subject, !subject.isEmpty {
                 Label(subject, systemImage: "envelope")
+                    .font(.caption)
+                    .foregroundColor(.secondary)
+            }
+            if let preview = alert.preview, !preview.isEmpty {
+                Text(preview)
+                    .font(.caption)
+                    .foregroundColor(.secondary)
+                    .lineLimit(2)
+            }
+            if let filePath = alert.filePath,
+               alert.type != "EMAIL_THREAT_DETECTED" && alert.type != "MESSAGE_THREAT_DETECTED" {
+                Label((filePath as NSString).lastPathComponent, systemImage: "doc")
                     .font(.caption)
                     .foregroundColor(.secondary)
             }
@@ -613,10 +694,13 @@ struct ThreatsWindowView: View {
 
     private func openMessages(_ alert: SecurityAlert) {
         let sender = alert.sender ?? ""
-        if let url = URL(string: "imessage://\(sender)") {
+        // Use sms: scheme which opens the existing conversation thread
+        // (imessage:// opens a new message compose window)
+        if !sender.isEmpty, let url = URL(string: "sms:\(sender)") {
             NSWorkspace.shared.open(url)
         } else {
-            NSWorkspace.shared.open(URL(string: "imessage://")!)
+            // Fallback: just open Messages app
+            NSWorkspace.shared.open(URL(fileURLWithPath: "/System/Applications/Messages.app"))
         }
     }
 
@@ -701,7 +785,7 @@ struct ThreatsWindowView: View {
 struct LogWindowView: View {
     let config: SecurityConfig
     @State private var logLines: [String] = []
-    @State private var refreshTimer: Timer?
+    @State private var refreshID = UUID()
 
     var body: some View {
         VStack(spacing: 0) {
@@ -711,8 +795,10 @@ struct LogWindowView: View {
                 Text("Activity Log")
                     .font(.title2.bold())
                 Spacer()
-                Button("Refresh") { loadLog() }
-                    .buttonStyle(.bordered)
+                Button("Refresh") {
+                    DispatchQueue.main.async { loadLog() }
+                }
+                .buttonStyle(.bordered)
             }
             .padding()
             .background(.bar)
@@ -727,28 +813,20 @@ struct LogWindowView: View {
             } else {
                 ScrollView {
                     LazyVStack(alignment: .leading, spacing: 2) {
-                        ForEach(logLines.indices, id: \.self) { i in
-                            Text(logLines[i])
+                        ForEach(Array(logLines.enumerated()), id: \.offset) { i, line in
+                            Text(line)
                                 .font(.system(.caption, design: .monospaced))
                                 .textSelection(.enabled)
                                 .padding(.horizontal, 8)
                         }
                     }
                     .padding(.vertical, 8)
+                    .id(refreshID) // force ScrollView to re-render
                 }
             }
         }
         .frame(minWidth: 500, minHeight: 250)
-        .onAppear {
-            loadLog()
-            refreshTimer = Timer.scheduledTimer(withTimeInterval: 5.0, repeats: true) { _ in
-                loadLog()
-            }
-        }
-        .onDisappear {
-            refreshTimer?.invalidate()
-            refreshTimer = nil
-        }
+        .onAppear { loadLog() }
     }
 
     private func loadLog() {
@@ -761,6 +839,7 @@ struct LogWindowView: View {
         }
         let lines = content.components(separatedBy: "\n").filter { !$0.isEmpty }
         logLines = Array(lines.suffix(200).reversed())
+        refreshID = UUID() // force SwiftUI to re-render
     }
 }
 
