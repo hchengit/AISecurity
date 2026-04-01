@@ -1,5 +1,15 @@
 import Foundation
 import AppKit
+import CryptoKit
+
+/// Cryptographically secure random number generation.
+private enum SecureRandom {
+    static func uint32() -> UInt32 {
+        var value: UInt32 = 0
+        _ = SecRandomCopyBytes(kSecRandomDefault, MemoryLayout<UInt32>.size, &value)
+        return value
+    }
+}
 
 extension Notification.Name {
     static let vaultWatchedPathsChanged = Notification.Name("vaultWatchedPathsChanged")
@@ -84,6 +94,182 @@ final class VaultManager {
 
     private init() {
         self.securityDir = SecurityConfig.shared.securityDir
+    }
+
+    // MARK: - Recovery Key
+
+    /// BIP39-style word list (2048 words). Using a compact subset of common English words.
+    private static let wordList: [String] = [
+        "abandon", "ability", "able", "about", "above", "absent", "absorb", "abstract",
+        "absurd", "abuse", "access", "account", "accuse", "achieve", "acid", "across",
+        "act", "action", "actor", "adapt", "add", "address", "adjust", "admit",
+        "adult", "advance", "advice", "afford", "again", "agent", "agree", "ahead",
+        "aim", "air", "airport", "aisle", "alarm", "album", "alert", "alien",
+        "almost", "alone", "alpha", "already", "also", "alter", "always", "amateur",
+        "amazing", "among", "amount", "amused", "anchor", "ancient", "angel", "anger",
+        "angle", "animal", "answer", "anxiety", "apart", "apple", "approve", "arctic",
+        "area", "arena", "argue", "armor", "army", "arrange", "arrest", "arrive",
+        "arrow", "artist", "ask", "aspect", "assault", "asset", "assist", "assume",
+        "attack", "attend", "auction", "audit", "august", "aunt", "auto", "autumn",
+        "average", "avoid", "awake", "aware", "awesome", "awful", "axis", "baby",
+        "bachelor", "bacon", "badge", "bag", "balance", "balcony", "ball", "bamboo",
+        "banana", "banner", "barrel", "base", "basket", "battle", "beach", "bean",
+        "beauty", "become", "beef", "before", "begin", "behave", "behind", "believe",
+        "below", "bench", "benefit", "best", "betray", "better", "between", "beyond",
+        "bicycle", "bird", "birth", "bitter", "black", "blade", "blame", "blanket",
+        "blast", "blaze", "bleak", "bless", "blind", "blood", "blossom", "blow",
+        "blue", "blur", "board", "boat", "body", "bomb", "bone", "bonus",
+        "book", "boost", "border", "boring", "borrow", "boss", "bottom", "bounce",
+        "bowl", "brave", "bread", "breeze", "brick", "bridge", "brief", "bright",
+        "bring", "brisk", "broken", "bronze", "brother", "brown", "brush", "bubble",
+        "budget", "buffalo", "build", "bullet", "bundle", "burden", "burger", "burst",
+        "bus", "busy", "butter", "buyer", "cabin", "cable", "cake", "call",
+        "camera", "camp", "cancel", "candle", "cannon", "canvas", "canyon", "capable",
+        "capital", "captain", "carbon", "card", "cargo", "carpet", "carry", "case",
+        "castle", "casual", "catalog", "catch", "cause", "caution", "cave", "ceiling",
+        "celery", "cement", "census", "century", "cereal", "certain", "chair", "chalk",
+        "chance", "change", "chaos", "chapter", "charge", "chase", "cheap", "check",
+        "cherry", "chest", "chicken", "chief", "child", "chimney", "choice", "chronic",
+        "chunk", "cinema", "circle", "citizen", "city", "civil", "claim", "clap",
+        "clarify", "claw", "clay", "clean", "clerk", "clever", "click", "client",
+        "cliff", "climb", "clinic", "clip", "clock", "close", "cloud", "clown",
+        "club", "cluster", "coach", "coast", "coconut", "code", "coffee", "coil",
+        "coin", "collect", "color", "column", "combine", "come", "comfort", "comic",
+        "common", "company", "concert", "conduct", "confirm", "congress", "connect", "consider",
+        "control", "convince", "cook", "cool", "copper", "copy", "coral", "core",
+        "corn", "correct", "cost", "cotton", "couch", "country", "couple", "course",
+        "cousin", "cover", "craft", "crash", "crater", "crazy", "cream", "credit",
+        "creek", "crew", "cricket", "crime", "crisp", "critic", "crop", "cross",
+        "crouch", "crowd", "crucial", "cruel", "cruise", "crumble", "crush", "cry",
+        "crystal", "cube", "culture", "cup", "cupboard", "curious", "current", "curve",
+        "cushion", "custom", "cycle", "dad", "damage", "dance", "danger", "daring",
+        "dash", "dawn", "day", "deal", "debate", "debris", "decade", "december",
+        "decide", "decline", "decorate", "decrease", "deer", "defense", "define", "defy",
+        "degree", "delay", "deliver", "demand", "denial", "dentist", "deny", "depart",
+        "depend", "deposit", "depth", "deputy", "derive", "describe", "desert", "design",
+        "desk", "detail", "detect", "develop", "device", "devote", "diagram", "dial",
+        "diamond", "diary", "diesel", "diet", "differ", "digital", "dignity", "dilemma",
+        "dinner", "dinosaur", "direct", "dirt", "disagree", "discover", "disease", "dish",
+        "dismiss", "display", "distance", "divert", "dizzy", "doctor", "document", "dog",
+        "dolphin", "domain", "donate", "donkey", "donor", "door", "dose", "double",
+        "dove", "draft", "dragon", "drama", "drastic", "draw", "dream", "dress",
+        "drift", "drill", "drink", "drip", "drive", "drop", "drum", "dry",
+        "duck", "dumb", "dune", "during", "dust", "duty", "dwarf", "dynamic",
+        "eager", "eagle", "early", "earn", "earth", "easily", "east", "easy",
+        "echo", "ecology", "economy", "edge", "edit", "educate", "effort", "eight",
+        "either", "elbow", "elder", "electric", "elegant", "element", "elephant", "elevator",
+        "elite", "else", "embark", "embody", "embrace", "emerge", "emotion", "employ",
+        "empower", "empty", "enable", "endless", "endorse", "enemy", "energy", "enforce",
+        "engage", "engine", "enhance", "enjoy", "enough", "enrich", "enroll", "ensure",
+        "enter", "entire", "entry", "envelope", "episode", "equal", "equip", "erode",
+        "erosion", "error", "escape", "essay", "essence", "estate", "eternal", "evoke",
+        "evolve", "exact", "example", "excess", "exchange", "exclude", "excuse", "execute",
+        "exercise", "exhaust", "exhibit", "exile", "exist", "exit", "exotic", "expand",
+        "expect", "expire", "explain", "expose", "express", "extend", "extra", "eye",
+        "fabric", "face", "faculty", "fade", "faint", "faith", "fall", "false",
+        "fame", "family", "famous", "fan", "fancy", "fantasy", "farm", "fashion",
+        "fatal", "father", "fatigue", "fault", "favorite", "feature", "february", "federal",
+        "fee", "feed", "feel", "female", "fence", "festival", "fetch", "fever",
+        "few", "fiber", "fiction", "field", "figure", "file", "film", "filter",
+        "final", "find", "finger", "finish", "fire", "firm", "fiscal", "fish",
+        "fitness", "flag", "flame", "flash", "flat", "flavor", "flee", "flight",
+        "flip", "float", "flock", "floor", "flower", "fluid", "flush", "fly",
+        "foam", "focus", "fog", "foil", "fold", "follow", "food", "foot",
+        "force", "forest", "forget", "fork", "fortune", "forum", "forward", "fossil",
+        "foster", "found", "fox", "fragile", "frame", "frequent", "fresh", "friend",
+        "fringe", "frog", "front", "frost", "frozen", "fruit", "fuel", "fun",
+        "funny", "furnace", "fury", "future", "gadget", "gain", "galaxy", "gallery",
+        "game", "gap", "garage", "garbage", "garden", "garlic", "garment", "gas",
+        "gasp", "gate", "gather", "gauge", "gaze", "general", "genius", "genre",
+        "gentle", "genuine", "gesture", "ghost", "giant", "gift", "giggle", "ginger",
+        "giraffe", "glad", "glance", "glare", "glass", "glide", "glimpse", "globe",
+        "gloom", "glory", "glove", "glow", "glue", "goat", "goddess", "gold",
+        "good", "goose", "gorilla", "gospel", "gossip", "govern", "gown", "grab",
+        "grace", "grain", "grant", "grape", "grass", "gravity", "great", "green",
+        "grid", "grief", "grit", "grocery", "group", "grow", "grunt", "guard",
+        "guess", "guide", "guilt", "guitar", "gun", "gym", "habit", "hair",
+        "half", "hammer", "hamster", "hand", "happy", "harbor", "hard", "harsh",
+        "harvest", "hat", "hawk", "hazard", "head", "health", "heart", "heavy",
+        "hedgehog", "height", "hello", "helmet", "help", "hero", "hidden", "high",
+        "hill", "hint", "hip", "hire", "history", "hobby", "hockey", "hold",
+        "hole", "holiday", "hollow", "home", "honey", "hood", "hope", "horn",
+        "horror", "horse", "hospital", "host", "hotel", "hour", "hover", "hub",
+        "huge", "human", "humble", "humor", "hundred", "hungry", "hunt", "hurdle",
+        "hurry", "hurt", "husband", "hybrid", "ice", "icon", "idea", "identify",
+        "idle", "ignore", "image", "imitate", "immune", "impact", "impose", "improve",
+        "impulse", "include", "income", "increase", "index", "indicate", "indoor", "industry",
+        "infant", "inflict", "inform", "initial", "inject", "inmate", "inner", "innocent",
+        "input", "inquiry", "insane", "insect", "inside", "inspire", "install", "intact",
+        "interest", "into", "invest", "invite", "involve", "iron", "island", "isolate",
+        "issue", "item", "ivory", "jacket", "jaguar", "jar", "jazz", "jealous",
+        "jeans", "jelly", "jewel", "job", "join", "joke", "journey", "joy",
+        "judge", "juice", "jump", "jungle", "junior", "junk", "just", "kangaroo",
+        "keen", "keep", "kernel", "kick", "kid", "kidney", "kind", "kingdom",
+        "kiss", "kit", "kitchen", "kite", "kitten", "kiwi", "knee", "knife",
+        "knock", "know", "labor", "ladder", "lady", "lake", "lamp", "language"
+    ]
+
+    /// Path to the recovery key hash file.
+    private var recoveryKeyHashPath: String {
+        (securityDir as NSString).appendingPathComponent(".vault-recovery-hash")
+    }
+
+    /// Generate a 12-word recovery key from cryptographically secure random bytes.
+    func generateRecoveryKey() -> String {
+        var words: [String] = []
+        for _ in 0..<12 {
+            let index = Int(SecureRandom.uint32()) % Self.wordList.count
+            words.append(Self.wordList[index])
+        }
+        return words.joined(separator: " ")
+    }
+
+    /// Store the SHA-256 hash of the recovery key (never store the key itself).
+    func storeRecoveryKeyHash(_ recoveryKey: String) {
+        let normalized = recoveryKey.lowercased().trimmingCharacters(in: .whitespaces)
+        let hash = SHA256.hash(data: Data(normalized.utf8))
+        let hashHex = hash.compactMap { String(format: "%02x", $0) }.joined()
+        try? hashHex.write(toFile: recoveryKeyHashPath, atomically: true, encoding: .utf8)
+    }
+
+    /// Verify a recovery key against the stored hash. Returns true if it matches.
+    func verifyRecoveryKey(_ recoveryKey: String) -> Bool {
+        guard let storedHash = try? String(contentsOfFile: recoveryKeyHashPath, encoding: .utf8)
+            .trimmingCharacters(in: .whitespacesAndNewlines) else { return false }
+        let normalized = recoveryKey.lowercased().trimmingCharacters(in: .whitespaces)
+        let hash = SHA256.hash(data: Data(normalized.utf8))
+        let hashHex = hash.compactMap { String(format: "%02x", $0) }.joined()
+        return hashHex == storedHash
+    }
+
+    /// Whether a recovery key has been set up.
+    var hasRecoveryKey: Bool {
+        FileManager.default.fileExists(atPath: recoveryKeyHashPath)
+    }
+
+    /// Reset the vault passphrase using the recovery key.
+    /// Returns true if successful.
+    func resetPassphraseWithRecoveryKey(recoveryKey: String, newPassphrase: String) -> Bool {
+        guard verifyRecoveryKey(recoveryKey) else { return false }
+
+        // We can't decrypt the manifest without the old passphrase.
+        // So we reset the vault: delete manifest + salt, re-setup with new passphrase.
+        // Existing .vault files become orphaned (unrecoverable without old passphrase).
+        let fm = FileManager.default
+        let manifestPath = (securityDir as NSString).appendingPathComponent("vault.json.enc")
+        let saltPath = (securityDir as NSString).appendingPathComponent(".vault-salt")
+        try? fm.removeItem(atPath: manifestPath)
+        try? fm.removeItem(atPath: saltPath)
+
+        // Re-setup vault with new passphrase
+        let result = setup()
+        guard result.success else { return false }
+        let ok = setInitialPassphrase(newPassphrase)
+        if ok {
+            passphrase = newPassphrase
+            authGate.invalidateSession()
+        }
+        return ok
     }
 
     /// Whether vault has been set up (salt + manifest exist).

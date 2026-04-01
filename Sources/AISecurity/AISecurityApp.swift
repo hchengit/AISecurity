@@ -168,6 +168,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         menu.addItem(makeItem("Protect Files...", action: #selector(vaultProtectFiles)))
         menu.addItem(makeItem("Open Vault...", action: #selector(vaultOpenWindow)))
         menu.addItem(makeItem("Change Passphrase...", action: #selector(vaultChangePassphrase)))
+        menu.addItem(makeItem("Forgot Passphrase...", action: #selector(vaultForgotPassphrase)))
 
         menu.addItem(.separator())
 
@@ -358,6 +359,14 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             } else {
                 VaultDialogs.showError(result.message)
             }
+        }
+    }
+
+    @objc private func vaultForgotPassphrase() {
+        NSApplication.shared.activate(ignoringOtherApps: true)
+        if let newPass = VaultDialogs.promptForgotPassphrase() {
+            VaultManager.shared.refreshWatchedPaths(passphrase: newPass)
+            VaultDialogs.showSuccess("Vault passphrase has been reset. You can now use your new passphrase.")
         }
     }
 

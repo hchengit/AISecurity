@@ -104,15 +104,187 @@ enum VaultDialogs {
 
         let passphrase = pass1.stringValue
 
-        // Step 3: Recovery info
+        // Step 3: Recovery key — show numbered words
+        let recoveryKey = VaultManager.shared.generateRecoveryKey()
+        let words = recoveryKey.split(separator: " ").map(String.init)
+        VaultManager.shared.storeRecoveryKeyHash(recoveryKey)
+
+        let keyAlert = NSAlert()
+        keyAlert.messageText = "Your Recovery Key"
+        keyAlert.informativeText = """
+        Write down these 12 words IN ORDER and store them in a safe place. \
+        This is the ONLY way to reset your passphrase if you forget it.
+
+        DO NOT store this digitally on this computer.
+        """
+        keyAlert.alertStyle = .critical
+        keyAlert.addButton(withTitle: "I've Written It Down")
+        keyAlert.addButton(withTitle: "Copy to Clipboard")
+
+        // Show numbered words in a two-column grid
+        let keyContainer = NSView(frame: NSRect(x: 0, y: 0, width: 440, height: 170))
+
+        // Two columns of 6 words each
+        for i in 0..<12 {
+            let col = i < 6 ? 0 : 1
+            let row = i < 6 ? i : i - 6
+            let x = col == 0 ? 10 : 230
+            let y = 140 - row * 22
+
+            let numLabel = NSTextField(labelWithString: "\(i + 1).")
+            numLabel.frame = NSRect(x: x, y: y, width: 25, height: 18)
+            numLabel.font = .monospacedSystemFont(ofSize: 12, weight: .regular)
+            numLabel.textColor = .secondaryLabelColor
+            numLabel.alignment = .right
+            keyContainer.addSubview(numLabel)
+
+            let wordLabel = NSTextField(labelWithString: words[i])
+            wordLabel.frame = NSRect(x: x + 30, y: y, width: 160, height: 18)
+            wordLabel.font = .monospacedSystemFont(ofSize: 14, weight: .medium)
+            wordLabel.isSelectable = true
+            keyContainer.addSubview(wordLabel)
+        }
+
+        let hint = NSTextField(labelWithString: "Write all 12 words on paper \u{2014} you'll be quizzed next")
+        hint.frame = NSRect(x: 10, y: 2, width: 420, height: 16)
+        hint.font = .systemFont(ofSize: 11)
+        hint.textColor = .tertiaryLabelColor
+        hint.alignment = .center
+        keyContainer.addSubview(hint)
+
+        keyAlert.accessoryView = keyContainer
+        keyAlert.layout()
+
+        let keyResponse = keyAlert.runModal()
+        if keyResponse == .alertSecondButtonReturn {
+            NSPasteboard.general.clearContents()
+            let numberedKey = words.enumerated().map { "\($0.offset + 1). \($0.element)" }.joined(separator: "  ")
+            NSPasteboard.general.setString(numberedKey, forType: .string)
+            let clipWarn = NSAlert()
+            clipWarn.messageText = "Recovery Key Copied"
+            clipWarn.informativeText = "Write it down on paper, then clear your clipboard.\n\nDO NOT leave it in your clipboard or save it digitally on this Mac."
+            clipWarn.alertStyle = .warning
+            clipWarn.addButton(withTitle: "OK")
+            clipWarn.runModal()
+        }
+
+        // Step 4: Verify — quiz all 12 words in random order
+        var shuffledIndices = Array(0..<12)
+        shuffledIndices.shuffle()
+
+        let verifyAlert = NSAlert()
+        verifyAlert.messageText = "Verify Your Recovery Key"
+        verifyAlert.informativeText = "Enter each word by its number to confirm you wrote them down correctly."
+        verifyAlert.alertStyle = .informational
+        verifyAlert.addButton(withTitle: "Verify")
+        verifyAlert.addButton(withTitle: "Show Key Again")
+
+        let verifyContainer = NSView(frame: NSRect(x: 0, y: 0, width: 440, height: 310))
+        var verifyFields: [Int: NSTextField] = [:]
+
+        for (pos, wordIndex) in shuffledIndices.enumerated() {
+            let col = pos < 6 ? 0 : 1
+            let row = pos < 6 ? pos : pos - 6
+            let x = col == 0 ? 10 : 230
+            let y = 270 - row * 44
+
+            let numLabel = NSTextField(labelWithString: "\(wordIndex + 1).")
+            numLabel.frame = NSRect(x: x, y: y + 2, width: 25, height: 20)
+            numLabel.font = .monospacedSystemFont(ofSize: 13, weight: .bold)
+            numLabel.alignment = .right
+            verifyContainer.addSubview(numLabel)
+
+            let field = NSTextField(frame: NSRect(x: x + 30, y: y, width: 160, height: 24))
+            field.placeholderString = "word \(wordIndex + 1)"
+            field.font = .monospacedSystemFont(ofSize: 13, weight: .regular)
+            field.tag = wordIndex
+            verifyContainer.addSubview(field)
+            verifyFields[wordIndex] = field
+        }
+
+        verifyAlert.accessoryView = verifyContainer
+        // Set focus to the first field shown
+        verifyAlert.window.initialFirstResponder = verifyFields[shuffledIndices[0]]
+        verifyAlert.layout()
+
+        while true {
+            let verifyResponse = verifyAlert.runModal()
+
+            if verifyResponse == .alertSecondButtonReturn {
+                // Show key again — loop back to display
+                let reshow = NSAlert()
+                reshow.messageText = "Your Recovery Key"
+                reshow.informativeText = "Here are your 12 words again. Write them down carefully."
+                reshow.alertStyle = .informational
+                reshow.addButton(withTitle: "OK, I've Written It Down")
+
+                let reshowContainer = NSView(frame: NSRect(x: 0, y: 0, width: 440, height: 160))
+                for i in 0..<12 {
+                    let col = i < 6 ? 0 : 1
+                    let row = i < 6 ? i : i - 6
+                    let x = col == 0 ? 10 : 230
+                    let y = 130 - row * 22
+
+                    let numL = NSTextField(labelWithString: "\(i + 1).")
+                    numL.frame = NSRect(x: x, y: y, width: 25, height: 18)
+                    numL.font = .monospacedSystemFont(ofSize: 12, weight: .regular)
+                    numL.textColor = .secondaryLabelColor
+                    numL.alignment = .right
+                    reshowContainer.addSubview(numL)
+
+                    let wL = NSTextField(labelWithString: words[i])
+                    wL.frame = NSRect(x: x + 30, y: y, width: 160, height: 18)
+                    wL.font = .monospacedSystemFont(ofSize: 14, weight: .medium)
+                    wL.isSelectable = true
+                    reshowContainer.addSubview(wL)
+                }
+                reshow.accessoryView = reshowContainer
+                reshow.layout()
+                reshow.runModal()
+
+                // Clear fields for re-attempt
+                for (_, field) in verifyFields { field.stringValue = "" }
+                continue
+            }
+
+            // Check all 12 words
+            var wrong: [Int] = []
+            for i in 0..<12 {
+                let entered = verifyFields[i]?.stringValue.trimmingCharacters(in: .whitespaces).lowercased() ?? ""
+                if entered != words[i].lowercased() {
+                    wrong.append(i + 1)
+                }
+            }
+
+            if wrong.isEmpty {
+                let success = NSAlert()
+                success.messageText = "Recovery Key Verified!"
+                success.informativeText = "All 12 words are correct. Your recovery key is safely stored.\n\nKeep your written copy in a secure location."
+                success.alertStyle = .informational
+                success.addButton(withTitle: "Continue")
+                success.runModal()
+                break
+            } else {
+                let wrongStr = wrong.map { "#\($0)" }.joined(separator: ", ")
+                showError("Incorrect words: \(wrongStr)\n\nPlease check your written copy and try again.")
+                // Clear wrong fields
+                for idx in wrong {
+                    verifyFields[idx - 1]?.stringValue = ""
+                }
+                continue
+            }
+        }
+
+        // Step 5: Setup complete
         let recovery = NSAlert()
         recovery.messageText = "Vault Setup Complete"
         recovery.informativeText = """
-        Your vault is ready! Recovery instructions have been saved to:
-        ~/.mac-security/VAULT-RECOVERY.txt
+        Your vault is ready!
 
-        Keep that file and your passphrase safe. If you ever need to recover \
-        your encrypted files, follow the instructions in that file.
+        Remember:
+        \u{2022} Your passphrase unlocks your vault
+        \u{2022} Your 12-word recovery key resets your passphrase if forgotten
+        \u{2022} Without both, encrypted files CANNOT be recovered
 
         You can now use "Protect Files..." from the menu bar to encrypt files.
         """
@@ -494,6 +666,126 @@ enum VaultDialogs {
         }
 
         return (container, update)
+    }
+
+    // MARK: - Helpers
+
+    // MARK: - Forgot Passphrase Recovery
+
+    /// Prompts user to enter their 12-word recovery key and set a new passphrase.
+    /// Returns the new passphrase if recovery succeeds, nil if cancelled or failed.
+    static func promptForgotPassphrase() -> String? {
+        guard VaultManager.shared.hasRecoveryKey else {
+            showError("No recovery key was set up for this vault.\n\nWithout a recovery key, your encrypted files cannot be recovered.")
+            return nil
+        }
+
+        let alert = NSAlert()
+        alert.messageText = "Reset Vault Passphrase"
+        alert.informativeText = """
+        Enter your 12-word recovery key to reset your passphrase.
+
+        \u{26A0} WARNING: This will reset the vault. Any currently encrypted \
+        files (.vault) from the old vault will become unrecoverable.
+        """
+        alert.alertStyle = .warning
+        alert.addButton(withTitle: "Reset Passphrase")
+        alert.addButton(withTitle: "Cancel")
+
+        let container = NSView(frame: NSRect(x: 0, y: 0, width: 400, height: 110))
+
+        let keyLabel = NSTextField(labelWithString: "Recovery Key (12 words):")
+        keyLabel.frame = NSRect(x: 0, y: 86, width: 400, height: 18)
+        keyLabel.font = .systemFont(ofSize: 12)
+        container.addSubview(keyLabel)
+
+        let keyField = NSTextField(frame: NSRect(x: 0, y: 58, width: 400, height: 24))
+        keyField.placeholderString = "word1 word2 word3 ... word12"
+        keyField.font = .monospacedSystemFont(ofSize: 12, weight: .regular)
+        container.addSubview(keyField)
+
+        let newPass = NSSecureTextField(frame: NSRect(x: 0, y: 28, width: 400, height: 24))
+        newPass.placeholderString = "New passphrase (min 8 characters)"
+        container.addSubview(newPass)
+
+        let confirmPass = NSSecureTextField(frame: NSRect(x: 0, y: 0, width: 400, height: 24))
+        confirmPass.placeholderString = "Confirm new passphrase"
+        container.addSubview(confirmPass)
+
+        alert.accessoryView = container
+        alert.window.initialFirstResponder = keyField
+
+        while true {
+            let response = alert.runModal()
+            guard response == .alertFirstButtonReturn else { return nil }
+
+            let key = keyField.stringValue.trimmingCharacters(in: .whitespaces)
+            let pass = newPass.stringValue
+            let confirm = confirmPass.stringValue
+
+            // Validate recovery key format
+            let words = key.split(separator: " ")
+            if words.count != 12 {
+                showError("Recovery key must be exactly 12 words separated by spaces.\nYou entered \(words.count) word\(words.count == 1 ? "" : "s").")
+                continue
+            }
+
+            // Validate new passphrase
+            if pass.isEmpty {
+                showError("New passphrase cannot be empty.")
+                continue
+            }
+            if pass.count < 8 {
+                showError("New passphrase must be at least 8 characters.")
+                continue
+            }
+            if pass != confirm {
+                showError("Passphrases don't match.")
+                newPass.stringValue = ""
+                confirmPass.stringValue = ""
+                continue
+            }
+
+            // Verify recovery key
+            if !VaultManager.shared.verifyRecoveryKey(key) {
+                showError("Recovery key is incorrect.\n\nMake sure you entered all 12 words in the correct order.")
+                keyField.stringValue = ""
+                continue
+            }
+
+            // Reset passphrase
+            if VaultManager.shared.resetPassphraseWithRecoveryKey(recoveryKey: key, newPassphrase: pass) {
+                // Generate and show new recovery key for the new vault
+                let newRecoveryKey = VaultManager.shared.generateRecoveryKey()
+                VaultManager.shared.storeRecoveryKeyHash(newRecoveryKey)
+
+                let successAlert = NSAlert()
+                successAlert.messageText = "Passphrase Reset Successful"
+                successAlert.informativeText = """
+                Your vault has been reset with a new passphrase.
+
+                Here is your NEW recovery key — write it down:
+                """
+                successAlert.alertStyle = .informational
+                successAlert.addButton(withTitle: "Done")
+
+                let keyView = NSTextField(frame: NSRect(x: 0, y: 0, width: 400, height: 28))
+                keyView.stringValue = newRecoveryKey
+                keyView.isEditable = false
+                keyView.isSelectable = true
+                keyView.font = .monospacedSystemFont(ofSize: 13, weight: .medium)
+                keyView.alignment = .center
+                keyView.backgroundColor = .controlBackgroundColor
+                keyView.isBordered = true
+                successAlert.accessoryView = keyView
+                successAlert.runModal()
+
+                return pass
+            } else {
+                showError("Vault reset failed. Please try again.")
+                return nil
+            }
+        }
     }
 
     // MARK: - Helpers
