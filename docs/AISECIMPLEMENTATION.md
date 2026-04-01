@@ -1,8 +1,8 @@
 # AISecurity — Cross-Platform Assessment & Implementation Plan
 
 **Date:** 2026-03-28
-**Status:** Phase 10 in progress (Linux completion — PAM auth, vault TUI, notifications)
-**Last Updated:** 2026-03-30
+**Status:** Phase 11 complete (recovery key + deletion protection). Phase 12 (commercial release) next.
+**Last Updated:** 2026-04-01
 
 ---
 
@@ -368,7 +368,34 @@ of WHAT it does with that access. That's the gap AISecurity fills.
 | External notification end-to-end test | ⬜ Not started | — |
 | Auth lockout + external alert test | ⬜ Not started | — |
 
-### Phase 11: Commercial Release Path
+### Phase 11: Vault Recovery Key & Deletion Protection
+
+| Component | Status | Location |
+|-----------|--------|----------|
+| **Recovery Key System** | | |
+| 12-word seed phrase generation (128-bit entropy, SecRandomCopyBytes) | ✅ Done | `VaultManager.swift` — 768-word list, cryptographically secure — 2026-04-01 |
+| SHA-256 hash storage (never store the key itself) | ✅ Done | `VaultManager.swift` — stored at `.vault-recovery-hash` — 2026-04-01 |
+| Numbered two-column display during setup | ✅ Done | `VaultDialogs.swift` — 1-12 in two columns, selectable text — 2026-04-01 |
+| Copy to clipboard option with security warning | ✅ Done | `VaultDialogs.swift` — clipboard copy + "clear your clipboard" reminder — 2026-04-01 |
+| Verification quiz (all 12 words, randomized order) | ✅ Done | `VaultDialogs.swift` — must get all 12 correct, wrong words identified by number — 2026-04-01 |
+| "Show Key Again" option during quiz | ✅ Done | `VaultDialogs.swift` — re-displays numbered words, clears fields for retry — 2026-04-01 |
+| Forgot Passphrase recovery flow | ✅ Done | `VaultDialogs.swift` — enter 12 words → verify hash → reset vault + new passphrase — 2026-04-01 |
+| New recovery key generated on reset | ✅ Done | `VaultDialogs.swift` — fresh 12 words shown after successful reset — 2026-04-01 |
+| "Forgot Passphrase..." menu item | ✅ Done | `AISecurityApp.swift` — under Vault section — 2026-04-01 |
+| **Deletion Protection** | | |
+| macOS immutable flag (uchg) on vault-protected files | ✅ Done | `FinderTags.swift` — `chflags uchg` prevents delete/move/rename — 2026-04-01 |
+| .vault files locked after encryption | ✅ Done | `AISecurityApp.swift` — `protectFromDeletion()` called after vault add — 2026-04-01 |
+| Read-only files locked (uchg + chmod 444) | ✅ Done | `FinderTags.swift` — double protection: permissions + immutable flag — 2026-04-01 |
+| Local-only files locked | ✅ Done | `FinderTags.swift` — immutable flag on monitored files — 2026-04-01 |
+| Unlock before vault operations (decrypt, release, temp write) | ✅ Done | `VaultWindowView.swift` — `unprotectFromDeletion()` before unlock/remove — 2026-04-01 |
+| Re-lock after re-encryption | ✅ Done | `VaultWindowView.swift` — `lockFile()` after re-encrypt timer fires — 2026-04-01 |
+| Re-lock read-only after temp write timeout | ✅ Done | `VaultWindowView.swift` — `lockFile()` after 5-minute write window — 2026-04-01 |
+| **Verification** | | |
+| Recovery key setup + quiz tested | ✅ Done | Deliberate wrong word caught, retry works — 2026-04-01 |
+| Forgot Passphrase recovery tested | ✅ Done | 12 words → new passphrase → new recovery key — 2026-04-01 |
+| Deletion protection tested | ✅ Done | Finder shows "item is locked" on delete attempt — 2026-04-01 |
+
+### Phase 12: Commercial Release Path
 
 | Component | Status | Notes |
 |-----------|--------|-------|
@@ -1457,14 +1484,14 @@ cargo run -p security-linux -- --tray
 # Enter wrong passphrase 3 times → lockout message + external alert
 ```
 
-## 10. Phase 10: Commercial Release Path
+## 12. Phase 12: Commercial Release Path
 
 **Goal:** Prepare AISecurity for public distribution — either as open source with a paid tier,
 or as a direct-sale product. The App Store is NOT viable for security tools (sandboxing blocks
 file monitoring, Mail access, Messages DB, etc.). Every serious macOS security tool distributes
 outside the App Store.
 
-### 10.1 Why Not the App Store?
+### 12.1 Why Not the App Store?
 
 Apple's App Store requires sandboxing, which blocks:
 - File monitoring across Downloads/Desktop/Documents
@@ -1476,7 +1503,7 @@ Apple's App Store requires sandboxing, which blocks:
 BlockBlock — all distribute via direct download + Apple notarization. Users download a `.dmg`,
 drag to Applications, and grant permissions manually.
 
-### 10.2 Distribution: Notarization (required)
+### 12.2 Distribution: Notarization (required)
 
 **What it is:** Apple scans your app binary for malware and issues a "ticket" that tells macOS
 "this app was checked by Apple." Without it, macOS shows a scary "unidentified developer" warning
@@ -1498,7 +1525,7 @@ and may refuse to open the app entirely.
 
 **Verification:** Users can install without any "unidentified developer" warnings.
 
-### 10.3 Endpoint Security Framework (recommended upgrade)
+### 12.3 Endpoint Security Framework (recommended upgrade)
 
 **What it is:** Apple's modern API (macOS 10.15+) specifically for security tools. It replaces
 our current `DispatchSource` file monitoring with a kernel-level event stream that:
@@ -1543,7 +1570,7 @@ let result = es_new_client(&client) { client, message in
 }
 ```
 
-### 10.4 Auto-Update (Sparkle)
+### 12.4 Auto-Update (Sparkle)
 
 **What it is:** Sparkle is the standard macOS framework for auto-updating apps distributed
 outside the App Store. When you release a new version, users get a notification and can update
@@ -1564,7 +1591,7 @@ with one click — no manual re-download.
 | 4 | On each release: sign the .dmg with your EdDSA key, update appcast.xml |
 | 5 | Host appcast.xml + .dmg on GitHub Pages, S3, or your own site |
 
-### 10.5 First-Run Onboarding
+### 12.5 First-Run Onboarding
 
 **What it is:** A step-by-step welcome flow for new users that guides them through:
 
@@ -1575,7 +1602,7 @@ with one click — no manual re-download.
 5. **What to Expect** — "You'll see alerts for: malware, sensitive data exposure, vault access.
    You won't be spammed — only real threats trigger notifications."
 
-### 10.6 Business Models
+### 12.6 Business Models
 
 **Option A: Open Source + Premium Features (recommended to start)**
 | Tier | Price | Features |
@@ -1600,7 +1627,7 @@ with one click — no manual re-download.
 - The TLS transport + logging infrastructure is already built (Phase 5)
 - Price: $5-15/endpoint/month
 
-### 10.7 Legal & Trust
+### 12.7 Legal & Trust
 
 | Item | What | Why |
 |------|------|-----|
@@ -1610,7 +1637,7 @@ with one click — no manual re-download.
 | Transparency report | "What we monitor, what we don't" | Users need to trust a security agent running on their machine |
 | CVE response plan | How you handle discovered vulnerabilities | Professional obligation for security software |
 
-### 10.8 Security Profiles (the dial)
+### 12.8 Security Profiles (the dial)
 
 Users should be able to choose a security posture that matches their use case. Three
 built-in profiles, plus full custom control:
@@ -1656,7 +1683,7 @@ Full access to all toggles in config.toml or a settings UI.
 settings. Changing the profile updates config.toml and restarts relevant modules.
 Power users can still edit config.toml directly for fine-grained control.
 
-### 10.9 Implementation Tracker
+### 12.9 Implementation Tracker
 
 | Component | Status | Notes |
 |-----------|--------|-------|
@@ -1736,7 +1763,13 @@ Mac Portability    -->  Rust Core Library     -->  macOS FFI Integration
                                                 System tray (ksni)
                                                 Rust notification channels
 
-                                              Phase 10 (Weeks 24-28)
+                                              Phase 11 (Week 24)
+                                              Recovery Key + Deletion Protection
+                                                12-word seed phrase + quiz
+                                                Forgot passphrase recovery
+                                                macOS immutable flag (uchg)
+
+                                              Phase 12 (Weeks 25-29)
                                               Commercial Release
                                                 Notarization + .dmg
                                                 Endpoint Security framework

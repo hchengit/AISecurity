@@ -53,6 +53,51 @@ enum FinderTags {
         }
     }
 
+    // MARK: - Deletion Protection (macOS immutable flag)
+
+    /// Set the macOS user-immutable flag (uchg) to prevent accidental deletion/rename/move.
+    static func lockFile(_ path: String) {
+        guard FileManager.default.fileExists(atPath: path) else { return }
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/chflags")
+        process.arguments = ["uchg", path]
+        process.standardOutput = FileHandle.nullDevice
+        process.standardError = FileHandle.nullDevice
+        try? process.run()
+        process.waitUntilExit()
+    }
+
+    /// Remove the macOS user-immutable flag so the file can be modified/deleted.
+    static func unlockFile(_ path: String) {
+        guard FileManager.default.fileExists(atPath: path) else { return }
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/chflags")
+        process.arguments = ["nouchg", path]
+        process.standardOutput = FileHandle.nullDevice
+        process.standardError = FileHandle.nullDevice
+        try? process.run()
+        process.waitUntilExit()
+    }
+
+    /// Lock a vault-protected file and its .vault counterpart.
+    static func protectFromDeletion(_ path: String, protection: SecurityCoreBridge.ProtectionLevel) {
+        // Lock the .vault file for encrypted protections
+        if protection.isLocked {
+            let vaultFile = path + ".vault"
+            lockFile(vaultFile)
+        }
+        // Lock the original for read-only and local-only
+        if protection.isReadOnly || protection == .localOnly {
+            lockFile(path)
+        }
+    }
+
+    /// Unlock a vault-protected file and its .vault counterpart for vault operations.
+    static func unprotectFromDeletion(_ path: String) {
+        unlockFile(path)
+        unlockFile(path + ".vault")
+    }
+
     // MARK: - Private
 
     private static func addFinderTag(url: URL, tag: String) {

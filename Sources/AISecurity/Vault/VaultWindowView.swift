@@ -313,6 +313,8 @@ struct VaultWindowView: View {
             // Decrypt any that are still encrypted
             if !needsDecrypt.isEmpty {
                 VaultOperationScope.begin()
+                // Remove immutable flags so vault can write original + read .vault
+                for path in needsDecrypt { FinderTags.unprotectFromDeletion(path) }
                 let result = SecurityCoreBridge.vaultUnlock(
                     securityDir: securityDir, paths: needsDecrypt, passphrase: passphrase)
                 if result.success && result.entriesAffected > 0 {
@@ -352,6 +354,7 @@ struct VaultWindowView: View {
             for path in readOnlyPaths {
                 let url = URL(fileURLWithPath: path)
                 if FileManager.default.fileExists(atPath: path) {
+                    FinderTags.unlockFile(path) // remove immutable flag first
                     try? FileManager.default.setAttributes(
                         [.posixPermissions: 0o644], ofItemAtPath: path)
                     NSWorkspace.shared.open(url)
@@ -363,6 +366,7 @@ struct VaultWindowView: View {
                 for path in readOnlyPaths {
                     try? FileManager.default.setAttributes(
                         [.posixPermissions: 0o444], ofItemAtPath: path)
+                    FinderTags.lockFile(path) // re-apply immutable flag
                 }
             }
             #endif
@@ -398,6 +402,8 @@ struct VaultWindowView: View {
         guard alert.runModal() == .alertFirstButtonReturn else { return }
 
         VaultOperationScope.begin()
+        // Remove deletion protection before vault operations
+        for path in paths { FinderTags.unprotectFromDeletion(path) }
         let result = SecurityCoreBridge.vaultRemove(
             securityDir: securityDir, paths: paths, passphrase: passphrase)
         if result.success {
@@ -498,12 +504,13 @@ struct VaultWindowView: View {
             VaultOperationScope.begin()
             let _ = SecurityCoreBridge.vaultLock(
                 securityDir: securityDir, paths: toReEncrypt, passphrase: passphrase)
-            // Unhide .vault files now that originals are re-encrypted
+            // Unhide .vault files and re-apply deletion protection
             for path in toReEncrypt {
                 let vaultFile = path + ".vault"
                 if FileManager.default.fileExists(atPath: vaultFile) {
                     let url = URL(fileURLWithPath: vaultFile)
                     try? (url as NSURL).setResourceValue(false, forKey: .isHiddenKey)
+                    FinderTags.lockFile(vaultFile)
                 }
             }
             VaultOperationScope.end()

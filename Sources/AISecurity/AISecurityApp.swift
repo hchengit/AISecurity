@@ -299,6 +299,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                 if result.success {
                     for path in paths {
                         FinderTags.addTag(path, protection: protection)
+                        FinderTags.protectFromDeletion(path, protection: protection)
                     }
                     VaultManager.shared.refreshWatchedPaths(passphrase: passphrase)
                     VaultDialogs.showSuccess(result.message)
