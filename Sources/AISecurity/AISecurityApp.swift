@@ -30,14 +30,23 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     private var refreshTimer: Timer?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        // Diagnostic: confirm we reach this point
+        let diagPath = (NSHomeDirectory() as NSString).appendingPathComponent(".mac-security/logs/menubar-debug.log")
+        var diag = "[\(Date())] applicationDidFinishLaunching reached. Creating status item...\n"
+
         // Create status item in applicationDidFinishLaunching (run loop is active)
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         if let button = statusItem.button {
             button.image = NSImage(systemSymbolName: "shield.lefthalf.filled",
                                    accessibilityDescription: "AISecurity")
             button.image?.isTemplate = true   // adapts to light/dark menu bar
+            diag += "[\(Date())] Status item created. Frame: \(button.frame)\n"
+        } else {
+            diag += "[\(Date())] ERROR: statusItem.button is nil!\n"
         }
         statusItem.isVisible = true
+        diag += "[\(Date())] statusItem.isVisible = true\n"
+        try? diag.write(toFile: diagPath, atomically: true, encoding: .utf8)
 
         // Warm up Rust security-core lazy statics
         SecurityCoreBridge.initialize()
@@ -54,6 +63,11 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         refreshTimer = Timer.scheduledTimer(withTimeInterval: 10.0, repeats: true) { [weak self] _ in
             DispatchQueue.main.async { self?.rebuildMenu() }
         }
+
+        // Register for Finder Services (right-click > Services > "Protect with AISecurity Vault")
+        NSApp.servicesProvider = self
+        NSApp.registerServicesMenuSendTypes([.fileURL, .string], returnTypes: [])
+        NSUpdateDynamicServices()
     }
 
     func applicationWillTerminate(_ notification: Notification) {
@@ -99,8 +113,11 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             passphrasePrompt: "Enter Vault Passphrase to Decrypt",
             onPassphrase: { passphrase in
                 VaultOperationScope.begin()
-                // Remove deletion protection before decrypt
-                for vf in vaultFiles { FinderTags.unprotectFromDeletion(String(vf.dropLast(".vault".count))) }
+                for vf in vaultFiles {
+                    let orig = String(vf.dropLast(".vault".count))
+                    FinderTags.unlockFile(vf)
+                    FinderTags.unlockFile(orig)
+                }
                 let result = VaultManager.shared.unlockFiles(vaultFiles, passphrase: passphrase)
                 VaultOperationScope.end()
                 if result.success {
@@ -121,8 +138,11 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                         // Permanent: remove from vault
                         let removeResult = VaultManager.shared.removeFiles(originalPaths, passphrase: passphrase)
                         if removeResult.success {
-                            for orig in originalPaths { FinderTags.removeTag(orig) }
-                            VaultManager.shared.refreshWatchedPaths(passphrase: passphrase)
+                            for orig in originalPaths {
+                                FinderTags.removeTag(orig)
+                                VaultManager.shared.untrackFiles([orig])
+                            }
+                            VaultManager.shared.syncTracker(passphrase: passphrase)
                         }
                         for orig in originalPaths {
                             if FileManager.default.fileExists(atPath: orig) {
@@ -184,6 +204,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         menu.addItem(.separator())
 
         // Stats
+        addStat(menu, "Email: \(daemon.emailScannerStatus)")
         addStat(menu, "Emails scanned: \(daemon.emailsScanned)")
         addStat(menu, "Email threats: \(daemon.emailThreats)")
         addStat(menu, "Texts scanned: \(daemon.messagesScanned)")
@@ -306,7 +327,60 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         return true
     }
 
+    // MARK: - Finder Services Handler (right-click > Services > "Protect with AISecurity Vault")
+
+    @objc func protectFilesService(_ pboard: NSPasteboard, userData: String, error: AutoreleasingUnsafeMutablePointer<NSString>) {
+        NSApplication.shared.activate(ignoringOtherApps: true)
+        guard ensureVaultSetup() else {
+            error.pointee = "Vault setup required" as NSString
+            return
+        }
+
+        // Extract file paths from pasteboard
+        guard let urls = pboard.readObjects(forClasses: [NSURL.self], options: [
+            .urlReadingFileURLsOnly: true
+        ]) as? [URL], !urls.isEmpty else {
+            error.pointee = "No files selected" as NSString
+            return
+        }
+
+        let paths = urls.map { $0.path }
+
+        // Pick protection level
+        guard let protection = VaultDialogs.pickProtectionLevel() else { return }
+
+        // Confirm
+        guard VaultDialogs.confirmEncrypt(paths: paths, protection: protection) else { return }
+
+        // Authenticate + add (use cached passphrase if available)
+        VaultManager.shared.withAuth(
+            reason: "Authenticate to protect files",
+            passphrasePrompt: "Enter Vault Passphrase",
+            onPassphrase: { passphrase in
+                VaultOperationScope.begin()
+                let result = VaultManager.shared.addFiles(paths, protection: protection, passphrase: passphrase)
+                if result.success {
+                    for path in paths {
+                        FinderTags.addTag(path, protection: protection)
+                    }
+                    VaultManager.shared.trackFiles(paths, protection: protection)
+                    VaultManager.shared.syncTracker(passphrase: passphrase)
+                    NotificationCenter.default.post(name: .vaultDidChange, object: nil)
+                    VaultDialogs.showSuccess(result.message)
+                } else {
+                    VaultDialogs.showError(result.message)
+                }
+                VaultOperationScope.end()
+            },
+            onCancel: {},
+            onError: { VaultDialogs.showError($0) }
+        )
+    }
+
+    // MARK: - Menu Bar Protect Files
+
     @objc private func vaultProtectFiles() {
+        NSApplication.shared.activate(ignoringOtherApps: true)
         guard ensureVaultSetup() else { return }
 
         // Pick protection level
@@ -327,25 +401,77 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         // Confirm
         guard VaultDialogs.confirmEncrypt(paths: paths, protection: protection) else { return }
 
-        // Authenticate + add (always require fresh auth for vault changes)
-        VaultManager.shared.clearPassphrase()
+        // Authenticate + add (reuses cached passphrase within session)
         VaultManager.shared.withAuth(
             reason: "Authenticate to protect files",
             passphrasePrompt: "Enter Vault Passphrase",
             onPassphrase: { passphrase in
-                VaultOperationScope.begin()
-                let result = VaultManager.shared.addFiles(paths, protection: protection, passphrase: passphrase)
-                if result.success {
-                    for path in paths {
-                        FinderTags.addTag(path, protection: protection)
-                        FinderTags.protectFromDeletion(path, protection: protection)
+                let useBatchProgress = paths.count > 20
+
+                if useBatchProgress {
+                    // Async batch with progress window
+                    let progressWindow = VaultProgressWindow(title: "Protecting Files...", total: paths.count)
+                    progressWindow.show()
+
+                    VaultOperationScope.begin()
+
+                    DispatchQueue.global(qos: .userInitiated).async {
+                        let secDir = SecurityConfig.shared.securityDir
+
+                        // C callback that updates the progress window and checks cancel
+                        let callback: @convention(c) (UInt32, UInt32, UnsafePointer<CChar>?, UnsafeMutableRawPointer?) -> Bool = { current, total, pathPtr, userData in
+                            guard let userData,
+                                  let win = userData.assumingMemoryBound(to: VaultProgressWindow.self).pointee as VaultProgressWindow? else {
+                                return true
+                            }
+                            let path = pathPtr.flatMap { String(cString: $0) } ?? ""
+                            win.update(current: Int(current), total: Int(total), currentPath: path)
+                            return !win.cancelled
+                        }
+
+                        // Pass progress window pointer as user data
+                        var winRef = progressWindow
+                        let result = withUnsafeMutablePointer(to: &winRef) { ptr in
+                            SecurityCoreBridge.vaultAddWithProgress(
+                                securityDir: secDir, paths: paths,
+                                protection: protection, passphrase: passphrase,
+                                callback: callback,
+                                userData: UnsafeMutableRawPointer(ptr)
+                            )
+                        }
+
+                        DispatchQueue.main.async {
+                            progressWindow.dismiss()
+                            VaultOperationScope.end()
+
+                            if result.success {
+                                for path in paths {
+                                    FinderTags.addTag(path, protection: protection)
+                                }
+                                VaultManager.shared.trackFiles(paths, protection: protection)
+                                VaultManager.shared.syncTracker(passphrase: passphrase)
+                                VaultDialogs.showSuccess(result.message)
+                            } else {
+                                VaultDialogs.showError(result.message)
+                            }
+                        }
                     }
-                    VaultManager.shared.refreshWatchedPaths(passphrase: passphrase)
-                    VaultDialogs.showSuccess(result.message)
                 } else {
-                    VaultDialogs.showError(result.message)
+                    // Small batch — synchronous (existing flow)
+                    VaultOperationScope.begin()
+                    let result = VaultManager.shared.addFiles(paths, protection: protection, passphrase: passphrase)
+                    if result.success {
+                        for path in paths {
+                            FinderTags.addTag(path, protection: protection)
+                        }
+                        VaultManager.shared.trackFiles(paths, protection: protection)
+                        VaultManager.shared.syncTracker(passphrase: passphrase)
+                        VaultDialogs.showSuccess(result.message)
+                    } else {
+                        VaultDialogs.showError(result.message)
+                    }
+                    VaultOperationScope.end()
                 }
-                VaultOperationScope.end()
             },
             onCancel: {},
             onError: { VaultDialogs.showError($0) }
@@ -355,14 +481,13 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     @objc private func vaultOpenWindow() {
         guard ensureVaultSetup() else { return }
 
-        // Always require fresh auth to open vault
-        VaultManager.shared.clearPassphrase()
+        // Reuse cached passphrase within session (cleared when vault window closes or app quits)
         VaultManager.shared.withAuth(
             reason: "Authenticate to open vault",
             passphrasePrompt: "Enter Vault Passphrase",
             onPassphrase: { passphrase in
                 // Refresh watched-paths cache so FileWatcher can monitor vault files
-                VaultManager.shared.refreshWatchedPaths(passphrase: passphrase)
+                VaultManager.shared.syncTracker(passphrase: passphrase)
                 DispatchQueue.main.async {
                     WindowManager.shared.showVault(
                         securityDir: SecurityConfig.shared.securityDir,
@@ -394,7 +519,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             guard let passes = VaultDialogs.promptChangePassphrase() else { return }
             let result = VaultManager.shared.changePassphrase(old: passes.old, new: passes.new)
             if result.success {
-                VaultManager.shared.refreshWatchedPaths(passphrase: passes.new)
+                VaultManager.shared.syncTracker(passphrase: passes.new)
                 VaultDialogs.showSuccess(result.message)
             } else {
                 VaultDialogs.showError(result.message)
@@ -405,7 +530,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     @objc private func vaultForgotPassphrase() {
         NSApplication.shared.activate(ignoringOtherApps: true)
         if let newPass = VaultDialogs.promptForgotPassphrase() {
-            VaultManager.shared.refreshWatchedPaths(passphrase: newPass)
+            VaultManager.shared.syncTracker(passphrase: newPass)
             VaultDialogs.showSuccess("Vault passphrase has been reset. You can now use your new passphrase.")
         }
     }
@@ -469,7 +594,7 @@ final class WindowManager {
         let controller = NSHostingController(rootView: view)
         let window = NSWindow(contentViewController: controller)
         window.title = "AISecurity \u{2014} Recent Threats"
-        window.setContentSize(NSSize(width: 620, height: 500))
+        window.setContentSize(NSSize(width: 850, height: 650))
         window.styleMask = [.titled, .closable, .resizable, .miniaturizable]
         window.center()
         window.makeKeyAndOrderFront(nil)
@@ -487,7 +612,7 @@ final class WindowManager {
         let controller = NSHostingController(rootView: view)
         let window = NSWindow(contentViewController: controller)
         window.title = "AISecurity \u{2014} Vault"
-        window.setContentSize(NSSize(width: 700, height: 500))
+        window.setContentSize(NSSize(width: 900, height: 650))
         window.styleMask = [.titled, .closable, .resizable, .miniaturizable]
         window.center()
         window.makeKeyAndOrderFront(nil)
@@ -505,7 +630,7 @@ final class WindowManager {
         let controller = NSHostingController(rootView: view)
         let window = NSWindow(contentViewController: controller)
         window.title = "AISecurity \u{2014} Activity Log"
-        window.setContentSize(NSSize(width: 620, height: 400))
+        window.setContentSize(NSSize(width: 850, height: 550))
         window.styleMask = [.titled, .closable, .resizable, .miniaturizable]
         window.center()
         window.makeKeyAndOrderFront(nil)
@@ -874,7 +999,7 @@ struct LogWindowView: View {
                 }
             }
         }
-        .frame(minWidth: 500, minHeight: 250)
+        .frame(minWidth: 700, minHeight: 350)
         .onAppear { loadLog() }
     }
 

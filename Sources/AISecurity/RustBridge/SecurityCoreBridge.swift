@@ -355,12 +355,56 @@ enum SecurityCoreBridge {
         return vaultResultFromFFI(ptr)
     }
 
+    static func vaultChangeProtection(securityDir: String, paths: [String],
+                                       newProtection: ProtectionLevel, passphrase: String) -> VaultResult {
+        let joined = paths.joined(separator: "\n")
+        let ptr = securityDir.withCString { d in
+            joined.withCString { p in
+                passphrase.withCString { pass in
+                    sec_vault_change_protection(d, p, newProtection.rawValue, pass)
+                }
+            }
+        }
+        return vaultResultFromFFI(ptr)
+    }
+
     static func vaultToggleLocalOnly(securityDir: String, paths: [String], passphrase: String) -> VaultResult {
         let joined = paths.joined(separator: "\n")
         let ptr = securityDir.withCString { d in
             joined.withCString { p in
                 passphrase.withCString { pass in
                     sec_vault_toggle_local_only(d, p, pass)
+                }
+            }
+        }
+        return vaultResultFromFFI(ptr)
+    }
+
+    /// Add files with progress callback. The callback returns false to cancel.
+    static func vaultAddWithProgress(
+        securityDir: String, paths: [String],
+        protection: ProtectionLevel, passphrase: String,
+        callback: @escaping @convention(c) (UInt32, UInt32, UnsafePointer<CChar>?, UnsafeMutableRawPointer?) -> Bool,
+        userData: UnsafeMutableRawPointer?
+    ) -> VaultResult {
+        let joined = paths.joined(separator: "\n")
+        let ptr = securityDir.withCString { d in
+            joined.withCString { p in
+                passphrase.withCString { pass in
+                    sec_vault_add_with_progress(d, p, protection.rawValue, pass, callback, userData)
+                }
+            }
+        }
+        return vaultResultFromFFI(ptr)
+    }
+
+    static func vaultUpdatePath(securityDir: String, oldPath: String, newPath: String, passphrase: String) -> VaultResult {
+        let ptr = securityDir.withCString { d in
+            oldPath.withCString { o in
+                newPath.withCString { n in
+                    passphrase.withCString { pass in
+                        sec_vault_update_path(d, o, n, pass)
+                    }
                 }
             }
         }

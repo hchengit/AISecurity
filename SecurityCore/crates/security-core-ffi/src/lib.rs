@@ -657,7 +657,34 @@ pub extern "C" fn sec_vault_change_passphrase(
     }
 }
 
-/// Toggle local-only monitoring on vault entries. `paths` is colon-separated.
+/// Change protection level of vault entries. `paths` is newline-separated.
+/// `new_protection`: 0=locked, 1=read_only, 2=local_only, 3=read_only_local, 4=locked_local.
+#[no_mangle]
+pub extern "C" fn sec_vault_change_protection(
+    security_dir: *const c_char,
+    paths: *const c_char,
+    new_protection: u8,
+    passphrase: *const c_char,
+) -> *mut VaultResultFFI {
+    let dir = match unsafe { from_c_str(security_dir) } { Some(d) => d, None => return ptr::null_mut() };
+    let paths_str = match unsafe { from_c_str(paths) } { Some(p) => p, None => return ptr::null_mut() };
+    let pass = match unsafe { from_c_str(passphrase) } { Some(p) => p, None => return ptr::null_mut() };
+
+    let path_list: Vec<&str> = paths_str.split('\n').collect();
+    let prot = u8_to_protection(new_protection);
+    let v = vault::Vault::new(&dir);
+
+    match v.change_protection(&path_list, prot, &pass) {
+        Ok(r) => Box::into_raw(Box::new(VaultResultFFI {
+            success: r.success, message: to_c_string(&r.message), entries_affected: r.entries_affected as u32,
+        })),
+        Err(e) => Box::into_raw(Box::new(VaultResultFFI {
+            success: false, message: to_c_string(&format!("{}", e)), entries_affected: 0,
+        })),
+    }
+}
+
+/// Toggle local-only monitoring on vault entries. `paths` is newline-separated.
 #[no_mangle]
 pub extern "C" fn sec_vault_toggle_local_only(
     security_dir: *const c_char,
@@ -672,6 +699,74 @@ pub extern "C" fn sec_vault_toggle_local_only(
     let v = vault::Vault::new(&dir);
 
     match v.toggle_local_only(&path_list, &pass) {
+        Ok(r) => Box::into_raw(Box::new(VaultResultFFI {
+            success: r.success, message: to_c_string(&r.message), entries_affected: r.entries_affected as u32,
+        })),
+        Err(e) => Box::into_raw(Box::new(VaultResultFFI {
+            success: false, message: to_c_string(&format!("{}", e)), entries_affected: 0,
+        })),
+    }
+}
+
+/// Progress callback type for batch vault operations.
+/// Returns true to continue, false to cancel.
+pub type VaultProgressCallback = extern "C" fn(
+    current: u32,
+    total: u32,
+    current_path: *const c_char,
+    user_data: *mut std::ffi::c_void,
+) -> bool;
+
+/// Add files to vault with progress callback and cancellation support.
+/// `paths` is newline-separated.
+#[no_mangle]
+pub extern "C" fn sec_vault_add_with_progress(
+    security_dir: *const c_char,
+    paths: *const c_char,
+    protection: u8,
+    passphrase: *const c_char,
+    callback: VaultProgressCallback,
+    user_data: *mut std::ffi::c_void,
+) -> *mut VaultResultFFI {
+    let dir = match unsafe { from_c_str(security_dir) } { Some(d) => d, None => return ptr::null_mut() };
+    let paths_str = match unsafe { from_c_str(paths) } { Some(p) => p, None => return ptr::null_mut() };
+    let pass = match unsafe { from_c_str(passphrase) } { Some(p) => p, None => return ptr::null_mut() };
+
+    let path_list: Vec<&str> = paths_str.split('\n').collect();
+    let prot = u8_to_protection(protection);
+    let v = vault::Vault::new(&dir);
+
+    match v.add_with_progress(&path_list, prot, &pass, |current, total, path| {
+        let c_path = to_c_string(path);
+        let cont = callback(current, total, c_path, user_data);
+        unsafe { free_c_string(c_path); }
+        cont
+    }) {
+        Ok(r) => Box::into_raw(Box::new(VaultResultFFI {
+            success: r.success, message: to_c_string(&r.message), entries_affected: r.entries_affected as u32,
+        })),
+        Err(e) => Box::into_raw(Box::new(VaultResultFFI {
+            success: false, message: to_c_string(&format!("{}", e)), entries_affected: 0,
+        })),
+    }
+}
+
+/// Update a vault entry's path after a file move.
+#[no_mangle]
+pub extern "C" fn sec_vault_update_path(
+    security_dir: *const c_char,
+    old_path: *const c_char,
+    new_path: *const c_char,
+    passphrase: *const c_char,
+) -> *mut VaultResultFFI {
+    let dir = match unsafe { from_c_str(security_dir) } { Some(d) => d, None => return ptr::null_mut() };
+    let old = match unsafe { from_c_str(old_path) } { Some(p) => p, None => return ptr::null_mut() };
+    let new = match unsafe { from_c_str(new_path) } { Some(p) => p, None => return ptr::null_mut() };
+    let pass = match unsafe { from_c_str(passphrase) } { Some(p) => p, None => return ptr::null_mut() };
+
+    let v = vault::Vault::new(&dir);
+
+    match v.update_entry_path(&old, &new, &pass) {
         Ok(r) => Box::into_raw(Box::new(VaultResultFFI {
             success: r.success, message: to_c_string(&r.message), entries_affected: r.entries_affected as u32,
         })),

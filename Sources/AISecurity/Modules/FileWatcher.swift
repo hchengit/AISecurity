@@ -3,7 +3,7 @@ import Combine
 import AppKit
 
 /// Monitors sensitive directories on macOS for unauthorized access and suspicious modifications.
-/// Replaces modules/file-watcher.js — uses DispatchSource for native file system events.
+/// Vault file tracking is handled separately by VaultFileTracker.
 final class FileWatcher: @unchecked Sendable {
 
     // MARK: - Types
@@ -18,30 +18,25 @@ final class FileWatcher: @unchecked Sendable {
     private var sources: [DispatchSourceFileSystemObject] = []
     private var fileDescriptors: [Int32] = []
     private var debounceTimers: [String: DispatchWorkItem] = [:]
-    private let timerLock = NSLock()  // protects debounceTimers from concurrent access
+    private let timerLock = NSLock()
     private(set) var isRunning = false
     var onAlert: AlertHandler?
 
     private let config = SecurityConfig.shared
-    private var vaultPaths: Set<String> = []  // cached vault-protected paths
-    private var vaultObserver: NSObjectProtocol?
-    private var trashAlertShown: Set<String> = [] // prevent repeated trash restore dialogs
-    /// Temporarily suppress vault alerts during our own vault operations.
-    var suppressVaultAlerts = false
 
     /// macOS routine file patterns — silently skip (no log at all)
     private let routinePatterns: [NSRegularExpression] = {
         let pats = [
             // Keychain — all routine operations
-            #"/Keychains/"#,              // everything in Keychains dir (db, wal, shm, lock, temp, prl_lock)
-            #"\.keychain-db"#,            // keychain DB + journal files anywhere
-            #"\.keychain$"#,              // legacy .keychain files
+            #"/Keychains/"#,
+            #"\.keychain-db"#,
+            #"\.keychain$"#,
 
             // Messages — chat DB, framework files, config plists
-            #"/Messages/"#,               // everything in Messages dir (chat.db, prewarm, plists, etc.)
+            #"/Messages/"#,
 
             // Notes — routine database changes
-            #"NoteStore\.sqlite"#,         // Apple Notes database + journal files
+            #"NoteStore\.sqlite"#,
 
             // Contacts/AddressBook — routine database journal writes
             #"/AddressBook/.*\.(?:db-wal|db-shm|db-lock|abcddb-wal|abcddb-shm)$"#,
@@ -54,7 +49,7 @@ final class FileWatcher: @unchecked Sendable {
             // Reminders — routine database journal writes
             #"/Reminders/.*\.(?:db-wal|db-shm|db-lock|sqlite-wal|sqlite-shm)$"#,
 
-            // Safari — all routine operations (bookmarks, history, databases, plists, caches)
+            // Safari — all routine operations
             #"/Safari/"#,
 
             // Spotlight/Siri — segment stores
@@ -64,7 +59,7 @@ final class FileWatcher: @unchecked Sendable {
             #"\.DS_Store$"#,
             #"\.localized$"#,
             #"COMMIT_EDITMSG$"#,
-            #"\.sb-[a-f0-9]+-"#,          // sandbox temp files
+            #"\.sb-[a-f0-9]+-"#,
         ]
         return pats.compactMap { try? NSRegularExpression(pattern: $0, options: .caseInsensitive) }
     }()
@@ -99,40 +94,9 @@ final class FileWatcher: @unchecked Sendable {
             watchDirectory(path, type: "PROTECTED")
         }
 
-        // Watch Trash for vault files that get moved there
-        let trashDir = (FileManager.default.homeDirectoryForCurrentUser.path as NSString)
-            .appendingPathComponent(".Trash")
-        watchDirectory(trashDir, type: "TRASH")
-
-        // Load vault-protected paths and watch their parent directories
-        loadVaultPaths()
-
-        // Listen for vault changes (add/remove/toggle) to update watched paths
-        vaultObserver = NotificationCenter.default.addObserver(
-            forName: .vaultWatchedPathsChanged, object: nil, queue: nil
-        ) { [weak self] _ in
-            self?.reloadVaultWatches()
-        }
-
-        // Listen for suppress/unsuppress during our own vault operations
-        NotificationCenter.default.addObserver(
-            forName: .vaultOperationStarted, object: nil, queue: nil
-        ) { [weak self] _ in
-            self?.suppressVaultAlerts = true
-        }
-        NotificationCenter.default.addObserver(
-            forName: .vaultOperationEnded, object: nil, queue: nil
-        ) { [weak self] _ in
-            // Delay unsuppress to let debounce timers flush
-            DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + 1.0) {
-                self?.suppressVaultAlerts = false
-            }
-        }
-
         logger.info("\u{1F4C2} File Watcher started", data: [
             "monitored": "\(config.fileWatcher.monitoredDirectories.count)",
-            "protected": "\(SensitiveDataDetector.protectedPaths.count)",
-            "vault": "\(vaultPaths.count)"
+            "protected": "\(SensitiveDataDetector.protectedPaths.count)"
         ])
     }
 
@@ -145,10 +109,6 @@ final class FileWatcher: @unchecked Sendable {
         }
         sources.removeAll()
         fileDescriptors.removeAll()
-        if let obs = vaultObserver {
-            NotificationCenter.default.removeObserver(obs)
-            vaultObserver = nil
-        }
         isRunning = false
         logger.info("\u{1F4C2} File Watcher stopped")
     }
@@ -185,30 +145,13 @@ final class FileWatcher: @unchecked Sendable {
     }
 
     private func handleDirectoryEvent(_ dirPath: String, type: String) {
-        // Trash events: batch-check for vault files instead of per-file handling
-        if type == "TRASH" {
-            timerLock.lock()
-            let key = "__trash_batch__"
-            debounceTimers[key]?.cancel()
-            let work = DispatchWorkItem { [weak self] in
-                self?.handleTrashEvent()
-            }
-            debounceTimers[key] = work
-            timerLock.unlock()
-            // Longer debounce for Trash — Finder moves files in bursts
-            DispatchQueue.global(qos: .utility).asyncAfter(
-                deadline: .now() + .milliseconds(1000), execute: work)
-            return
-        }
-
         let fm = FileManager.default
         guard let entries = try? fm.contentsOfDirectory(atPath: dirPath) else { return }
 
         for entry in entries {
-            guard !entry.hasPrefix(".") else { continue }  // skip hidden files
+            guard !entry.hasPrefix(".") else { continue }
             let fullPath = (dirPath as NSString).appendingPathComponent(entry)
 
-            // Debounce per-file (thread-safe access to debounceTimers)
             let work = DispatchWorkItem { [weak self] in
                 self?.handleFileEvent(fullPath, watchType: type)
             }
@@ -224,85 +167,15 @@ final class FileWatcher: @unchecked Sendable {
         }
     }
 
-    /// Batch-check Trash for vault files. Shows ONE dialog listing all found files.
-    private func handleTrashEvent() {
-        guard !suppressVaultAlerts else { return }
-        let fm = FileManager.default
-        let trashDir = (fm.homeDirectoryForCurrentUser.path as NSString).appendingPathComponent(".Trash")
-        guard let trashEntries = try? fm.contentsOfDirectory(atPath: trashDir) else { return }
-
-        // Find vault files in Trash that we haven't already alerted on
-        var foundFiles: [(trashPath: String, fileName: String, originalPath: String?)] = []
-        for entry in trashEntries {
-            let trashPath = (trashDir as NSString).appendingPathComponent(entry)
-            guard !trashAlertShown.contains(trashPath) else { continue }
-
-            let isVaultFile = entry.hasSuffix(".vault")
-            let baseName = isVaultFile ? String(entry.dropLast(6)) : entry
-            let matchingVaultPath = vaultPaths.first(where: { path in
-                (path as NSString).lastPathComponent == entry ||
-                (path as NSString).lastPathComponent == baseName
-            })
-
-            if isVaultFile || matchingVaultPath != nil {
-                foundFiles.append((trashPath: trashPath, fileName: entry, originalPath: matchingVaultPath))
-                trashAlertShown.insert(trashPath)
-            }
-        }
-
-        guard !foundFiles.isEmpty else { return }
-
-        // Log one alert
-        let names = foundFiles.map(\.fileName).joined(separator: ", ")
-        let alert = SecurityAlert(
-            type: "VAULT_FILE_ACCESS",
-            severity: .critical,
-            message: "\u{1F6A8} Vault-protected file(s) moved to Trash: \(names)",
-            findings: [FindingDetail(
-                label: "\(foundFiles.count) protected file(s) in Trash",
-                category: "vault_protection",
-                severity: .critical
-            )]
-        )
-        logger.alert(alert)
-        onAlert?(alert)
-
-        // Show ONE dialog for all files
-        DispatchQueue.main.async { [weak self] in
-            let fileList = foundFiles.map(\.fileName).joined(separator: "\n")
-            let dialog = NSAlert()
-            dialog.messageText = "\u{1F6A8} \(foundFiles.count) Vault File(s) in Trash"
-            dialog.informativeText = "These protected files were moved to Trash:\n\n\(fileList)\n\nIf you empty the Trash, they may be permanently lost.\nTo safely delete: first release protection in the Vault."
-            dialog.alertStyle = .critical
-            dialog.addButton(withTitle: "Restore All")
-            dialog.addButton(withTitle: "Leave in Trash")
-            NSApplication.shared.activate(ignoringOtherApps: true)
-
-            if dialog.runModal() == .alertFirstButtonReturn {
-                for file in foundFiles {
-                    if let dest = file.originalPath, !FileManager.default.fileExists(atPath: dest) {
-                        try? FileManager.default.moveItem(atPath: file.trashPath, toPath: dest)
-                        FinderTags.lockFile(dest)
-                    }
-                    self?.trashAlertShown.remove(file.trashPath)
-                }
-            }
-        }
-    }
-
     private func handleFileEvent(_ filePath: String, watchType: String) {
-        // Use lstat to avoid following symlinks (TOCTOU-safe, single syscall)
+        // Use lstat to avoid following symlinks
         var statBuf = stat()
         guard lstat(filePath, &statBuf) == 0 else { return }
-        // Reject symlinks — only handle regular files
         guard (statBuf.st_mode & S_IFMT) == S_IFREG else { return }
-
-        // Vault files in Trash are handled by handleTrashEvent (batched, not per-file)
-        if watchType == "TRASH" { return }
 
         if watchType == "PROTECTED" {
             if isMacOSRoutine(filePath) {
-                return   // silently skip routine macOS file operations (keychain, chat.db, etc.)
+                return
             }
 
             let alert = SecurityAlert(
@@ -373,76 +246,6 @@ final class FileWatcher: @unchecked Sendable {
         )
         logger.alert(alert)
         onAlert?(alert)
-    }
-
-    // MARK: - Vault Path Monitoring
-
-    /// Load vault-protected paths from the plaintext cache (no auth needed).
-    private func loadVaultPaths() {
-        let paths = VaultManager.cachedVaultPaths()
-        vaultPaths = Set(paths)
-
-        // Watch each vault file individually (directory DispatchSource doesn't detect
-        // modifications to existing files — only creates/deletes).
-        for path in paths {
-            watchVaultFile(path)
-        }
-    }
-
-    /// Reload vault path set and file watches when vault entries change.
-    private func reloadVaultWatches() {
-        let newPaths = VaultManager.cachedVaultPaths()
-        let addedPaths = Set(newPaths).subtracting(vaultPaths)
-        vaultPaths = Set(newPaths)
-        for path in addedPaths {
-            watchVaultFile(path)
-        }
-        logger.info("\u{1F512} Vault watches reloaded", data: ["paths": "\(vaultPaths.count)"])
-    }
-
-    /// Watch an individual vault file for any modification.
-    private func watchVaultFile(_ filePath: String) {
-        guard FileManager.default.fileExists(atPath: filePath) else { return }
-        let fd = open(filePath, O_EVTONLY)
-        guard fd >= 0 else { return }
-        fileDescriptors.append(fd)
-
-        let source = DispatchSource.makeFileSystemObjectSource(
-            fileDescriptor: fd,
-            eventMask: [.write, .rename, .delete, .extend, .attrib],
-            queue: DispatchQueue.global(qos: .utility)
-        )
-
-        source.setEventHandler { [weak self] in
-            guard let self, !self.suppressVaultAlerts else { return }
-            let fileName = (filePath as NSString).lastPathComponent
-            let isVaultFile = filePath.hasSuffix(".vault")
-            let alert = SecurityAlert(
-                type: "VAULT_FILE_ACCESS",
-                severity: .critical,
-                message: "\u{1F6A8} Unauthorized access to vault-protected file: \(fileName)",
-                filePath: filePath,
-                findings: [FindingDetail(
-                    label: isVaultFile ? "Encrypted vault file modified" : "Vault-protected file modified",
-                    category: "vault_protection",
-                    severity: .critical
-                )]
-            )
-            self.logger.alert(alert)
-            self.onAlert?(alert)
-        }
-
-        source.setCancelHandler {
-            close(fd)
-        }
-
-        source.resume()
-        sources.append(source)
-    }
-
-    /// Check if a file path is a vault-protected path (.vault file or original path).
-    private func isVaultProtected(_ filePath: String) -> Bool {
-        vaultPaths.contains(filePath)
     }
 
     private func isMacOSRoutine(_ filePath: String) -> Bool {

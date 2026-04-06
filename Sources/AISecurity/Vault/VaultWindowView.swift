@@ -8,9 +8,7 @@ struct VaultWindowView: View {
     let passphrase: String
     @State private var entries: [SecurityCoreBridge.VaultEntry] = []
     @State private var selectedPaths: Set<String> = []
-    @State private var expandedFolders: Set<String> = [] // tracks which folders are expanded
-    @State private var trashAlertShown: Set<String> = [] // prevent repeated trash restore dialogs
-    @State private var fileMonitors: [String: Any] = [:] // for temporary unlock tracking
+    @State private var showAuditLog = false
 
     // MARK: - Grouped entries by protection section
 
@@ -24,12 +22,13 @@ struct VaultWindowView: View {
         entries.filter { $0.protection == .localOnly }
     }
 
-    /// Group entries by their parent folder, sorted by folder name.
-    private func folderGroups(_ sectionEntries: [SecurityCoreBridge.VaultEntry]) -> [(folder: String, entries: [SecurityCoreBridge.VaultEntry])] {
-        let grouped = Dictionary(grouping: sectionEntries) { entry in
-            (entry.originalPath as NSString).deletingLastPathComponent
-        }
-        return grouped.sorted { $0.key < $1.key }.map { (folder: $0.key, entries: $0.value) }
+    private var allSelected: Bool {
+        !entries.isEmpty && selectedPaths.count == entries.count
+    }
+
+    /// Whether any selected files are temporarily decrypted (is_unlocked = true)
+    private var hasUnlockedSelected: Bool {
+        entries.contains { selectedPaths.contains($0.originalPath) && $0.isUnlocked }
     }
 
     var body: some View {
@@ -37,9 +36,9 @@ struct VaultWindowView: View {
             // Header
             HStack {
                 Image(systemName: "lock.shield")
-                    .font(.title2)
+                    .font(.title)
                 Text("AISecurity Vault")
-                    .font(.title2.bold())
+                    .font(.title.bold())
                 Spacer()
                 Text("\(entries.count) protected item\(entries.count == 1 ? "" : "s")")
                     .foregroundColor(.secondary)
@@ -53,123 +52,189 @@ struct VaultWindowView: View {
                 Spacer()
                 VStack(spacing: 12) {
                     Image(systemName: "lock.open")
-                        .font(.system(size: 48))
+                        .font(.system(size: 64))
                         .foregroundColor(.secondary)
                     Text("Your vault is empty")
-                        .font(.title3)
+                        .font(.title2)
                     Text("Use \"Protect Files...\" from the menu bar to add files.")
                         .foregroundColor(.secondary)
                 }
                 Spacer()
             } else {
-                List(selection: $selectedPaths) {
-                    // Locked (Encrypted) section
+                // Select All row
+                HStack {
+                    Button {
+                        if allSelected {
+                            selectedPaths.removeAll()
+                        } else {
+                            selectedPaths = Set(entries.map(\.originalPath))
+                        }
+                    } label: {
+                        Image(systemName: allSelected ? "checkmark.square.fill" : "square")
+                            .foregroundColor(allSelected ? .accentColor : .secondary)
+                    }
+                    .buttonStyle(.plain)
+
+                    Text("Select All")
+                        .font(.body)
+                        .foregroundColor(.secondary)
+
+                    Spacer()
+
+                    if !selectedPaths.isEmpty {
+                        Text("\(selectedPaths.count) selected")
+                            .font(.body)
+                            .foregroundColor(.accentColor)
+                    }
+                }
+                .padding(.horizontal)
+                .padding(.vertical, 6)
+                .background(.bar)
+
+                Divider()
+
+                // File list with checkboxes
+                List {
                     if !lockedEntries.isEmpty {
                         sectionHeader(icon: "lock.fill", iconColor: .red,
                                       title: "Encrypted", count: lockedEntries.count)
-                        sectionFolders(title: "Encrypted", sectionEntries: lockedEntries)
+                        ForEach(lockedEntries, id: \.originalPath) { entry in
+                            entryRow(entry)
+                        }
                     }
 
-                    // Read-Only section
                     if !readOnlyEntries.isEmpty {
                         sectionHeader(icon: "book.closed.fill", iconColor: .blue,
                                       title: "Read-Only", count: readOnlyEntries.count)
-                        sectionFolders(title: "Read-Only", sectionEntries: readOnlyEntries)
+                        ForEach(readOnlyEntries, id: \.originalPath) { entry in
+                            entryRow(entry)
+                        }
                     }
 
-                    // Local-Only section (pure local-only, no combo)
                     if !localOnlyEntries.isEmpty {
                         sectionHeader(icon: "network.slash", iconColor: .orange,
                                       title: "Local-Only", count: localOnlyEntries.count)
-                        sectionFolders(title: "Local-Only", sectionEntries: localOnlyEntries)
+                        ForEach(localOnlyEntries, id: \.originalPath) { entry in
+                            entryRow(entry)
+                        }
                     }
                 }
                 .listStyle(.plain)
 
                 Divider()
 
-                // Action bar
-                HStack(spacing: 12) {
-                    let selectedCount = selectedPaths.count
-                    let label = selectedCount == 0 ? "All" : "\(selectedCount) selected"
+                // Action bar: Action dropdown + Audit + Clear
+                HStack(spacing: 10) {
+                    // Action dropdown menu
+                    Menu {
+                        Button("Decrypt Once (auto re-encrypts)") {
+                            temporaryUnlock()
+                        }
+
+                        Button("Decrypt Permanently") {
+                            decryptPermanently()
+                        }
+
+                        if hasUnlockedSelected {
+                            Button("Re-encrypt Now") {
+                                reencryptUnlocked()
+                            }
+                        }
+
+                        Divider()
+
+                        Button("Change to Encrypted") {
+                            applyProtection(.locked)
+                        }
+
+                        Button("Change to Encrypted + Local") {
+                            applyProtection(.lockedLocal)
+                        }
+
+                        Divider()
+
+                        Button("Change to Read-Only") {
+                            applyProtection(.readOnly)
+                        }
+
+                        Button("Change to Read-Only + Local") {
+                            applyProtection(.readOnlyLocal)
+                        }
+
+                        Divider()
+
+                        Button("Change to Local-Only") {
+                            applyProtection(.localOnly)
+                        }
+
+                        Divider()
+
+                        Button("Release Protection", role: .destructive) {
+                            releaseProtection()
+                        }
+                    } label: {
+                        Label("Action", systemImage: "ellipsis.circle")
+                    }
+                    .menuStyle(.borderedButton)
+                    .fixedSize()
+                    .disabled(selectedPaths.isEmpty)
 
                     Button {
-                        temporaryUnlock()
+                        showAuditLog = true
                     } label: {
-                        Label("Open Temporarily", systemImage: "lock.open.rotation")
+                        Label("Audit Log", systemImage: "doc.text.magnifyingglass")
                     }
                     .buttonStyle(.bordered)
-                    .help("Decrypt and open. Files re-encrypt when you close them.")
-                    .disabled(selectedLockedCount == 0 && !selectedPaths.isEmpty)
-
-                    Button {
-                        permanentUnlock()
-                    } label: {
-                        Label("Release Protection", systemImage: "lock.open")
-                    }
-                    .buttonStyle(.bordered)
-                    .tint(.orange)
-                    .help("Permanently decrypt and remove from vault.")
-
-                    Button {
-                        toggleLocalOnly()
-                    } label: {
-                        Label("Toggle Local-Only", systemImage: "network.slash")
-                    }
-                    .buttonStyle(.bordered)
-                    .tint(.purple)
-                    .help("Add or remove local-only network monitoring for selected items.")
-                    .disabled(onlyPureLocalOnlySelected)
-
-                    Button {
-                        changeProtection()
-                    } label: {
-                        Label("Change Protection", systemImage: "arrow.triangle.2.circlepath")
-                    }
-                    .buttonStyle(.bordered)
-                    .tint(.indigo)
-                    .help("Change protection level (e.g. read-only to encrypted).")
 
                     Spacer()
 
-                    Text(label)
-                        .foregroundColor(.secondary)
-                        .font(.caption)
-
-                    Button {
-                        selectedPaths = Set(entries.map(\.originalPath))
-                    } label: {
-                        Text("Select All")
-                    }
-                    .buttonStyle(.bordered)
-
-                    Button {
+                    Button("Clear Selection") {
                         selectedPaths.removeAll()
-                    } label: {
-                        Text("Clear")
                     }
                     .buttonStyle(.bordered)
+                    .disabled(selectedPaths.isEmpty)
                 }
                 .padding()
             }
         }
-        .frame(minWidth: 700, minHeight: 500)
+        .frame(minWidth: 900, minHeight: 650)
+        .sheet(isPresented: $showAuditLog) {
+            VaultAuditLogView()
+        }
         .onAppear {
+            let currentEntries = SecurityCoreBridge.vaultList(securityDir: securityDir, passphrase: passphrase)
+            entries = currentEntries
+            VaultManager.shared.syncTracker(passphrase: passphrase)
+            cleanupDeletedEntries(currentEntries)
+
+            // Re-register any temporarily unlocked files with the auto-re-encrypt monitor
+            // (in case the app was restarted while files were temporarily decrypted)
+            let unlockedPaths = currentEntries
+                .filter { $0.isUnlocked && $0.protection.isLocked }
+                .map(\.originalPath)
+                .filter { FileManager.default.fileExists(atPath: $0) }
+            if !unlockedPaths.isEmpty {
+                TemporaryDecryptMonitor.shared.watch(
+                    paths: unlockedPaths, passphrase: passphrase, securityDir: securityDir)
+            }
+        }
+        .onDisappear {
+            VaultManager.shared.clearPassphrase()
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .vaultDidChange)) { _ in
             reload()
-            checkTrashForVaultFiles()
         }
     }
 
-    // MARK: - Flat Section Header + Folder Groups (avoids Section+DisclosureGroup nesting bug)
+    // MARK: - Section Header
 
-    /// Non-selectable header row for a protection category.
     @ViewBuilder
     private func sectionHeader(icon: String, iconColor: Color, title: String, count: Int) -> some View {
         HStack {
             Image(systemName: icon)
                 .foregroundColor(iconColor)
             Text("\(title) (\(count))")
-                .font(.headline)
+                .font(.title3.bold())
             Spacer()
         }
         .padding(.top, 8)
@@ -177,72 +242,41 @@ struct VaultWindowView: View {
         .listRowSeparator(.hidden)
     }
 
-    /// Folder disclosure groups for a protection section — placed directly in the List (no Section wrapper).
-    @ViewBuilder
-    private func sectionFolders(title: String, sectionEntries: [SecurityCoreBridge.VaultEntry]) -> some View {
-        let groups = folderGroups(sectionEntries)
-        ForEach(groups, id: \.folder) { group in
-            DisclosureGroup(
-                isExpanded: Binding(
-                    get: { expandedFolders.contains("\(title):\(group.folder)") },
-                    set: { expanded in
-                        let key = "\(title):\(group.folder)"
-                        if expanded { expandedFolders.insert(key) }
-                        else { expandedFolders.remove(key) }
-                    }
-                )
-            ) {
-                ForEach(group.entries, id: \.originalPath) { entry in
-                    entryRow(entry)
-                        .tag(entry.originalPath)
-                }
-            } label: {
-                HStack(spacing: 8) {
-                    Image(systemName: "folder.fill")
-                        .foregroundColor(.accentColor)
-                        .frame(width: 16)
-                    Text(shortenedFolder(group.folder))
-                        .font(.body)
-                    Spacer()
-                    Text("\(group.entries.count) file\(group.entries.count == 1 ? "" : "s")")
-                        .font(.caption)
-                        .foregroundColor(.secondary)
-                }
-            }
-        }
-    }
-
-    // MARK: - Computed helpers
-
-    private var selectedLockedCount: Int {
-        if selectedPaths.isEmpty {
-            return lockedEntries.count
-        }
-        return lockedEntries.filter { selectedPaths.contains($0.originalPath) }.count
-    }
-
-    /// True if all selected items are pure local-only (no combo), meaning toggle would be meaningless.
-    private var onlyPureLocalOnlySelected: Bool {
-        let targets = targetPaths()
-        if targets.isEmpty { return false }
-        return targets.allSatisfy { p in
-            entries.first(where: { $0.originalPath == p })?.protection == .localOnly
-        }
-    }
-
-    // MARK: - Entry Row
+    // MARK: - Entry Row (with checkbox)
 
     @ViewBuilder
     private func entryRow(_ entry: SecurityCoreBridge.VaultEntry) -> some View {
+        let isSelected = selectedPaths.contains(entry.originalPath)
+
         HStack(spacing: 10) {
-            // File/folder icon
+            // Checkbox
+            Button {
+                if isSelected {
+                    selectedPaths.remove(entry.originalPath)
+                } else {
+                    selectedPaths.insert(entry.originalPath)
+                }
+            } label: {
+                Image(systemName: isSelected ? "checkmark.square.fill" : "square")
+                    .foregroundColor(isSelected ? .accentColor : .secondary)
+            }
+            .buttonStyle(.plain)
+
+            // File icon
             Image(systemName: entry.isDirectory ? "folder.fill" : fileIcon(for: entry.originalPath))
                 .foregroundColor(iconColor(for: entry))
-                .frame(width: 20)
+                .frame(width: 24)
 
-            Text((entry.originalPath as NSString).lastPathComponent)
-                .font(.body)
-                .lineLimit(1)
+            // File name + path
+            VStack(alignment: .leading, spacing: 2) {
+                Text((entry.originalPath as NSString).lastPathComponent)
+                    .font(.title3)
+                    .lineLimit(1)
+                Text(shortenedFolder((entry.originalPath as NSString).deletingLastPathComponent))
+                    .font(.body)
+                    .foregroundColor(.secondary)
+                    .lineLimit(1)
+            }
 
             Spacer()
 
@@ -251,17 +285,24 @@ struct VaultWindowView: View {
 
             // Size
             Text(formatSize(entry.sizeBytes))
-                .font(.caption)
+                .font(.body)
                 .foregroundColor(.secondary)
-                .frame(width: 65, alignment: .trailing)
+                .frame(width: 80, alignment: .trailing)
         }
-        .padding(.vertical, 3)
+        .padding(.vertical, 6)
+        .contentShape(Rectangle())
+        .onTapGesture {
+            if isSelected {
+                selectedPaths.remove(entry.originalPath)
+            } else {
+                selectedPaths.insert(entry.originalPath)
+            }
+        }
     }
 
     @ViewBuilder
     private func statusBadges(_ entry: SecurityCoreBridge.VaultEntry) -> some View {
         HStack(spacing: 4) {
-            // Primary status badge
             if entry.protection.isLocked && entry.isUnlocked {
                 badge("DECRYPTED", color: .green)
             } else if entry.protection.isLocked {
@@ -272,7 +313,6 @@ struct VaultWindowView: View {
                 badge("MONITORED", color: .orange)
             }
 
-            // Local-only indicator for combo protections
             if entry.protection.isLocalOnly && entry.protection != .localOnly {
                 badge("LOCAL", color: .orange)
             }
@@ -282,9 +322,9 @@ struct VaultWindowView: View {
     @ViewBuilder
     private func badge(_ text: String, color: Color) -> some View {
         Text(text)
-            .font(.caption2.bold())
-            .padding(.horizontal, 6)
-            .padding(.vertical, 2)
+            .font(.callout.bold())
+            .padding(.horizontal, 8)
+            .padding(.vertical, 4)
             .background(color.opacity(0.2))
             .foregroundColor(color)
             .clipShape(RoundedRectangle(cornerRadius: 4))
@@ -292,47 +332,31 @@ struct VaultWindowView: View {
 
     // MARK: - Actions
 
-    private func targetPaths() -> [String] {
-        if selectedPaths.isEmpty {
-            return entries.map(\.originalPath)
-        }
-        return Array(selectedPaths)
+    private func selectedEntries() -> [SecurityCoreBridge.VaultEntry] {
+        entries.filter { selectedPaths.contains($0.originalPath) }
     }
 
+    /// Decrypt once — opens files, auto re-encrypts when closed
     private func temporaryUnlock() {
-        let paths = targetPaths()
-        let lockedPaths = paths.filter { p in
-            entries.first(where: { $0.originalPath == p })?.protection.isLocked == true
-        }
-        let readOnlyPaths = paths.filter { p in
-            entries.first(where: { $0.originalPath == p })?.protection.isReadOnly == true
-        }
-        let localOnlyPaths = paths.filter { p in
-            entries.first(where: { $0.originalPath == p })?.protection == .localOnly
-        }
+        let selected = selectedEntries()
+        let lockedPaths = selected.filter { $0.protection.isLocked }.map(\.originalPath)
+        let readOnlyPaths = selected.filter { $0.protection.isReadOnly }.map(\.originalPath)
+        let localOnlyPaths = selected.filter { $0.protection == .localOnly }.map(\.originalPath)
 
         var messages: [String] = []
 
-        // Unlock encrypted files temporarily
         if !lockedPaths.isEmpty {
-            // Split into already-unlocked (just open) vs still-encrypted (decrypt first)
-            let alreadyOpen = lockedPaths.filter { p in
-                entries.first(where: { $0.originalPath == p })?.isUnlocked == true
-            }
             let needsDecrypt = lockedPaths.filter { p in
                 entries.first(where: { $0.originalPath == p })?.isUnlocked != true
             }
 
-            // Decrypt any that are still encrypted
             if !needsDecrypt.isEmpty {
                 VaultOperationScope.begin()
-                // Remove immutable flags so vault can write original + read .vault
-                for path in needsDecrypt { FinderTags.unprotectFromDeletion(path) }
+                for path in needsDecrypt { FinderTags.unlockFile(path); FinderTags.unlockFile(path + ".vault") }
                 let result = SecurityCoreBridge.vaultUnlock(
                     securityDir: securityDir, paths: needsDecrypt, passphrase: passphrase)
                 if result.success && result.entriesAffected > 0 {
                     messages.append("\(result.entriesAffected) file(s) decrypted")
-                    // Hide .vault files in Finder while originals are temporarily open
                     for path in needsDecrypt {
                         let vaultFile = path + ".vault"
                         if FileManager.default.fileExists(atPath: vaultFile) {
@@ -346,46 +370,37 @@ struct VaultWindowView: View {
                 VaultOperationScope.end()
             }
 
-            // Open all files (both newly decrypted and already open)
-            var opened = 0
+            var openedPaths: [String] = []
             for path in lockedPaths {
                 if FileManager.default.fileExists(atPath: path) {
                     NSWorkspace.shared.open(URL(fileURLWithPath: path))
-                    opened += 1
+                    openedPaths.append(path)
                 }
             }
-            if opened > 0 {
-                messages.append("\(opened) file(s) opened temporarily")
-                // Start watching for close — re-encrypt when done
-                startReEncryptTimer(paths: lockedPaths)
+            if !openedPaths.isEmpty {
+                TemporaryDecryptMonitor.shared.watch(
+                    paths: openedPaths, passphrase: passphrase, securityDir: securityDir)
+                messages.append("\(openedPaths.count) file(s) opened — will auto-re-encrypt when closed")
             }
         }
 
-        // Restore write for read-only (temporary)
         if !readOnlyPaths.isEmpty {
-            #if os(macOS)
             for path in readOnlyPaths {
-                let url = URL(fileURLWithPath: path)
                 if FileManager.default.fileExists(atPath: path) {
-                    FinderTags.unlockFile(path) // remove immutable flag first
-                    try? FileManager.default.setAttributes(
-                        [.posixPermissions: 0o644], ofItemAtPath: path)
-                    NSWorkspace.shared.open(url)
+                    FinderTags.unlockFile(path)
+                    try? FileManager.default.setAttributes([.posixPermissions: 0o644], ofItemAtPath: path)
+                    NSWorkspace.shared.open(URL(fileURLWithPath: path))
                 }
             }
-            messages.append("\(readOnlyPaths.count) read-only file(s) temporarily writable")
-            // Re-lock after delay
+            messages.append("\(readOnlyPaths.count) read-only file(s) temporarily writable (5 min)")
             DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + 300) {
                 for path in readOnlyPaths {
-                    try? FileManager.default.setAttributes(
-                        [.posixPermissions: 0o444], ofItemAtPath: path)
-                    FinderTags.lockFile(path) // re-apply immutable flag
+                    try? FileManager.default.setAttributes([.posixPermissions: 0o444], ofItemAtPath: path)
+                    FinderTags.lockFile(path)
                 }
             }
-            #endif
         }
 
-        // Local-only just opens
         if !localOnlyPaths.isEmpty {
             for path in localOnlyPaths {
                 if FileManager.default.fileExists(atPath: path) {
@@ -401,88 +416,66 @@ struct VaultWindowView: View {
         reload()
     }
 
-    private func permanentUnlock() {
-        let paths = targetPaths()
-        let count = paths.count
-
-        let alert = NSAlert()
-        alert.messageText = "Release Protection for \(count) item(s)?"
-        alert.informativeText = "Encrypted files will be permanently decrypted.\nRead-only files will have write access restored.\nLocal-only monitoring will be removed.\n\nThese items will no longer be protected by AISecurity Vault."
-        alert.alertStyle = .warning
-        alert.addButton(withTitle: "Release Protection")
-        alert.addButton(withTitle: "Cancel")
-
-        guard alert.runModal() == .alertFirstButtonReturn else { return }
+    /// Re-encrypt files that were temporarily decrypted
+    private func reencryptUnlocked() {
+        let selected = selectedEntries()
+        let unlockedPaths = selected.filter { $0.isUnlocked && $0.protection.isLocked }.map(\.originalPath)
+        guard !unlockedPaths.isEmpty else {
+            VaultDialogs.showError("No temporarily decrypted files selected.")
+            return
+        }
 
         VaultOperationScope.begin()
-        // Remove deletion protection before vault operations
-        for path in paths { FinderTags.unprotectFromDeletion(path) }
-        let result = SecurityCoreBridge.vaultRemove(
-            securityDir: securityDir, paths: paths, passphrase: passphrase)
+        TemporaryDecryptMonitor.shared.unwatch(paths: unlockedPaths)
+        for path in unlockedPaths { FinderTags.unlockFile(path); FinderTags.unlockFile(path + ".vault") }
+
+        let result = SecurityCoreBridge.vaultLock(
+            securityDir: securityDir, paths: unlockedPaths, passphrase: passphrase)
         if result.success {
-            for path in paths { FinderTags.removeTag(path) }
-            VaultManager.shared.refreshWatchedPaths(passphrase: passphrase)
-            VaultDialogs.showSuccess(result.message)
-        } else {
-            VaultDialogs.showError(result.message)
-        }
-        VaultOperationScope.end()
-        reload()
-    }
-
-    private func toggleLocalOnly() {
-        let paths = targetPaths()
-        // Filter out pure local-only entries (toggle is meaningless for them)
-        let toggleable = paths.filter { p in
-            guard let entry = entries.first(where: { $0.originalPath == p }) else { return false }
-            return entry.protection != .localOnly
-        }
-        guard !toggleable.isEmpty else { return }
-
-        // Describe what will happen
-        let adding = toggleable.filter { p in
-            guard let entry = entries.first(where: { $0.originalPath == p }) else { return false }
-            return !entry.protection.isLocalOnly
-        }
-        let removing = toggleable.filter { p in
-            guard let entry = entries.first(where: { $0.originalPath == p }) else { return false }
-            return entry.protection.isLocalOnly
-        }
-
-        var desc: [String] = []
-        if !adding.isEmpty { desc.append("\(adding.count) item(s) will gain local-only monitoring") }
-        if !removing.isEmpty { desc.append("\(removing.count) item(s) will lose local-only monitoring") }
-
-        let alert = NSAlert()
-        alert.messageText = "Toggle Local-Only Monitoring?"
-        alert.informativeText = desc.joined(separator: "\n") + "\n\nLocal-only monitoring alerts you when any process tries to send protected files over the network."
-        alert.alertStyle = .informational
-        alert.addButton(withTitle: "Toggle")
-        alert.addButton(withTitle: "Cancel")
-
-        guard alert.runModal() == .alertFirstButtonReturn else { return }
-
-        VaultOperationScope.begin()
-        let result = SecurityCoreBridge.vaultToggleLocalOnly(
-            securityDir: securityDir, paths: toggleable, passphrase: passphrase)
-        if result.success {
-            // Update Finder tags for changed entries
-            for path in toggleable {
-                if let entry = entries.first(where: { $0.originalPath == path }) {
-                    // Re-apply tag based on new protection (toggle flips it)
-                    let newProt: SecurityCoreBridge.ProtectionLevel
-                    switch entry.protection {
-                    case .locked: newProt = .lockedLocal
-                    case .lockedLocal: newProt = .locked
-                    case .readOnly: newProt = .readOnlyLocal
-                    case .readOnlyLocal: newProt = .readOnly
-                    default: continue
-                    }
-                    FinderTags.removeTag(path)
-                    FinderTags.addTag(path, protection: newProt)
+            for path in unlockedPaths {
+                // Unhide .vault file
+                let vaultFile = path + ".vault"
+                if FileManager.default.fileExists(atPath: vaultFile) {
+                    let url = URL(fileURLWithPath: vaultFile)
+                    try? (url as NSURL).setResourceValue(false, forKey: .isHiddenKey)
                 }
+                FinderTags.lockFile(vaultFile)
+                VaultAuditLog.shared.log(.fileLocked, path: path, detail: "manually re-encrypted")
             }
-            VaultManager.shared.refreshWatchedPaths(passphrase: passphrase)
+            VaultManager.shared.syncTracker(passphrase: passphrase)
+            VaultDialogs.showSuccess("\(result.entriesAffected) file(s) re-encrypted")
+        } else {
+            VaultDialogs.showError(result.message)
+        }
+        VaultOperationScope.end()
+        reload()
+    }
+
+    /// Decrypt permanently — removes encryption but keeps in vault as decrypted
+    private func decryptPermanently() {
+        let selected = selectedEntries()
+        let lockedPaths = selected.filter { $0.protection.isLocked }.map(\.originalPath)
+        guard !lockedPaths.isEmpty else {
+            VaultDialogs.showError("No encrypted files selected.")
+            return
+        }
+
+        let alert = NSAlert()
+        alert.messageText = "Permanently decrypt \(lockedPaths.count) file(s)?"
+        alert.informativeText = "Files will be decrypted and removed from the vault. This cannot be undone."
+        alert.alertStyle = .warning
+        alert.addButton(withTitle: "Decrypt")
+        alert.addButton(withTitle: "Cancel")
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+
+        VaultOperationScope.begin()
+        TemporaryDecryptMonitor.shared.unwatch(paths: lockedPaths)
+        for path in lockedPaths { FinderTags.unlockFile(path); FinderTags.unlockFile(path + ".vault") }
+        let result = SecurityCoreBridge.vaultRemove(
+            securityDir: securityDir, paths: lockedPaths, passphrase: passphrase)
+        if result.success {
+            for path in lockedPaths { FinderTags.removeTag(path); FinderTags.removeTag(path + ".vault") }
+            VaultManager.shared.syncTracker(passphrase: passphrase)
             VaultDialogs.showSuccess(result.message)
         } else {
             VaultDialogs.showError(result.message)
@@ -491,168 +484,152 @@ struct VaultWindowView: View {
         reload()
     }
 
-    private func changeProtection() {
-        let paths = targetPaths()
+    /// Apply a new protection level to selected files
+    private func applyProtection(_ newProtection: SecurityCoreBridge.ProtectionLevel) {
+        let selected = selectedEntries()
+        let paths = selected.map(\.originalPath)
         guard !paths.isEmpty else { return }
 
-        // Pick new protection level
-        guard let newProtection = VaultDialogs.pickProtectionLevel() else { return }
+        // If files are temporarily unlocked and target is the same locked level, just re-lock
+        let unlockedSameLevel = selected.filter { $0.isUnlocked && $0.protection == newProtection }
+        if !unlockedSameLevel.isEmpty && unlockedSameLevel.count == selected.count {
+            reencryptUnlocked()
+            return
+        }
 
+        // For unlocked files changing to a locked protection, re-lock them first
+        let needsRelock = selected.filter { $0.isUnlocked && $0.protection.isLocked }
+        if !needsRelock.isEmpty {
+            VaultOperationScope.begin()
+            let relockPaths = needsRelock.map(\.originalPath)
+            for path in relockPaths { FinderTags.unlockFile(path); FinderTags.unlockFile(path + ".vault") }
+            _ = SecurityCoreBridge.vaultLock(securityDir: securityDir, paths: relockPaths, passphrase: passphrase)
+            VaultOperationScope.end()
+        }
+
+        // Confirm
         let count = paths.count
         let alert = NSAlert()
-        alert.messageText = "Change protection for \(count) item(s)?"
-        alert.informativeText = "Current protection will be released and files will be re-protected as: \(newProtection.label).\n\nThis requires decrypting and re-encrypting files."
+        alert.messageText = "Change \(count) file(s) to \(newProtection.label)?"
+        alert.informativeText = protectionDescription(newProtection)
         alert.alertStyle = .warning
         alert.addButton(withTitle: "Change")
         alert.addButton(withTitle: "Cancel")
         guard alert.runModal() == .alertFirstButtonReturn else { return }
 
         VaultOperationScope.begin()
-        // Step 1: Remove deletion protection
-        for path in paths { FinderTags.unprotectFromDeletion(path) }
+        TemporaryDecryptMonitor.shared.unwatch(paths: paths)
+        for path in paths { FinderTags.unlockFile(path); FinderTags.unlockFile(path + ".vault") }
 
-        // Step 2: Remove from vault (decrypts if needed)
-        let removeResult = SecurityCoreBridge.vaultRemove(
-            securityDir: securityDir, paths: paths, passphrase: passphrase)
-        guard removeResult.success else {
-            VaultDialogs.showError("Failed to release: \(removeResult.message)")
-            VaultOperationScope.end()
-            reload()
-            return
-        }
+        let result = SecurityCoreBridge.vaultChangeProtection(
+            securityDir: securityDir, paths: paths,
+            newProtection: newProtection, passphrase: passphrase)
 
-        // Step 3: Re-add with new protection
-        let addResult = SecurityCoreBridge.vaultAdd(
-            securityDir: securityDir, paths: paths, protection: newProtection, passphrase: passphrase)
-        if addResult.success {
+        if result.success {
             for path in paths {
                 FinderTags.removeTag(path)
-                FinderTags.addTag(path, protection: newProtection)
-                FinderTags.protectFromDeletion(path, protection: newProtection)
+                FinderTags.removeTag(path + ".vault")
+                let tagPath = newProtection.isLocked ? (path + ".vault") : path
+                FinderTags.addTag(tagPath, protection: newProtection)
             }
-            VaultManager.shared.refreshWatchedPaths(passphrase: passphrase)
-            VaultDialogs.showSuccess("\(addResult.entriesAffected) file(s) changed to \(newProtection.label)")
+            VaultManager.shared.syncTracker(passphrase: passphrase)
+            VaultDialogs.showSuccess(result.message)
         } else {
-            VaultDialogs.showError("Re-protection failed: \(addResult.message)")
+            VaultDialogs.showError(result.message)
         }
         VaultOperationScope.end()
         reload()
     }
 
-    /// Start a timer to re-encrypt temporarily unlocked files.
-    private func startReEncryptTimer(paths: [String]) {
-        // Check every 30 seconds if the files are still open
-        // Re-encrypt when no process has them open
-        DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + 30) {
-            self.checkAndReEncrypt(paths: paths, attempts: 0)
+    /// Release all protection — remove from vault entirely
+    private func releaseProtection() {
+        let paths = Array(selectedPaths)
+        guard !paths.isEmpty else { return }
+
+        let alert = NSAlert()
+        alert.messageText = "Release protection for \(paths.count) file(s)?"
+        alert.informativeText = "All protections will be removed. Encrypted files will be decrypted. Read-only permissions restored. This cannot be undone."
+        alert.alertStyle = .critical
+        alert.addButton(withTitle: "Release")
+        alert.addButton(withTitle: "Cancel")
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+
+        VaultOperationScope.begin()
+        TemporaryDecryptMonitor.shared.unwatch(paths: paths)
+        for path in paths { FinderTags.unlockFile(path); FinderTags.unlockFile(path + ".vault") }
+        let result = SecurityCoreBridge.vaultRemove(
+            securityDir: securityDir, paths: paths, passphrase: passphrase)
+        if result.success {
+            for path in paths { FinderTags.removeTag(path); FinderTags.removeTag(path + ".vault") }
+            VaultManager.shared.syncTracker(passphrase: passphrase)
+            VaultDialogs.showSuccess(result.message)
+        } else {
+            VaultDialogs.showError(result.message)
+        }
+        VaultOperationScope.end()
+        reload()
+    }
+
+    private func protectionDescription(_ prot: SecurityCoreBridge.ProtectionLevel) -> String {
+        switch prot {
+        case .locked:
+            return "Files will be encrypted with AES-256-GCM. Originals securely deleted."
+        case .readOnly:
+            return "Files will be set to read-only (chmod 444). Encrypted files will be decrypted first."
+        case .localOnly:
+            return "Files monitored for network exfiltration. Encrypted files will be decrypted first."
+        case .readOnlyLocal:
+            return "Read-only + network monitoring. Encrypted files will be decrypted first."
+        case .lockedLocal:
+            return "Encrypted + network monitoring."
         }
     }
 
-    private func checkAndReEncrypt(paths: [String], attempts: Int) {
-        // Give up after 2 hours (240 checks × 30 seconds)
-        guard attempts < 240 else { return }
+    // MARK: - Cleanup
 
-        var stillOpen: [String] = []
-        for path in paths {
-            if FileManager.default.fileExists(atPath: path) && isFileOpen(path) {
-                stillOpen.append(path)
+    private func cleanupDeletedEntries(_ checkEntries: [SecurityCoreBridge.VaultEntry]) {
+        let fm = FileManager.default
+        var missing: [SecurityCoreBridge.VaultEntry] = []
+
+        for entry in checkEntries {
+            let originalExists = !entry.originalPath.isEmpty && fm.fileExists(atPath: entry.originalPath)
+            let vaultExists = !entry.vaultPath.isEmpty && fm.fileExists(atPath: entry.vaultPath)
+            let computedVault = entry.originalPath + ".vault"
+            let computedVaultExists = fm.fileExists(atPath: computedVault)
+
+            if !originalExists && !vaultExists && !computedVaultExists {
+                missing.append(entry)
             }
         }
 
-        let toReEncrypt = paths.filter { !stillOpen.contains($0) && FileManager.default.fileExists(atPath: $0) }
+        guard !missing.isEmpty else { return }
 
-        if !toReEncrypt.isEmpty {
+        let names = missing.map { ($0.originalPath as NSString).lastPathComponent }.joined(separator: "\n")
+        let alert = NSAlert()
+        alert.messageText = "\(missing.count) Vault Entry(s) — Files Missing"
+        alert.informativeText = "These protected files no longer exist on disk:\n\n\(names)\n\nRemove them from the vault?"
+        alert.alertStyle = .warning
+        alert.addButton(withTitle: "Remove from Vault")
+        alert.addButton(withTitle: "Keep Entries")
+
+        if alert.runModal() == .alertFirstButtonReturn {
             VaultOperationScope.begin()
-            let _ = SecurityCoreBridge.vaultLock(
-                securityDir: securityDir, paths: toReEncrypt, passphrase: passphrase)
-            // Unhide .vault files and re-apply deletion protection
-            for path in toReEncrypt {
-                let vaultFile = path + ".vault"
-                if FileManager.default.fileExists(atPath: vaultFile) {
-                    let url = URL(fileURLWithPath: vaultFile)
-                    try? (url as NSURL).setResourceValue(false, forKey: .isHiddenKey)
-                    FinderTags.lockFile(vaultFile)
-                }
+            let paths = missing.map(\.originalPath)
+            let result = SecurityCoreBridge.vaultRemove(
+                securityDir: securityDir, paths: paths, passphrase: passphrase)
+            if result.success {
+                VaultManager.shared.untrackFiles(paths)
+                VaultManager.shared.syncTracker(passphrase: passphrase)
             }
             VaultOperationScope.end()
-        }
-
-        if !stillOpen.isEmpty {
-            DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + 30) {
-                self.checkAndReEncrypt(paths: stillOpen, attempts: attempts + 1)
-            }
-        }
-    }
-
-    /// Check if a file is currently open by any process (via lsof).
-    private func isFileOpen(_ path: String) -> Bool {
-        let process = Process()
-        process.executableURL = URL(fileURLWithPath: "/usr/sbin/lsof")
-        process.arguments = ["-t", path]
-        let pipe = Pipe()
-        process.standardOutput = pipe
-        process.standardError = FileHandle.nullDevice
-        do {
-            try process.run()
-            process.waitUntilExit()
-            let data = pipe.fileHandleForReading.readDataToEndOfFile()
-            return !data.isEmpty
-        } catch {
-            return false
+            reload()
         }
     }
 
     // MARK: - Helpers
 
-    /// One-time check for vault files in Trash (called on window open only).
-    private func checkTrashForVaultFiles() {
-        let fm = FileManager.default
-        let trashDir = (fm.homeDirectoryForCurrentUser.path as NSString).appendingPathComponent(".Trash")
-        var trashedFiles: [(expected: String, trashPath: String, fileName: String)] = []
-
-        for entry in entries {
-            let expectedPath = entry.protection.isLocked ? entry.vaultPath : entry.originalPath
-            guard !expectedPath.isEmpty, !fm.fileExists(atPath: expectedPath) else { continue }
-
-            let fileName = (expectedPath as NSString).lastPathComponent
-            let trashPath = (trashDir as NSString).appendingPathComponent(fileName)
-            if fm.fileExists(atPath: trashPath) {
-                trashedFiles.append((expected: expectedPath, trashPath: trashPath, fileName: fileName))
-            }
-        }
-
-        guard !trashedFiles.isEmpty else { return }
-
-        let fileList = trashedFiles.map(\.fileName).joined(separator: "\n")
-        let alert = NSAlert()
-        alert.messageText = "\(trashedFiles.count) vault file(s) found in Trash"
-        alert.informativeText = "These files are tracked in your vault but were moved to Trash:\n\n\(fileList)\n\nRestore them to their original locations?"
-        alert.alertStyle = .warning
-        alert.addButton(withTitle: "Restore All")
-        alert.addButton(withTitle: "Leave in Trash")
-
-        if alert.runModal() == .alertFirstButtonReturn {
-            for file in trashedFiles {
-                try? fm.moveItem(atPath: file.trashPath, toPath: file.expected)
-                FinderTags.lockFile(file.expected)
-            }
-            reload()
-        }
-    }
-
     private func reload() {
         entries = SecurityCoreBridge.vaultList(securityDir: securityDir, passphrase: passphrase)
-
-        // Always expand all folders after data changes
-        expandedFolders.removeAll()
-        for entry in entries {
-            let folder = (entry.originalPath as NSString).deletingLastPathComponent
-            let sectionTitle: String
-            if entry.protection.isLocked { sectionTitle = "Encrypted" }
-            else if entry.protection.isReadOnly { sectionTitle = "Read-Only" }
-            else { sectionTitle = "Local-Only" }
-            expandedFolders.insert("\(sectionTitle):\(folder)")
-        }
     }
 
     private func shortenedFolder(_ folder: String) -> String {
@@ -689,18 +666,117 @@ struct VaultWindowView: View {
         return .orange
     }
 
-    private func parentPath(_ path: String) -> String {
-        let parent = (path as NSString).deletingLastPathComponent
-        let home = FileManager.default.homeDirectoryForCurrentUser.path
-        if parent.hasPrefix(home) {
-            return "~" + parent.dropFirst(home.count)
-        }
-        return parent
-    }
-
     private func formatSize(_ bytes: UInt64) -> String {
         if bytes < 1024 { return "\(bytes) B" }
         if bytes < 1024 * 1024 { return "\(bytes / 1024) KB" }
         return String(format: "%.1f MB", Double(bytes) / (1024 * 1024))
+    }
+}
+
+// MARK: - Audit Log Viewer
+
+struct VaultAuditLogView: View {
+    @Environment(\.dismiss) private var dismiss
+    @State private var entries: [VaultAuditLog.AuditEntry] = []
+    @State private var filterEvent: String = "All"
+
+    private let eventTypes = ["All", "FILE_ADDED", "FILE_REMOVED", "FILE_MOVED", "FILE_DELETED",
+                              "PROTECTION_CHANGED", "FILE_UNLOCKED", "FILE_LOCKED",
+                              "FILE_MODIFIED", "UNAUTHORIZED_ACCESS", "THREAT_DETECTED",
+                              "PASSPHRASE_CHANGED"]
+
+    var filteredEntries: [VaultAuditLog.AuditEntry] {
+        if filterEvent == "All" { return entries }
+        return entries.filter { $0.event == filterEvent }
+    }
+
+    var body: some View {
+        VStack(spacing: 0) {
+            HStack {
+                Image(systemName: "doc.text.magnifyingglass")
+                    .font(.title)
+                Text("Vault Audit Log")
+                    .font(.title.bold())
+                Spacer()
+
+                Picker("Filter:", selection: $filterEvent) {
+                    ForEach(eventTypes, id: \.self) { Text($0) }
+                }
+                .frame(width: 220)
+
+                Button("Close") { dismiss() }
+                    .buttonStyle(.bordered)
+            }
+            .padding()
+
+            Divider()
+
+            if filteredEntries.isEmpty {
+                Spacer()
+                Text("No audit log entries found.")
+                    .foregroundColor(.secondary)
+                Spacer()
+            } else {
+                List(filteredEntries.reversed(), id: \.timestamp) { entry in
+                    VStack(alignment: .leading, spacing: 4) {
+                        HStack {
+                            Text(entry.event)
+                                .font(.caption.bold())
+                                .padding(.horizontal, 6)
+                                .padding(.vertical, 2)
+                                .background(colorForEvent(entry.event).opacity(0.2))
+                                .cornerRadius(4)
+                            Text(formatTimestamp(entry.timestamp))
+                                .font(.body)
+                                .foregroundColor(.secondary)
+                        }
+                        if !entry.path.isEmpty {
+                            Text(entry.path)
+                                .font(.body)
+                                .lineLimit(1)
+                                .truncationMode(.middle)
+                        }
+                        if !entry.detail.isEmpty {
+                            Text(entry.detail)
+                                .font(.body)
+                                .foregroundColor(.secondary)
+                                .lineLimit(2)
+                        }
+                    }
+                    .padding(.vertical, 2)
+                }
+                .listStyle(.plain)
+            }
+        }
+        .frame(minWidth: 800, minHeight: 550)
+        .onAppear {
+            entries = VaultAuditLog.shared.getEntries(limit: 500)
+        }
+    }
+
+    private func colorForEvent(_ event: String) -> Color {
+        switch event {
+        case "FILE_ADDED": return .green
+        case "FILE_REMOVED": return .orange
+        case "FILE_MOVED": return .blue
+        case "FILE_DELETED": return .red
+        case "FILE_MODIFIED", "UNAUTHORIZED_ACCESS": return .red
+        case "THREAT_DETECTED": return .red
+        case "FILE_UNLOCKED": return .yellow
+        case "FILE_LOCKED": return .green
+        case "PROTECTION_CHANGED": return .purple
+        case "PASSPHRASE_CHANGED": return .indigo
+        default: return .gray
+        }
+    }
+
+    private func formatTimestamp(_ ts: String) -> String {
+        let formatter = ISO8601DateFormatter()
+        formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        guard let date = formatter.date(from: ts) else { return ts }
+        let display = DateFormatter()
+        display.dateStyle = .short
+        display.timeStyle = .medium
+        return display.string(from: date)
     }
 }

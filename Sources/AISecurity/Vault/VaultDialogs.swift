@@ -304,56 +304,69 @@ enum VaultDialogs {
 
         let count = paths.count
         let fileWord = count == 1 ? "file" : "files"
+        let formattedCount = NumberFormatter.localizedString(from: NSNumber(value: count), number: .decimal)
 
-        let pathList = paths.prefix(5).joined(separator: "\n")
-            + (count > 5 ? "\n... and \(count - 5) more" : "")
+        // Large batch warning
+        let batchWarning = count > 50
+            ? "\n\nThis may take several minutes. You can cancel at any time."
+            : ""
+
+        // Build file list — scrollable for large selections
+        let pathList: String
+        if count <= 10 {
+            pathList = paths.joined(separator: "\n")
+        } else {
+            let remaining = NumberFormatter.localizedString(from: NSNumber(value: count - 10), number: .decimal)
+            pathList = paths.prefix(10).joined(separator: "\n")
+                + "\n... and \(remaining) more"
+        }
 
         switch protection {
         case .locked:
-            alert.messageText = "Encrypt \(count) \(fileWord)?"
+            alert.messageText = "Encrypt \(formattedCount) \(fileWord)?"
             alert.informativeText = """
             The selected \(fileWord) will be encrypted with AES-256-GCM.
             Original files will be securely deleted (overwritten 3 times).
 
-            You will need your vault passphrase to access them again.
+            You will need your vault passphrase to access them again.\(batchWarning)
 
             \(pathList)
             """
         case .readOnly:
-            alert.messageText = "Set \(count) \(fileWord) to read-only?"
+            alert.messageText = "Set \(formattedCount) \(fileWord) to read-only?"
             alert.informativeText = """
             The selected \(fileWord) will be set to read-only (chmod 444).
             Apps can still open and read them, but cannot modify them.
-            You'll be alerted if anything tries to write to them.
+            You'll be alerted if anything tries to write to them.\(batchWarning)
 
             \(pathList)
             """
         case .localOnly:
-            alert.messageText = "Monitor \(count) \(fileWord) for exfiltration?"
+            alert.messageText = "Monitor \(formattedCount) \(fileWord) for exfiltration?"
             alert.informativeText = """
             The selected \(fileWord) will be monitored. Apps can read and write \
             them normally, but you'll be alerted if any process attempts to upload \
-            or send them over the network.
+            or send them over the network.\(batchWarning)
 
             \(pathList)
             """
         case .readOnlyLocal:
-            alert.messageText = "Set \(count) \(fileWord) to read-only + local-only?"
+            alert.messageText = "Set \(formattedCount) \(fileWord) to read-only + local-only?"
             alert.informativeText = """
             The selected \(fileWord) will be set to read-only (chmod 444) AND \
             monitored for network exfiltration.
             Apps can open but not modify them, and you'll be alerted if any \
-            process attempts to send them over the network.
+            process attempts to send them over the network.\(batchWarning)
 
             \(pathList)
             """
         case .lockedLocal:
-            alert.messageText = "Encrypt \(count) \(fileWord) + monitor?"
+            alert.messageText = "Encrypt \(formattedCount) \(fileWord) + monitor?"
             alert.informativeText = """
             The selected \(fileWord) will be encrypted with AES-256-GCM AND \
             monitored for network exfiltration.
             Original files will be securely deleted. When temporarily unlocked, \
-            you'll be alerted if any process tries to send them over the network.
+            you'll be alerted if any process tries to send them over the network.\(batchWarning)
 
             \(pathList)
             """
@@ -363,6 +376,10 @@ enum VaultDialogs {
         alert.addButton(withTitle: "Cancel")
 
         return alert.runModal() == .alertFirstButtonReturn
+    }
+
+    private static func formattedCount(_ n: Int) -> String {
+        NumberFormatter.localizedString(from: NSNumber(value: n), number: .decimal)
     }
 
     // MARK: - Pre-Decrypt Confirmation

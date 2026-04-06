@@ -24,6 +24,11 @@ final class EmailScanner: @unchecked Sendable {
     private var lastResetDay: Int = 0  // day-of-year for daily counter reset
     var onAlert: AlertHandler?
 
+    /// Whether Full Disk Access appears to be missing (cannot traverse Mail directory).
+    private(set) var fdaRequired = false
+    /// Human-readable status for menu bar display.
+    private(set) var scannerStatus: String = "Starting..."
+
     // MARK: - Attachment checks (stay in Swift — operate on parsed email structure)
 
     private let dangerousExtensions: Set<String>
@@ -59,8 +64,19 @@ final class EmailScanner: @unchecked Sendable {
             .appendingPathComponent("email-scanned-state.json")
         // Load previously scanned files so we don't re-alert on restart
         if let data = FileManager.default.contents(atPath: stateFile),
-           let dict = try? JSONDecoder().decode([String: TimeInterval].self, from: data) {
+           var dict = try? JSONDecoder().decode([String: TimeInterval].self, from: data) {
+            // Prune entries older than 90 days to prevent unbounded memory growth
+            let ninetyDaysAgo = Date().timeIntervalSince1970 - (90 * 24 * 60 * 60)
+            let beforeCount = dict.count
+            dict = dict.filter { $0.value >= ninetyDaysAgo }
+            if dict.count < beforeCount {
+                logger.info("\u{1F4E7} Pruned \(beforeCount - dict.count) old email scan entries (>90 days)")
+            }
             self.scannedFiles = dict
+            // Restore cumulative scan count from persisted state
+            self.emailsScanned = dict.count
+            // Initialize lastResetDay to today so the daily reset doesn't zero our restored count
+            self.lastResetDay = Calendar.current.ordinality(of: .day, in: .year, for: Date()) ?? 0
         }
 
         self.dangerousExtensions = [
@@ -85,10 +101,28 @@ final class EmailScanner: @unchecked Sendable {
         let mailDir = config.emailScanner.mailDir
         guard FileManager.default.fileExists(atPath: mailDir) else {
             logger.warn("Apple Mail directory not found — email scanning skipped", data: ["path": mailDir])
+            scannerStatus = "Inactive — Mail directory not found"
             return
         }
 
         isRunning = true
+
+        // FDA diagnostic check
+        let fdaCheck = checkMailAccess(mailDir: mailDir)
+        logger.info("\u{1F4E7} Email FDA check", data: [
+            "canOpen": "\(fdaCheck.canOpen)",
+            "canTraverse": "\(fdaCheck.canTraverse)",
+            "emlxCount": "\(fdaCheck.emlxCount)"
+        ])
+        if fdaCheck.canTraverse && fdaCheck.emlxCount > 0 {
+            scannerStatus = "Active — \(fdaCheck.emlxCount) emails found"
+        } else if !fdaCheck.canTraverse {
+            fdaRequired = true
+            scannerStatus = "Inactive — FDA required"
+            logger.warn("\u{1F4E7} Email scanning: Full Disk Access may not be granted — cannot traverse \(mailDir)")
+        } else {
+            scannerStatus = "Active — waiting for new emails"
+        }
 
         // Watch for file system changes
         let fd = open(mailDir, O_EVTONLY)
@@ -99,7 +133,7 @@ final class EmailScanner: @unchecked Sendable {
                 queue: DispatchQueue.global(qos: .utility)
             )
             src.setEventHandler { [weak self] in
-                self?.pollRecentEmails(windowMs: 70000)
+                self?.pollRecentEmails(windowMs: 300000) // 5 minutes
             }
             src.setCancelHandler { close(fd) }
             src.resume()
@@ -110,17 +144,63 @@ final class EmailScanner: @unchecked Sendable {
         let timer = DispatchSource.makeTimerSource(queue: DispatchQueue.global(qos: .utility))
         timer.schedule(deadline: .now() + 60, repeating: 60)
         timer.setEventHandler { [weak self] in
-            self?.pollRecentEmails(windowMs: 70000)
+            self?.pollRecentEmails(windowMs: 300000) // 5 minutes
         }
         timer.resume()
         pollTimer = timer
 
-        // Startup scan of last 7 days
+        // Startup scan: scan ALL emails on first launch (no prior state),
+        // otherwise scan last 30 days to catch anything missed while app was closed
+        let isFirstLaunch = scannedFiles.isEmpty
         DispatchQueue.global(qos: .utility).async { [weak self] in
-            self?.pollRecentEmails(windowMs: 7 * 24 * 60 * 60 * 1000)
+            if isFirstLaunch {
+                self?.pollRecentEmails(windowMs: 0) // 0 = scan all
+            } else {
+                self?.pollRecentEmails(windowMs: 30 * 24 * 60 * 60 * 1000) // 30 days
+            }
         }
 
         logger.info("\u{1F4E7} Email Scanner started", data: ["mailDir": mailDir, "mode": fd >= 0 ? "watch+poll" : "poll-only"])
+    }
+
+    /// Diagnostic check: can we actually read the Mail directory tree?
+    private func checkMailAccess(mailDir: String) -> (canOpen: Bool, canTraverse: Bool, emlxCount: Int) {
+        let fm = FileManager.default
+        let canOpen = fm.fileExists(atPath: mailDir)
+        var canTraverse = false
+        var emlxCount = 0
+
+        if canOpen {
+            do {
+                let topLevel = try fm.contentsOfDirectory(atPath: mailDir)
+                canTraverse = !topLevel.isEmpty
+
+                // Probe versioned subdirectories (V9/, V10/, V11/, etc.)
+                for item in topLevel where item.hasPrefix("V") {
+                    let subdir = (mailDir as NSString).appendingPathComponent(item)
+                    do {
+                        let sub = try fm.contentsOfDirectory(atPath: subdir)
+                        emlxCount += sub.filter { $0.hasSuffix(".emlx") }.count
+                        // Also check one level deeper (Mailboxes/)
+                        for subItem in sub {
+                            let deeper = (subdir as NSString).appendingPathComponent(subItem)
+                            var isDir: ObjCBool = false
+                            if fm.fileExists(atPath: deeper, isDirectory: &isDir), isDir.boolValue {
+                                if let deepEntries = try? fm.contentsOfDirectory(atPath: deeper) {
+                                    emlxCount += deepEntries.filter { $0.hasSuffix(".emlx") }.count
+                                }
+                            }
+                        }
+                    } catch {
+                        logger.warn("\u{1F4E7} Email FDA: cannot read \(subdir): \(error.localizedDescription)")
+                    }
+                }
+            } catch {
+                logger.warn("\u{1F4E7} Email FDA: cannot list \(mailDir): \(error.localizedDescription)")
+            }
+        }
+
+        return (canOpen, canTraverse, emlxCount)
     }
 
     func stop() {
@@ -144,12 +224,25 @@ final class EmailScanner: @unchecked Sendable {
     // MARK: - Poll
 
     private func pollRecentEmails(windowMs: Int) {
-        let cutoff = Date().timeIntervalSince1970 - Double(windowMs) / 1000.0 - 5.0
-        let emlxFiles = findEmlxFiles(in: config.emailScanner.mailDir, limit: 2000)
+        // windowMs == 0 means scan ALL emails (first launch)
+        let cutoff: TimeInterval = windowMs > 0
+            ? Date().timeIntervalSince1970 - Double(windowMs) / 1000.0 - 5.0
+            : 0
+        let limit = windowMs == 0 ? 50000 : 10000
+        let emlxFiles = findEmlxFiles(in: config.emailScanner.mailDir, limit: limit)
 
         if emlxFiles.isEmpty {
+            if !fdaRequired {
+                fdaRequired = true
+                scannerStatus = "Inactive — FDA required (0 .emlx files found)"
+            }
             logger.warn("\u{1F4E7} Email poll: 0 .emlx files found — FDA may not be active")
             return
+        }
+
+        // FDA is working if we found files
+        if fdaRequired {
+            fdaRequired = false
         }
 
         // Reset daily counter at midnight
@@ -173,9 +266,15 @@ final class EmailScanner: @unchecked Sendable {
         }
 
         if newCount > 0 {
-            logger.info("\u{1F4E7} Poll scanned \(newCount) new/updated email(s)")
+            logger.info("\u{1F4E7} Poll scanned \(newCount) new/updated email(s), total: \(emailsScanned), threats: \(threatsFound)")
             persistScannedFiles()
+        } else if windowMs == 0 || windowMs > 600000 {
+            // Log even when no new emails on large scans to confirm it ran
+            logger.info("\u{1F4E7} Scan complete: \(emlxFiles.count) emails checked, \(emailsScanned) total scanned, \(threatsFound) threats")
         }
+
+        // Update status for UI (always, even if no new emails)
+        scannerStatus = "Active — \(emailsScanned) scanned, \(threatsFound) threats"
     }
 
     // MARK: - Scan Email
@@ -281,6 +380,8 @@ final class EmailScanner: @unchecked Sendable {
             )
             logger.alert(alert)
             onAlert?(alert)
+            VaultAuditLog.shared.log(.threatDetected, path: filePath,
+                detail: "email threat: \(confirmedThreats.map(\.label).joined(separator: ", ")) from \(from)")
         } else if !warnings.isEmpty {
             logger.warn("\u{26A0}\u{FE0F} Suspicious email from \(from.isEmpty ? "unknown" : from): \(subject)")
         } else {
@@ -366,16 +467,23 @@ final class EmailScanner: @unchecked Sendable {
 
         func walk(_ d: String) {
             guard files.count < limit else { return }
-            guard let entries = try? fm.contentsOfDirectory(atPath: d) else { return }
-            for entry in entries {
-                guard files.count < limit else { return }
-                let full = (d as NSString).appendingPathComponent(entry)
-                var isDir: ObjCBool = false
-                guard fm.fileExists(atPath: full, isDirectory: &isDir) else { continue }
-                if isDir.boolValue {
-                    walk(full)
-                } else if entry.hasSuffix(".emlx") {
-                    files.append(full)
+            do {
+                let entries = try fm.contentsOfDirectory(atPath: d)
+                for entry in entries {
+                    guard files.count < limit else { return }
+                    let full = (d as NSString).appendingPathComponent(entry)
+                    var isDir: ObjCBool = false
+                    guard fm.fileExists(atPath: full, isDirectory: &isDir) else { continue }
+                    if isDir.boolValue {
+                        walk(full)
+                    } else if entry.hasSuffix(".emlx") {
+                        files.append(full)
+                    }
+                }
+            } catch {
+                logger.warn("\u{1F4E7} Cannot read directory \(d): \(error.localizedDescription)")
+                if d == dir {
+                    fdaRequired = true
                 }
             }
         }

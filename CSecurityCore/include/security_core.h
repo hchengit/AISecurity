@@ -123,6 +123,15 @@ typedef struct VaultEntryArrayFFI {
 } VaultEntryArrayFFI;
 
 /**
+ * Progress callback type for batch vault operations.
+ * Returns true to continue, false to cancel.
+ */
+typedef bool (*VaultProgressCallback)(uint32_t current,
+                                      uint32_t total,
+                                      const char *current_path,
+                                      void *user_data);
+
+/**
  * Initialize with an optional config path. Returns true on success.
  */
 bool sec_init(const char *configPath);
@@ -241,11 +250,39 @@ struct VaultResultFFI *sec_vault_change_passphrase(const char *securityDir,
                                                    const char *newPassphrase);
 
 /**
- * Toggle local-only monitoring on vault entries. `paths` is colon-separated.
+ * Change protection level of vault entries. `paths` is newline-separated.
+ * `new_protection`: 0=locked, 1=read_only, 2=local_only, 3=read_only_local, 4=locked_local.
+ */
+struct VaultResultFFI *sec_vault_change_protection(const char *securityDir,
+                                                   const char *paths,
+                                                   uint8_t newProtection,
+                                                   const char *passphrase);
+
+/**
+ * Toggle local-only monitoring on vault entries. `paths` is newline-separated.
  */
 struct VaultResultFFI *sec_vault_toggle_local_only(const char *securityDir,
                                                    const char *paths,
                                                    const char *passphrase);
+
+/**
+ * Add files to vault with progress callback and cancellation support.
+ * `paths` is newline-separated.
+ */
+struct VaultResultFFI *sec_vault_add_with_progress(const char *securityDir,
+                                                   const char *paths,
+                                                   uint8_t protection,
+                                                   const char *passphrase,
+                                                   VaultProgressCallback callback,
+                                                   void *userData);
+
+/**
+ * Update a vault entry's path after a file move.
+ */
+struct VaultResultFFI *sec_vault_update_path(const char *securityDir,
+                                             const char *oldPath,
+                                             const char *newPath,
+                                             const char *passphrase);
 
 /**
  * Free a VaultResultFFI.

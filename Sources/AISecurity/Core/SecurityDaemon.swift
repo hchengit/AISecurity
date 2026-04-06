@@ -16,6 +16,7 @@ final class SecurityDaemon: ObservableObject {
     @Published var messageThreats = 0
     @Published var mode: SecurityMode
     @Published var scanStatusMessage: String?
+    @Published var emailScannerStatus: String = "Starting..."
 
     /// Called when state changes so the menu can rebuild.
     var onStateChange: (() -> Void)?
@@ -62,6 +63,8 @@ final class SecurityDaemon: ObservableObject {
         guard_ = PromptInjectionGuard(logger: logger)
         sanitizer = ExternalFileSanitizer(logger: logger)
         watcher = FileWatcher(logger: logger)
+        // Initialize vault file tracker
+        VaultManager.shared.tracker = VaultFileTracker(logger: logger)
         emailScanner = EmailScanner(logger: logger, whitelist: whitelist)
         messagesScanner = MessagesScanner(
             logger: logger,
@@ -127,10 +130,44 @@ final class SecurityDaemon: ObservableObject {
                 guard let self else { return }
                 self.emailThreats = self.emailScanner.threatsFound
                 self.emailsScanned = self.emailScanner.emailsScanned
+                self.emailScannerStatus = self.emailScanner.scannerStatus
                 self.threatCount += 1
             }
         }
         emailScanner.start()
+
+        // Delayed email scanner verification (5s after start) + FDA retry at 30s
+        let scanner = emailScanner!
+        let log = logger!
+        DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + 5) { [weak self] in
+            let status = scanner.scannerStatus
+            let fdaNeeded = scanner.fdaRequired
+            let scanned = scanner.emailsScanned
+            let threats = scanner.threatsFound
+            if fdaNeeded {
+                log.warn("\u{1F4E7} Email scanning inactive: Full Disk Access required for ~/Library/Mail")
+            }
+            Task { @MainActor [weak self] in
+                self?.emailScannerStatus = status
+                self?.emailsScanned = scanned
+                self?.emailThreats = threats
+            }
+        }
+        // FDA retry: if scanners didn't start because FDA wasn't granted yet, try again after 30s
+        DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + 30) { [weak self] in
+            guard let self else { return }
+            if !scanner.isRunning || scanner.fdaRequired {
+                let mailDir = SecurityConfig.shared.emailScanner.mailDir
+                if FileManager.default.isReadableFile(atPath: mailDir) {
+                    log.info("\u{1F4E7} FDA now available — restarting email scanner")
+                    scanner.stop()
+                    scanner.start()
+                    Task { @MainActor [weak self] in
+                        self?.emailScannerStatus = scanner.scannerStatus
+                    }
+                }
+            }
+        }
 
         // 4. Messages scanner
         messagesScanner.onAlert = { [weak self] _ in

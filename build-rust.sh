@@ -23,6 +23,7 @@ echo "==> Generating C header..."
 (cd "$RUST_DIR" && cbindgen --crate security-core-ffi --output "$OUT_DIR/include/security_core.h")
 
 echo "==> Copying static library..."
+mkdir -p "$OUT_DIR/lib" "$OUT_DIR/include"
 cp "$TARGET_DIR/libsecurity_core_ffi.a" "$OUT_DIR/lib/"
 
 echo "==> Done."

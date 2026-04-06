@@ -1,8 +1,8 @@
 # AISecurity — Cross-Platform Assessment & Implementation Plan
 
 **Date:** 2026-03-28
-**Status:** Phase 11 complete (recovery key + deletion protection). Phase 12 (commercial release) next.
-**Last Updated:** 2026-04-01
+**Status:** Phase 11b complete (reliability overhaul — always-on architecture). Phase 12 (commercial release) next.
+**Last Updated:** 2026-04-02
 
 ---
 
@@ -395,37 +395,212 @@ of WHAT it does with that access. That's the gap AISecurity fills.
 | Forgot Passphrase recovery tested | ✅ Done | 12 words → new passphrase → new recovery key — 2026-04-01 |
 | Deletion protection tested | ✅ Done | Finder shows "item is locked" on delete attempt — 2026-04-01 |
 
-### Phase 11b: Vault Protection Redesign (Atomic Change Protection + Hard Delete Block)
+### Phase 11b: Reliability Overhaul — Always-On Architecture
 
-**Problem discovered:** The current `changeProtection()` uses a non-atomic remove+add pattern
-that corrupts the vault manifest — files show wrong badges, entries get duplicated or lost.
-Also, macOS Finder can override the `uchg` immutable flag with a user confirmation, allowing
-accidental deletion of vault-protected files.
+**Last Updated:** 2026-04-02
 
-**Goal:** Atomic protection changes in Rust + hard deletion blocking via Endpoint Security
-(Phase 12) or, until then, stronger prevention + immediate recovery.
+**Problems discovered:**
+
+1. **Vault tracker is not always-on.** After app restart, `VaultFileTracker.trackedFiles` is empty.
+   `syncTracker()` requires the passphrase (to decrypt manifest), so tracking only starts when
+   the user opens the vault window or performs a vault operation. Between restart and first
+   interaction, protected files are completely unmonitored.
+
+2. **File moves not persisted.** `handleFileMoved()` detects moves via macOS bookmarks but never
+   updates the Rust manifest or the UI. Vault shows stale paths; operations fail on moved files.
+
+3. **Deleted files haunt the vault.** Manifest entries persist after permanent deletion. Cleanup
+   only runs when the vault window opens (`cleanupDeletedEntries()` in `onAppear`).
+
+4. **Batch protection freezes the app.** Encrypting 1226 files blocks the UI with no progress bar,
+   no cancel button, and no prominent file count warning. User accidentally protected 1226 files
+   with no way to abort.
+
+5. **Email scanning silently fails.** `findEmlxFiles()` uses `try?` which returns `[]` when FDA
+   blocks subdirectory traversal. No error logged, no user indication. Messages scanner works
+   because it opens a single SQLite file.
+
+6. **No audit trail.** No structured log of vault operations, file moves, deletions, or access
+   attempts. A security app defending against prompt injection and file tampering must record
+   what happened and when.
+
+7. **Non-atomic `changeProtection()`.** Uses remove+add pattern that corrupts the vault manifest.
+
+**Goal:** Make the app a true always-on background daemon. Vault files tracked from startup
+without passphrase. Email/message scanning verified active. All suspicious and protected-file
+events logged to a 30-day audit trail. Batch operations cancellable with progress feedback.
+
+#### Step 1: Vault Audit Log
 
 | Component | Status | Location |
 |-----------|--------|----------|
-| **Rust: Atomic `change_protection()`** | | |
-| Add `Vault::change_protection(paths, new_protection, passphrase)` to Rust | ⬜ Not started | `vault.rs` |
-| Handle all 20 transitions atomically (single manifest load/save) | ⬜ Not started | `vault.rs` |
-| Fast path: Locked↔LockedLocal, ReadOnly↔ReadOnlyLocal (metadata only) | ⬜ Not started | `vault.rs` |
-| Decrypt→re-encrypt transitions (Locked→ReadOnly, etc.) | ⬜ Not started | `vault.rs` |
-| Encrypt transitions (ReadOnly→Locked, LocalOnly→Locked) | ⬜ Not started | `vault.rs` |
-| Rust unit tests for key transitions | ⬜ Not started | `vault.rs` |
-| **FFI + Swift Bridge** | | |
-| `sec_vault_change_protection()` FFI export | ⬜ Not started | `security-core-ffi/src/lib.rs` |
-| C header declaration (cbindgen) | ⬜ Not started | `security_core.h` |
-| `SecurityCoreBridge.vaultChangeProtection()` Swift wrapper | ⬜ Not started | `SecurityCoreBridge.swift` |
-| `VaultManager.changeProtection()` convenience method | ⬜ Not started | `VaultManager.swift` |
-| **Vault Window: Replace changeProtection()** | | |
-| Replace remove+add with single atomic call | ⬜ Not started | `VaultWindowView.swift` |
-| Update Finder tags + deletion protection after change | ⬜ Not started | `VaultWindowView.swift` |
-| **Hard Delete Prevention** | | |
-| Block Finder deletion entirely (not just warn) for vault files | ⬜ Not started | Needs Endpoint Security (Phase 12) or `schg` flag |
-| User guidance: "Release protection in Vault before deleting" | ⬜ Not started | Trash monitoring dialog |
-| **Transition Matrix** | | |
+| `VaultAuditLog` class (singleton, thread-safe serial queue) | ✅ Done | New: `Vault/VaultAuditLog.swift` |
+| JSON Lines format (`vault-audit.jsonl`) in `~/.mac-security/logs/` | ✅ Done | `VaultAuditLog.swift` |
+| Event types: FILE_ADDED, FILE_REMOVED, FILE_MOVED, FILE_DELETED, PROTECTION_CHANGED, FILE_UNLOCKED, FILE_LOCKED, FILE_MODIFIED, UNAUTHORIZED_ACCESS, PASSPHRASE_CHANGED, THREAT_DETECTED | ✅ Done | `VaultAuditLog.swift` |
+| Log rotation: rotate at 10MB, date-stamped archives | ✅ Done | `VaultAuditLog.swift` |
+| 30-day retention: delete old rotations on startup | ✅ Done | `VaultAuditLog.swift` |
+| `getEntries(since:limit:)` for UI viewer | ✅ Done | `VaultAuditLog.swift` |
+
+#### Step 2: Unencrypted Tracking Sidecar
+
+Separate "what to watch" from "what to decrypt." Stores paths + protection levels only — no secrets.
+
+| Component | Status | Location |
+|-----------|--------|----------|
+| `VaultTrackingManifest` struct (Codable: path, watchPath, protection, addedAt) | ✅ Done | New: `Vault/VaultTrackingManifest.swift` |
+| `VaultTrackingStore` singleton (load/save/add/remove/update, serial queue, atomic write) | ✅ Done | `Vault/VaultTrackingManifest.swift` |
+| File: `~/.mac-security/vault-tracking-manifest.json` (permissions 0600) | ✅ Done | `VaultTrackingManifest.swift` |
+
+#### Step 3: Always-On Tracker Auto-Load
+
+| Component | Status | Location |
+|-----------|--------|----------|
+| `VaultFileTracker.init()` reads sidecar, calls `track()` for each entry (no passphrase) | ✅ Done | `Vault/VaultFileTracker.swift` |
+| `SecurityDaemon.start()` triggers auto-load immediately after tracker creation | ✅ Done | `Core/SecurityDaemon.swift` |
+| Log: "Vault tracker auto-loaded N files from sidecar" | ✅ Done | `VaultFileTracker.swift` |
+
+#### Step 4: Keep Sidecar in Sync with Vault Operations
+
+| Component | Status | Location |
+|-----------|--------|----------|
+| `VaultManager.addFiles` success → `VaultTrackingStore.addEntries()` | ✅ Done | `Vault/VaultManager.swift` |
+| `VaultManager.removeFiles` success → `VaultTrackingStore.removeEntries()` | ✅ Done | `Vault/VaultManager.swift` |
+| `VaultManager.lockFiles` / `unlockFiles` → update sidecar watchPath | ✅ Done | `Vault/VaultManager.swift` |
+| `VaultManager.syncTracker` → reconcile sidecar from encrypted manifest (source of truth) | ✅ Done | `Vault/VaultManager.swift` |
+
+#### Step 5: Instrument All Operations with Audit Logging
+
+| Component | Status | Location |
+|-----------|--------|----------|
+| `VaultManager.addFiles` → `VaultAuditLog.log(.fileAdded, ...)` | ✅ Done | `Vault/VaultManager.swift` |
+| `VaultManager.removeFiles` → `VaultAuditLog.log(.fileRemoved, ...)` | ✅ Done | `Vault/VaultManager.swift` |
+| `VaultManager.unlockFiles` → `VaultAuditLog.log(.fileUnlocked, ...)` | ✅ Done | `Vault/VaultManager.swift` |
+| `VaultManager.lockFiles` → `VaultAuditLog.log(.fileLocked, ...)` | ✅ Done | `Vault/VaultManager.swift` |
+| `VaultManager.changePassphrase` → `VaultAuditLog.log(.passphraseChanged, ...)` | ✅ Done | `Vault/VaultManager.swift` |
+| `VaultFileTracker.handleFileMoved` → `VaultAuditLog.log(.fileMoved, ...)` | ✅ Done | `Vault/VaultFileTracker.swift` |
+| `VaultFileTracker.handleFileEvent` (modification) → `VaultAuditLog.log(.fileModified, ...)` | ✅ Done | `Vault/VaultFileTracker.swift` |
+| Email/Message scanner threats → `VaultAuditLog.log(.threatDetected, ...)` | ✅ Done | `Modules/EmailScanner.swift`, `Modules/MessagesScanner.swift` |
+
+#### Step 6: Rust — `update_entry_path()` for File Move Persistence
+
+| Component | Status | Location |
+|-----------|--------|----------|
+| `Vault::update_entry_path(old_path, new_path, passphrase)` in Rust | ✅ Done | `SecurityCore/crates/security-core/src/vault.rs` |
+| Load manifest, find entry by old_path, update original_path + vault_path | ✅ Done | `vault.rs` |
+| If locked: `fs::rename` the `.vault` file to new location | ✅ Done | `vault.rs` |
+| Rust unit tests for path update (normal move, locked file move) | ✅ Done | `vault.rs` |
+
+#### Step 7: FFI + Swift Bridge for Path Update
+
+| Component | Status | Location |
+|-----------|--------|----------|
+| `sec_vault_update_path()` FFI export (security_dir, old, new, passphrase) | ✅ Done | `SecurityCore/crates/security-core-ffi/src/lib.rs` |
+| C header declaration | ✅ Done | `CSecurityCore/include/security_core.h` |
+| `SecurityCoreBridge.vaultUpdatePath()` Swift wrapper | ✅ Done | `RustBridge/SecurityCoreBridge.swift` |
+
+#### Step 8: File Move Tracking Persists to Manifest + Sidecar
+
+| Component | Status | Location |
+|-----------|--------|----------|
+| `VaultFileTracker.updateTrackedPath()` — updates sidecar immediately (no passphrase) | ✅ Done | `Vault/VaultFileTracker.swift` |
+| If passphrase available: call `SecurityCoreBridge.vaultUpdatePath()` | ✅ Done | `VaultFileTracker.swift` |
+| If passphrase unavailable: queue in `pendingMoves` array | ✅ Done | `VaultFileTracker.swift` |
+| Re-key `trackedFiles` dictionary, recreate DispatchSource + bookmark for new path | ✅ Done | `VaultFileTracker.swift` |
+| `handleFileMoved()` calls `updateTrackedPath()` for all move types | ✅ Done | `VaultFileTracker.swift` |
+| Persist pending ops to `~/.mac-security/vault-pending-ops.json` for crash recovery | ✅ Done | `VaultFileTracker.swift` |
+
+#### Step 9: Background Cleanup for Deleted Files
+
+| Component | Status | Location |
+|-----------|--------|----------|
+| 60-second cleanup timer on serial queue (`checkTrackedFilesExist()`) | ✅ Done | `Vault/VaultFileTracker.swift` |
+| Check each tracked file exists; try bookmark if missing; add to `pendingDeletions` if gone | ✅ Done | `VaultFileTracker.swift` |
+| `processDeletions()` — remove from sidecar, manifest (if passphrase), and tracker dict | ✅ Done | `VaultFileTracker.swift` |
+| `VaultManager.syncTracker()` — process pending moves + deletions on auth | ✅ Done | `Vault/VaultManager.swift` |
+| Keep existing `cleanupDeletedEntries()` in VaultWindowView as fallback | ✅ Done | `Vault/VaultWindowView.swift` |
+
+#### Step 10: Email Scanner — FDA Diagnostics + Error Visibility
+
+| Component | Status | Location |
+|-----------|--------|----------|
+| Replace `try?` with `try/catch` in `findEmlxFiles()` — log exact directory that fails | ✅ Done | `Modules/EmailScanner.swift` |
+| `checkMailAccess()` diagnostic at startup (canOpen, canTraverse, emlxCount) | ✅ Done | `EmailScanner.swift` |
+| Try versioned Mail paths (`V9/`, `V10/`, `V11/`) if top-level yields 0 files | ✅ Done | `EmailScanner.swift` |
+| Expose `@Published scannerStatus` and `fdaRequired` flag | ✅ Done | `EmailScanner.swift` |
+| Log on EVERY poll attempt (not just when threats found) | ✅ Done | `EmailScanner.swift` |
+
+#### Step 11: Email Scanner Status in UI
+
+| Component | Status | Location |
+|-----------|--------|----------|
+| `SecurityDaemon` — delayed 5s startup check, set `emailScannerStatus` published property | ✅ Done | `Core/SecurityDaemon.swift` |
+| Menu bar — show "Email: Active (N scanned)" or "Email: FDA Required" | ✅ Done | `AISecurityApp.swift` |
+| "FDA Required" links to System Settings > Privacy & Security > Full Disk Access | ✅ Done | `AISecurityApp.swift` |
+
+#### Step 12: Rust — `add_with_progress()` with Cancel Callback
+
+| Component | Status | Location |
+|-----------|--------|----------|
+| `Vault::add_with_progress(paths, protection, passphrase, callback)` | ✅ Done | `SecurityCore/crates/security-core/src/vault.rs` |
+| Callback: `Fn(u32, u32, &str) -> bool` (current, total, path → should_continue) | ✅ Done | `vault.rs` |
+| If callback returns false: save partial manifest, return with `entries_affected` count | ✅ Done | `vault.rs` |
+| Existing `add()` delegates to `add_with_progress` with `\|_,_,_\| true` | ✅ Done | `vault.rs` |
+| `sec_vault_add_with_progress()` FFI with C function pointer | ✅ Done | `security-core-ffi/src/lib.rs` |
+| C header + `SecurityCoreBridge.vaultAddWithProgress()` Swift wrapper | ✅ Done | `security_core.h`, `SecurityCoreBridge.swift` |
+
+#### Step 13: Batch Protection — Progress Window + Improved Confirmation
+
+| Component | Status | Location |
+|-----------|--------|----------|
+| `VaultProgressWindow` — NSPanel with progress bar, file label, count, Cancel button | ✅ Done | New: `Vault/VaultProgressWindow.swift` |
+| Atomic `cancelled` flag checked by C callback from Rust | ✅ Done | `VaultProgressWindow.swift` |
+| Callback updates UI via `DispatchQueue.main.async` | ✅ Done | `VaultProgressWindow.swift` |
+| Improved `confirmEncrypt()` — bold file count, scrollable list, warning for >50 files | ✅ Done | `Vault/VaultDialogs.swift` |
+
+#### Step 14: Async Batch Flow Wired Up
+
+| Component | Status | Location |
+|-----------|--------|----------|
+| After confirmation: show `VaultProgressWindow`, dispatch to background | ✅ Done | `AISecurityApp.swift` |
+| Background calls `vaultAddWithProgress` with C callback | ✅ Done | `AISecurityApp.swift` |
+| On completion/cancel: dismiss window, show summary ("Protected N of M") | ✅ Done | `AISecurityApp.swift` |
+| Update tracking sidecar for all successfully protected files | ✅ Done | `AISecurityApp.swift`, `VaultManager.swift` |
+
+#### Step 15: Audit Log Viewer in Vault Window
+
+| Component | Status | Location |
+|-----------|--------|----------|
+| "View Audit Log" button in vault window action bar | ✅ Done | `Vault/VaultWindowView.swift` |
+| Sheet with scrollable list of recent entries (last 500) | ✅ Done | `VaultWindowView.swift` |
+| Filter by event type dropdown | ✅ Done | `VaultWindowView.swift` |
+
+#### Step 16: Atomic `change_protection()` (from original Phase 11b)
+
+| Component | Status | Location |
+|-----------|--------|----------|
+| `Vault::change_protection(paths, new_protection, passphrase)` in Rust | ✅ Done | `vault.rs` |
+| Handle all 20 transitions atomically (single manifest load/save) | ✅ Done | `vault.rs` |
+| Fast path: Locked↔LockedLocal, ReadOnly↔ReadOnlyLocal (metadata only) | ✅ Done | `vault.rs` |
+| Decrypt→re-encrypt transitions (Locked→ReadOnly, etc.) | ✅ Done | `vault.rs` |
+| Encrypt transitions (ReadOnly→Locked, LocalOnly→Locked) | ✅ Done | `vault.rs` |
+| Rust unit tests for key transitions | ✅ Done | `vault.rs` |
+| `sec_vault_change_protection()` FFI export | ✅ Done | `security-core-ffi/src/lib.rs` |
+| C header + `SecurityCoreBridge.vaultChangeProtection()` wrapper | ✅ Done | `security_core.h`, `SecurityCoreBridge.swift` |
+| `VaultManager.changeProtection()` convenience method | ✅ Done | `VaultManager.swift` |
+| Replace remove+add in VaultWindowView with single atomic call | ✅ Done | `VaultWindowView.swift` |
+| Update Finder tags + deletion protection after change | ✅ Done | `VaultWindowView.swift` |
+| Update sidecar after protection change | ✅ Done | `VaultManager.swift` |
+
+#### Step 17: Sidecar ↔ Encrypted Manifest Reconciliation
+
+| Component | Status | Location |
+|-----------|--------|----------|
+| On auth: compare sidecar entries vs encrypted manifest entries | ✅ Done | `Vault/VaultManager.swift` |
+| If sidecar has entries not in manifest: remove from sidecar | ✅ Done | `VaultManager.swift` |
+| If manifest has entries not in sidecar: add to sidecar | ✅ Done | `VaultManager.swift` |
+| Log any discrepancies to audit log | ✅ Done | `VaultManager.swift` |
+
+#### Transition Matrix (for Step 16)
 
 All 20 protection transitions and their file operations:
 
@@ -438,6 +613,47 @@ LocalOnly        | Encrypt          | chmod444         | -           | chmod444 
 ReadOnly+Local   | chmod644, Encrypt| Metadata only    | chmod644    | -                | chmod644, Encrypt
 Locked+Local     | Metadata only    | Decrypt, chmod444| Decrypt     | Decrypt, chmod444| -
 ```
+
+#### New Files Created in Phase 11b
+
+| File | Purpose |
+|------|---------|
+| `Sources/AISecurity/Vault/VaultAuditLog.swift` | Structured audit trail with 30-day rotation |
+| `Sources/AISecurity/Vault/VaultTrackingManifest.swift` | Unencrypted sidecar for always-on tracking |
+| `Sources/AISecurity/Vault/VaultProgressWindow.swift` | Batch progress UI with cancel button |
+
+#### Existing Files Modified in Phase 11b
+
+| File | Changes |
+|------|---------|
+| `SecurityCore/crates/security-core/src/vault.rs` | `update_entry_path()`, `add_with_progress()`, `change_protection()` |
+| `SecurityCore/crates/security-core-ffi/src/lib.rs` | 3 new FFI exports |
+| `CSecurityCore/include/security_core.h` | 3 new C declarations |
+| `Sources/AISecurity/RustBridge/SecurityCoreBridge.swift` | 3 new bridge methods |
+| `Sources/AISecurity/Vault/VaultFileTracker.swift` | Auto-load, move persistence, cleanup timer, pending ops |
+| `Sources/AISecurity/Vault/VaultManager.swift` | Sidecar sync, pending ops on auth, reconciliation, audit hooks |
+| `Sources/AISecurity/Vault/VaultWindowView.swift` | Audit log viewer button |
+| `Sources/AISecurity/Vault/VaultDialogs.swift` | Improved batch confirmation |
+| `Sources/AISecurity/Modules/EmailScanner.swift` | FDA diagnostics, proper error handling, status |
+| `Sources/AISecurity/Modules/MessagesScanner.swift` | Audit logging for threats |
+| `Sources/AISecurity/Core/SecurityDaemon.swift` | Tracker auto-start, email status check |
+| `Sources/AISecurity/AISecurityApp.swift` | Async batch flow, email status in menu |
+
+#### Verification
+
+| Test | Expected Result |
+|------|----------------|
+| Kill app, restart | Tracker auto-loads all vault files within 5s (check log) |
+| Protect file → move in Finder | Vault UI shows new path, audit log shows FILE_MOVED |
+| Protect file → Trash → Empty Trash | Entry auto-removed from vault within 60s |
+| Select 100+ files → start → Cancel at 50% | Partial success reported, uncancelled files unprotected |
+| Select folder with many files | Prominent count in confirmation dialog |
+| Check menu bar Email section | "Email: Active (N scanned)" or "Email: FDA Required" |
+| Revoke FDA → check menu | "Email: FDA Required" appears |
+| Perform add/move/delete/unlock | All events in audit log with timestamps |
+| Wait 30+ days | Old audit logs auto-deleted on startup |
+| Manually edit sidecar → auth to vault | Sidecar corrected to match encrypted manifest |
+| Change protection level on existing file | Single atomic operation, correct badges, sidecar updated |
 
 ### Phase 12: Commercial Release Path
 

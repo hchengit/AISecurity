@@ -2,6 +2,14 @@ import Foundation
 import AppKit
 import CryptoKit
 
+// MARK: - Vault Notification
+
+extension Notification.Name {
+    /// Posted after any vault mutation (add, remove, lock, unlock, changeProtection, toggleLocalOnly).
+    /// VaultWindowView listens for this to auto-refresh.
+    static let vaultDidChange = Notification.Name("com.aisecurity.vaultDidChange")
+}
+
 /// Cryptographically secure random number generation.
 private enum SecureRandom {
     static func uint32() -> UInt32 {
@@ -11,19 +19,13 @@ private enum SecureRandom {
     }
 }
 
-extension Notification.Name {
-    static let vaultWatchedPathsChanged = Notification.Name("vaultWatchedPathsChanged")
-    static let vaultOperationStarted = Notification.Name("vaultOperationStarted")
-    static let vaultOperationEnded = Notification.Name("vaultOperationEnded")
-}
-
-/// Post these around vault operations to suppress FileWatcher alerts for our own file access.
+/// Convenience wrapper for suppressing vault tracking during our own operations.
 enum VaultOperationScope {
     static func begin() {
-        NotificationCenter.default.post(name: .vaultOperationStarted, object: nil)
+        VaultManager.shared.tracker?.beginSuppress()
     }
     static func end() {
-        NotificationCenter.default.post(name: .vaultOperationEnded, object: nil)
+        VaultManager.shared.tracker?.endSuppress()
     }
 }
 
@@ -35,6 +37,8 @@ final class VaultManager {
     let authGate = AuthGate()
     private let securityDir: String
     private(set) var passphrase: String? // held in memory during session only
+    /// Single owner of vault file monitoring. Created lazily when daemon starts.
+    var tracker: VaultFileTracker?
 
     // MARK: - Auth Rate Limiting
 
@@ -249,8 +253,20 @@ final class VaultManager {
 
     /// Reset the vault passphrase using the recovery key.
     /// Returns true if successful.
+    /// Clean up all tracking artifacts: untrack all files, remove uchg flags, Finder tags, cache.
+    /// Call before any vault data reset to prevent orphaned flags.
+    func cleanupAllTracking() {
+        tracker?.untrackAll()
+        // Remove watched-paths cache
+        let cacheFile = (securityDir as NSString).appendingPathComponent("vault-watched-paths.json")
+        try? FileManager.default.removeItem(atPath: cacheFile)
+    }
+
     func resetPassphraseWithRecoveryKey(recoveryKey: String, newPassphrase: String) -> Bool {
         guard verifyRecoveryKey(recoveryKey) else { return false }
+
+        // Clean up all tracking before resetting vault data
+        cleanupAllTracking()
 
         // We can't decrypt the manifest without the old passphrase.
         // So we reset the vault: delete manifest + salt, re-setup with new passphrase.
@@ -324,24 +340,11 @@ final class VaultManager {
                 return
             }
 
-            // Otherwise, prompt for passphrase via UI
+            // Prompt for passphrase with retry loop
             DispatchQueue.main.async {
-                self?.promptForPassphrase(title: passphrasePrompt) { pass in
+                self?.promptForPassphraseWithRetry(title: passphrasePrompt) { pass in
                     if let pass = pass {
-                        guard let self = self else { return }
-                        if self.verifyPassphrase(pass) {
-                            self.resetFailedAttempts()
-                            self.passphrase = pass
-                            onPassphrase(pass)
-                        } else {
-                            let locked = self.recordFailedAttempt()
-                            if locked {
-                                onError("Vault locked out: \(self.maxFailedAttempts) failed attempts.\nLocked for \(Int(self.lockoutDuration / 60)) minutes.")
-                            } else {
-                                let remaining = self.maxFailedAttempts - self.failedAttempts
-                                onError("Incorrect vault passphrase.\n\(remaining) attempt\(remaining == 1 ? "" : "s") remaining before lockout.")
-                            }
-                        }
+                        onPassphrase(pass)
                     } else {
                         onCancel()
                     }
@@ -353,23 +356,58 @@ final class VaultManager {
     /// Add files to vault.
     func addFiles(_ paths: [String], protection: SecurityCoreBridge.ProtectionLevel,
                   passphrase: String) -> SecurityCoreBridge.VaultResult {
-        SecurityCoreBridge.vaultAdd(securityDir: securityDir, paths: paths,
-                                    protection: protection, passphrase: passphrase)
+        let result = SecurityCoreBridge.vaultAdd(securityDir: securityDir, paths: paths,
+                                                  protection: protection, passphrase: passphrase)
+        if result.success {
+            let watchPaths = paths.map { protection.isLocked ? $0 + ".vault" : $0 }
+            VaultTrackingStore.shared.addEntries(paths, watchPaths: watchPaths, protection: protection)
+            for path in paths {
+                VaultAuditLog.shared.log(.fileAdded, path: path,
+                    detail: "protection: \(protection.sidecarKey), batch: \(paths.count) files")
+            }
+            NotificationCenter.default.post(name: .vaultDidChange, object: nil)
+        }
+        return result
     }
 
     /// Unlock files.
     func unlockFiles(_ paths: [String], passphrase: String) -> SecurityCoreBridge.VaultResult {
-        SecurityCoreBridge.vaultUnlock(securityDir: securityDir, paths: paths, passphrase: passphrase)
+        let result = SecurityCoreBridge.vaultUnlock(securityDir: securityDir, paths: paths, passphrase: passphrase)
+        if result.success {
+            for path in paths {
+                let origPath = path.hasSuffix(".vault") ? String(path.dropLast(".vault".count)) : path
+                VaultTrackingStore.shared.updateWatchPath(originalPath: origPath, newWatchPath: origPath)
+                VaultAuditLog.shared.log(.fileUnlocked, path: origPath, detail: "decrypted")
+            }
+            NotificationCenter.default.post(name: .vaultDidChange, object: nil)
+        }
+        return result
     }
 
     /// Lock files.
     func lockFiles(_ paths: [String], passphrase: String) -> SecurityCoreBridge.VaultResult {
-        SecurityCoreBridge.vaultLock(securityDir: securityDir, paths: paths, passphrase: passphrase)
+        let result = SecurityCoreBridge.vaultLock(securityDir: securityDir, paths: paths, passphrase: passphrase)
+        if result.success {
+            for path in paths {
+                VaultTrackingStore.shared.updateWatchPath(originalPath: path, newWatchPath: path + ".vault")
+                VaultAuditLog.shared.log(.fileLocked, path: path, detail: "re-encrypted")
+            }
+            NotificationCenter.default.post(name: .vaultDidChange, object: nil)
+        }
+        return result
     }
 
     /// Remove files from vault.
     func removeFiles(_ paths: [String], passphrase: String) -> SecurityCoreBridge.VaultResult {
-        SecurityCoreBridge.vaultRemove(securityDir: securityDir, paths: paths, passphrase: passphrase)
+        let result = SecurityCoreBridge.vaultRemove(securityDir: securityDir, paths: paths, passphrase: passphrase)
+        if result.success {
+            VaultTrackingStore.shared.removeEntries(paths)
+            for path in paths {
+                VaultAuditLog.shared.log(.fileRemoved, path: path, detail: "released from vault")
+            }
+            NotificationCenter.default.post(name: .vaultDidChange, object: nil)
+        }
+        return result
     }
 
     /// List vault entries.
@@ -377,9 +415,34 @@ final class VaultManager {
         SecurityCoreBridge.vaultList(securityDir: securityDir, passphrase: passphrase)
     }
 
+    /// Change protection level of existing entries (atomic — single manifest load/save).
+    func changeProtection(_ paths: [String], newProtection: SecurityCoreBridge.ProtectionLevel,
+                          passphrase: String) -> SecurityCoreBridge.VaultResult {
+        let result = SecurityCoreBridge.vaultChangeProtection(securityDir: securityDir, paths: paths,
+                                                              newProtection: newProtection, passphrase: passphrase)
+        if result.success {
+            for path in paths {
+                let newWatch = newProtection.isLocked ? path + ".vault" : path
+                VaultTrackingStore.shared.updateWatchPath(originalPath: path, newWatchPath: newWatch)
+                VaultTrackingStore.shared.updateProtection(originalPath: path, protection: newProtection)
+                VaultAuditLog.shared.log(.protectionChanged, path: path,
+                    detail: "changed to \(newProtection.sidecarKey)")
+            }
+            NotificationCenter.default.post(name: .vaultDidChange, object: nil)
+        }
+        return result
+    }
+
     /// Toggle local-only monitoring on existing entries.
     func toggleLocalOnly(_ paths: [String], passphrase: String) -> SecurityCoreBridge.VaultResult {
-        SecurityCoreBridge.vaultToggleLocalOnly(securityDir: securityDir, paths: paths, passphrase: passphrase)
+        let result = SecurityCoreBridge.vaultToggleLocalOnly(securityDir: securityDir, paths: paths, passphrase: passphrase)
+        // After toggle, rebuild sidecar from manifest to get correct protection levels
+        if result.success {
+            let entries = SecurityCoreBridge.vaultList(securityDir: securityDir, passphrase: passphrase)
+            VaultTrackingStore.shared.rebuild(from: entries)
+            NotificationCenter.default.post(name: .vaultDidChange, object: nil)
+        }
+        return result
     }
 
     /// Change passphrase.
@@ -388,8 +451,8 @@ final class VaultManager {
             securityDir: securityDir, oldPassphrase: old, newPassphrase: new)
         if result.success {
             passphrase = new
-            // Invalidate auth session so next sensitive operation requires fresh Touch ID
             authGate.invalidateSession()
+            VaultAuditLog.shared.log(.passphraseChanged, path: "", detail: "vault passphrase changed")
         }
         return result
     }
@@ -409,47 +472,89 @@ final class VaultManager {
         authGate.invalidateSession()
     }
 
-    // MARK: - Watched Paths Cache (for FileWatcher, no auth required)
 
-    /// Path to the plaintext cache of vault-protected paths (for FileWatcher).
-    private var watchedPathsCacheFile: String {
-        (securityDir as NSString).appendingPathComponent("vault-watched-paths.json")
-    }
 
-    /// Update the watched-paths cache after any vault mutation.
-    /// Call this after add, remove, toggle, lock, unlock operations.
-    func refreshWatchedPaths(passphrase: String) {
+    // MARK: - Tracker Integration
+
+    /// Sync tracker with current vault manifest entries after any vault mutation.
+    /// Also rebuilds the unencrypted sidecar from the encrypted manifest (source of truth).
+    func syncTracker(passphrase: String) {
         let entries = SecurityCoreBridge.vaultList(securityDir: securityDir, passphrase: passphrase)
-        let paths = entries.map { $0.originalPath }
-        let vaultFiles = entries.compactMap { $0.vaultPath.isEmpty ? nil : $0.vaultPath }
-        let allPaths = paths + vaultFiles
-
-        let cache: [String: Any] = [
-            "updatedAt": ISO8601DateFormatter().string(from: Date()),
-            "paths": allPaths
-        ]
-
-        if let data = try? JSONSerialization.data(withJSONObject: cache, options: .prettyPrinted) {
-            try? data.write(to: URL(fileURLWithPath: watchedPathsCacheFile))
-        }
-
-        // Notify FileWatcher to reload
-        NotificationCenter.default.post(name: .vaultWatchedPathsChanged, object: nil)
+        tracker?.syncWithManifest(entries: entries)
+        // Rebuild sidecar from encrypted manifest — the source of truth
+        VaultTrackingStore.shared.rebuild(from: entries)
+        // Process any pending operations that were queued while passphrase was unavailable
+        tracker?.processPendingOps(passphrase: passphrase, securityDir: securityDir)
     }
 
-    /// Read cached vault paths (no auth needed — used by FileWatcher at startup).
-    static func cachedVaultPaths() -> [String] {
-        let cacheFile = (SecurityConfig.shared.securityDir as NSString)
-            .appendingPathComponent("vault-watched-paths.json")
-        guard let data = try? Data(contentsOf: URL(fileURLWithPath: cacheFile)),
-              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-              let paths = json["paths"] as? [String] else {
-            return []
+    /// Track newly added files.
+    func trackFiles(_ paths: [String], protection: SecurityCoreBridge.ProtectionLevel) {
+        for path in paths {
+            let vaultPath = protection.isLocked ? path + ".vault" : ""
+            tracker?.track(originalPath: path, vaultPath: vaultPath, protection: protection)
         }
-        return paths
+    }
+
+    /// Untrack released files.
+    func untrackFiles(_ paths: [String]) {
+        for path in paths {
+            tracker?.untrack(originalPath: path)
+        }
     }
 
     // MARK: - Passphrase Prompt
+
+    /// Prompt for passphrase with retry on wrong password (3 attempts per dialog).
+    private func promptForPassphraseWithRetry(title: String, completion: @escaping (String?) -> Void) {
+        // Fresh 3 attempts each time the dialog opens
+        resetFailedAttempts()
+
+        let alert = NSAlert()
+        alert.messageText = title
+        alert.informativeText = "Enter your vault passphrase to continue."
+        alert.alertStyle = .informational
+        alert.addButton(withTitle: "OK")
+        alert.addButton(withTitle: "Cancel")
+
+        let input = NSSecureTextField(frame: NSRect(x: 0, y: 0, width: 300, height: 24))
+        input.placeholderString = "Vault passphrase"
+        alert.accessoryView = input
+        alert.window.initialFirstResponder = input
+
+        while true {
+            input.stringValue = ""
+            let response = alert.runModal()
+
+            guard response == .alertFirstButtonReturn, !input.stringValue.isEmpty else {
+                completion(nil) // cancelled
+                return
+            }
+
+            let pass = input.stringValue
+            if verifyPassphrase(pass) {
+                resetFailedAttempts()
+                passphrase = pass
+                completion(pass)
+                return
+            }
+
+            // Wrong password
+            let locked = recordFailedAttempt()
+            if locked {
+                alert.informativeText = "Vault locked out: \(maxFailedAttempts) failed attempts.\nLocked for \(Int(lockoutDuration / 60)) minutes."
+                alert.alertStyle = .critical
+                // Remove OK button, only show Cancel
+                alert.buttons.first?.isHidden = true
+                alert.runModal()
+                completion(nil)
+                return
+            }
+
+            let remaining = maxFailedAttempts - failedAttempts
+            alert.informativeText = "Incorrect passphrase. \(remaining) attempt\(remaining == 1 ? "" : "s") remaining.\nTry again."
+            alert.alertStyle = .warning
+        }
+    }
 
     private func promptForPassphrase(title: String, completion: @escaping (String?) -> Void) {
         let alert = NSAlert()

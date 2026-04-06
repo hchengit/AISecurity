@@ -4,7 +4,7 @@
 <plist version="1.0">
 <dict>
     <key>CFBundleIdentifier</key>
-    <string>com.aisecurity.menubar</string>
+    <string>com.aisecurity.shield</string>
 
     <key>CFBundleName</key>
     <string>AISecurity</string>
@@ -38,6 +38,26 @@
 
     <key>NSHumanReadableCopyright</key>
     <string>AI Security Agent</string>
+
+    <!-- Finder right-click > Services > "Protect with AISecurity Vault" -->
+    <key>NSServices</key>
+    <array>
+        <dict>
+            <key>NSMenuItem</key>
+            <dict>
+                <key>default</key>
+                <string>Protect with AISecurity Vault</string>
+            </dict>
+            <key>NSMessage</key>
+            <string>protectFilesService</string>
+            <key>NSSendTypes</key>
+            <array>
+                <string>NSFilenamesPboardType</string>
+            </array>
+            <key>NSReturnTypes</key>
+            <array/>
+        </dict>
+    </array>
 
     <!-- Register as handler for .vault files -->
     <key>CFBundleDocumentTypes</key>

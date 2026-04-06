@@ -39,7 +39,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SECURITY_DIR="${MACSEC_SECURITY_DIR:-$HOME/.mac-security}"
 INSTALL_DIR="${INSTALL_DIR:-${MACSEC_INSTALL_DIR:-/Applications}}"
 APP_NAME="AISecurity.app"
-AGENT_LABEL="com.aisecurity.menubar"
+AGENT_LABEL="com.aisecurity.shield"
 AGENT_PLIST="$HOME/Library/LaunchAgents/${AGENT_LABEL}.plist"
 
 echo ""
@@ -119,8 +119,15 @@ else
         --entitlements "$SCRIPT_DIR/AISecurity.entitlements" \
         "$APP_BUNDLE" 2>&1 || warn "Ad-hoc signing failed — FDA may not persist across rebuilds"
     warn "No developer cert found — using ad-hoc signing (FDA grants won't survive rebuilds)"
+    warn "To get a stable signing identity: enroll at developer.apple.com"
 fi
-success "Installed: $APP_BUNDLE"
+
+# Verify code signature
+if codesign -v "$APP_BUNDLE" 2>/dev/null; then
+    success "Installed: $APP_BUNDLE (signature valid)"
+else
+    warn "Installed: $APP_BUNDLE (signature INVALID — FDA and menu bar may not work)"
+fi
 
 # Create LaunchAgent — uses `open -W -a` so macOS launches it as a proper
 # .app bundle (reads Info.plist, honours LSUIElement, registers for FDA).
@@ -164,7 +171,13 @@ launchctl start "$AGENT_LABEL" 2>/dev/null
 sleep 3
 
 if pgrep -f "AISecurity" > /dev/null 2>&1; then
-    success "AISecurity is running"
+    success "AISecurity is running (PID: $(pgrep -f AISecurity-bin | head -1))"
+    # Verify the process was launched via open -a (proper GUI role)
+    if launchctl list | grep -q "$AGENT_LABEL"; then
+        success "LaunchAgent active: $AGENT_LABEL"
+    else
+        warn "LaunchAgent not in launchctl list — menu bar icon may not appear"
+    fi
 else
     warn "Process not detected — try: open -a AISecurity"
 fi

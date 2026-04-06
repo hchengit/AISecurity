@@ -21,6 +21,10 @@ use std::path::{Path, PathBuf};
 pub const VAULT_AAD: &[u8] = b"securitycore:vault:v1";
 pub const VAULT_MANIFEST_AAD: &[u8] = b"securitycore:vault-manifest:v1";
 
+/// Magic header for self-contained .vault files (portable decryption).
+const VAULT_FILE_MAGIC: &[u8; 11] = b"AISECVAULT1";
+const VAULT_FILE_SALT_LEN: usize = 32;
+
 // ─── Types ──────────────────────────────────────────────────────────────────
 
 /// Protection policy for a vault entry.
@@ -214,6 +218,7 @@ impl Vault {
         let mut manifest = self.load_manifest(passphrase)?;
         let encryptor = self.make_encryptor(passphrase)?;
         let mut affected = 0;
+        let mut pending_deletes: Vec<PathBuf> = Vec::new();
 
         for path_str in paths {
             let path = Path::new(path_str);
@@ -242,18 +247,112 @@ impl Vault {
 
             if canonical.is_dir() {
                 // Recursively add directory contents
-                affected += self.add_directory(&canonical, protection, &encryptor, &mut manifest)?;
+                affected += self.add_directory(&canonical, protection, &encryptor, &mut manifest, &mut pending_deletes)?;
             } else {
-                self.add_single_file(&canonical, protection, &encryptor, &mut manifest)?;
+                if let Some(del_path) = self.add_single_file(&canonical, protection, &encryptor, &mut manifest)? {
+                    pending_deletes.push(del_path);
+                }
                 affected += 1;
             }
         }
 
+        // Save manifest BEFORE secure-deleting originals.
+        // This ensures a crash between delete and save doesn't lose track of .vault files.
         self.save_manifest_passphrase(&manifest, passphrase)?;
+
+        // Now safe to delete originals — manifest already knows about the .vault files.
+        for del_path in &pending_deletes {
+            secure_delete(del_path)?;
+        }
 
         Ok(VaultResult {
             success: true,
             message: format!("{} file(s) protected with {} policy", affected, protection),
+            entries_affected: affected,
+        })
+    }
+
+    /// Add files with a progress callback that can cancel the operation.
+    /// The callback receives (current, total, current_path) and returns false to cancel.
+    pub fn add_with_progress<F>(
+        &self,
+        paths: &[&str],
+        protection: ProtectionLevel,
+        passphrase: &str,
+        progress: F,
+    ) -> Result<VaultResult, VaultError>
+    where
+        F: Fn(u32, u32, &str) -> bool,
+    {
+        let mut manifest = self.load_manifest(passphrase)?;
+        let encryptor = self.make_encryptor(passphrase)?;
+        let mut affected = 0;
+        let mut pending_deletes: Vec<PathBuf> = Vec::new();
+        let total = paths.len() as u32;
+        let mut cancelled = false;
+
+        for (i, path_str) in paths.iter().enumerate() {
+            // Check cancel callback before each file
+            if !progress(i as u32, total, path_str) {
+                cancelled = true;
+                break;
+            }
+
+            let path = Path::new(path_str);
+            if !path.exists() {
+                continue; // skip missing files in progress mode instead of erroring
+            }
+
+            let canonical = match path.canonicalize() {
+                Ok(c) => c,
+                Err(_) => continue,
+            };
+            let canonical_str = canonical.to_string_lossy().to_string();
+
+            // Reject symlinks
+            if canonical_str != *path_str && path.read_link().is_ok() {
+                continue;
+            }
+
+            // Check not already in vault
+            if manifest.entries.iter().any(|e| e.original_path == canonical_str) {
+                continue;
+            }
+
+            if canonical.is_dir() {
+                match self.add_directory(&canonical, protection, &encryptor, &mut manifest, &mut pending_deletes) {
+                    Ok(n) => affected += n,
+                    Err(_) => continue,
+                }
+            } else {
+                match self.add_single_file(&canonical, protection, &encryptor, &mut manifest) {
+                    Ok(Some(del_path)) => {
+                        pending_deletes.push(del_path);
+                        affected += 1;
+                    }
+                    Ok(None) => affected += 1,
+                    Err(_) => continue,
+                }
+            }
+        }
+
+        // Save manifest BEFORE secure-deleting originals
+        self.save_manifest_passphrase(&manifest, passphrase)?;
+
+        // Now safe to delete originals
+        for del_path in &pending_deletes {
+            secure_delete(del_path)?;
+        }
+
+        let msg = if cancelled {
+            format!("{} of {} file(s) protected (cancelled by user)", affected, total)
+        } else {
+            format!("{} file(s) protected with {} policy", affected, protection)
+        };
+
+        Ok(VaultResult {
+            success: true,
+            message: msg,
             entries_affected: affected,
         })
     }
@@ -265,9 +364,7 @@ impl Vault {
         let mut affected = 0;
 
         for path_str in paths {
-            if let Some(entry) = manifest.entries.iter_mut().find(|e| {
-                e.original_path == *path_str || e.vault_path == *path_str
-            }) {
+            if let Some(entry) = Self::find_entry_mut(&mut manifest.entries, path_str) {
                 if !entry.protection.is_locked() {
                     continue;
                 }
@@ -280,9 +377,8 @@ impl Vault {
                     continue;
                 }
 
-                // Decrypt
-                let encrypted_bytes = fs::read(vault_path)?;
-                let encrypted_data = EncryptedData::from_bytes(&encrypted_bytes)?;
+                // Decrypt (supports both portable and legacy format)
+                let (_salt, encrypted_data) = read_vault_file(&entry.vault_path)?;
                 let plaintext = encryptor.decrypt(&encrypted_data, VAULT_AAD)?;
 
                 // Write original
@@ -306,11 +402,10 @@ impl Vault {
         let mut manifest = self.load_manifest(passphrase)?;
         let encryptor = self.make_encryptor(passphrase)?;
         let mut affected = 0;
+        let mut pending_deletes: Vec<PathBuf> = Vec::new();
 
         for path_str in paths {
-            if let Some(entry) = manifest.entries.iter_mut().find(|e| {
-                e.original_path == *path_str || e.vault_path == *path_str
-            }) {
+            if let Some(entry) = Self::find_entry_mut(&mut manifest.entries, path_str) {
                 if !entry.protection.is_locked() || !entry.is_unlocked {
                     continue;
                 }
@@ -320,19 +415,25 @@ impl Vault {
                     continue;
                 }
 
-                // Re-encrypt
+                // Re-encrypt (portable format with embedded salt)
+                let salt = fs::read(&self.salt_path)?;
                 let plaintext = fs::read(original_path)?;
                 let encrypted = encryptor.encrypt(&plaintext, VAULT_AAD)?;
-                fs::write(&entry.vault_path, encrypted.to_bytes())?;
+                write_vault_file(&entry.vault_path, &salt, &encrypted)?;
 
-                // Secure delete original
-                secure_delete(original_path)?;
+                pending_deletes.push(original_path.to_path_buf());
                 entry.is_unlocked = false;
                 affected += 1;
             }
         }
 
+        // Save manifest BEFORE secure-deleting originals
         self.save_manifest_passphrase(&manifest, passphrase)?;
+
+        // Now safe to delete originals
+        for del_path in &pending_deletes {
+            secure_delete(del_path)?;
+        }
 
         Ok(VaultResult {
             success: true,
@@ -348,9 +449,7 @@ impl Vault {
         let mut affected = 0;
 
         for path_str in paths {
-            if let Some(idx) = manifest.entries.iter().position(|e| {
-                e.original_path == *path_str || e.vault_path == *path_str
-            }) {
+            if let Some(idx) = Self::find_entry_index(&manifest.entries, path_str) {
                 let entry = &manifest.entries[idx];
 
                 // Handle encrypted component
@@ -359,8 +458,7 @@ impl Vault {
                         // Decrypt first
                         let vault_path = Path::new(&entry.vault_path);
                         if vault_path.exists() {
-                            let encrypted_bytes = fs::read(vault_path)?;
-                            let encrypted_data = EncryptedData::from_bytes(&encrypted_bytes)?;
+                            let (_salt, encrypted_data) = read_vault_file(&entry.vault_path)?;
                             let plaintext = encryptor.decrypt(&encrypted_data, VAULT_AAD)?;
                             fs::write(&entry.original_path, &plaintext)?;
                             fs::remove_file(vault_path)?;
@@ -368,7 +466,11 @@ impl Vault {
                     } else {
                         // Already decrypted, just remove .vault file
                         let vault_path = Path::new(&entry.vault_path);
-                        if vault_path.exists() { let _ = fs::remove_file(vault_path); }
+                        if vault_path.exists() {
+                            if let Err(e) = fs::remove_file(vault_path) {
+                                eprintln!("Warning: failed to remove vault file {}: {}", vault_path.display(), e);
+                            }
+                        }
                     }
                 }
 
@@ -380,7 +482,9 @@ impl Vault {
                         let path = Path::new(&entry.original_path);
                         if path.exists() {
                             let perms = std::fs::Permissions::from_mode(0o644);
-                            let _ = fs::set_permissions(path, perms);
+                            if let Err(e) = fs::set_permissions(path, perms) {
+                                eprintln!("Warning: failed to restore permissions on {}: {}", path.display(), e);
+                            }
                         }
                     }
                 }
@@ -416,11 +520,11 @@ impl Vault {
                 let vault_path = Path::new(&entry.vault_path);
                 if !vault_path.exists() { continue; }
 
-                let encrypted_bytes = fs::read(vault_path)?;
-                let encrypted_data = EncryptedData::from_bytes(&encrypted_bytes)?;
+                let (_salt, encrypted_data) = read_vault_file(&entry.vault_path)?;
                 let plaintext = old_enc.decrypt(&encrypted_data, VAULT_AAD)?;
+                let salt = fs::read(&self.salt_path)?;
                 let new_encrypted = new_enc.encrypt(&plaintext, VAULT_AAD)?;
-                fs::write(vault_path, new_encrypted.to_bytes())?;
+                write_vault_file(&entry.vault_path, &salt, &new_encrypted)?;
                 affected += 1;
             }
         }
@@ -448,9 +552,7 @@ impl Vault {
         let mut affected = 0;
 
         for path_str in paths {
-            if let Some(entry) = manifest.entries.iter_mut().find(|e| {
-                e.original_path == *path_str || e.vault_path == *path_str
-            }) {
+            if let Some(entry) = Self::find_entry_mut(&mut manifest.entries, path_str) {
                 let new_prot = match entry.protection {
                     ProtectionLevel::Locked => ProtectionLevel::LockedLocal,
                     ProtectionLevel::LockedLocal => ProtectionLevel::Locked,
@@ -472,7 +574,247 @@ impl Vault {
         })
     }
 
+    /// Update the path of a vault entry after a file move.
+    /// Updates original_path (and vault_path + renames .vault file if locked).
+    pub fn update_entry_path(
+        &self,
+        old_path: &str,
+        new_path: &str,
+        passphrase: &str,
+    ) -> Result<VaultResult, VaultError> {
+        let mut manifest = self.load_manifest(passphrase)?;
+
+        let entry = Self::find_entry_mut(&mut manifest.entries, old_path);
+
+        let Some(entry) = entry else {
+            return Ok(VaultResult {
+                success: false,
+                message: format!("No vault entry found for path: {}", old_path),
+                entries_affected: 0,
+            });
+        };
+
+        // Update original_path
+        entry.original_path = new_path.to_string();
+
+        // If locked: rename .vault file and update vault_path
+        if entry.protection == ProtectionLevel::Locked
+            || entry.protection == ProtectionLevel::LockedLocal
+        {
+            let old_vault = format!("{}.vault", old_path);
+            let new_vault = format!("{}.vault", new_path);
+
+            if std::path::Path::new(&old_vault).exists() {
+                // Ensure parent directory of new path exists
+                if let Some(parent) = std::path::Path::new(&new_vault).parent() {
+                    let _ = std::fs::create_dir_all(parent);
+                }
+                std::fs::rename(&old_vault, &new_vault).map_err(|e| {
+                    VaultError::IoError(format!(
+                        "Failed to rename vault file {} -> {}: {}",
+                        old_vault, new_vault, e
+                    ))
+                })?;
+            }
+            entry.vault_path = new_vault;
+        } else {
+            // Non-locked: vault_path mirrors original_path (or is empty)
+            if !entry.vault_path.is_empty() {
+                entry.vault_path = new_path.to_string();
+            }
+        }
+
+        self.save_manifest_passphrase(&manifest, passphrase)?;
+
+        Ok(VaultResult {
+            success: true,
+            message: format!("Path updated: {} -> {}", old_path, new_path),
+            entries_affected: 1,
+        })
+    }
+
+    /// Change the protection level of existing vault entries.
+    /// Handles all 20 transitions atomically (single manifest load/save).
+    /// File operations (encrypt, decrypt, chmod) happen inline.
+    pub fn change_protection(
+        &self,
+        paths: &[&str],
+        new_protection: ProtectionLevel,
+        passphrase: &str,
+    ) -> Result<VaultResult, VaultError> {
+        let mut manifest = self.load_manifest(passphrase)?;
+        let encryptor = self.make_encryptor(passphrase)?;
+        let mut affected = 0;
+
+        for path_str in paths {
+            // Try multiple path forms for matching (add() stores canonical paths on macOS)
+            let canonical = Path::new(path_str).canonicalize()
+                .map(|p| p.to_string_lossy().to_string())
+                .unwrap_or_default();
+            // Also try canonicalizing the .vault variant
+            let vault_variant = format!("{}.vault", path_str);
+            let canonical_vault = Path::new(&vault_variant).canonicalize()
+                .map(|p| p.to_string_lossy().to_string())
+                .unwrap_or_default();
+
+            if let Some(entry) = manifest.entries.iter_mut().find(|e| {
+                e.original_path == *path_str || e.vault_path == *path_str
+                || (!canonical.is_empty() && (e.original_path == canonical || e.vault_path == canonical))
+                || (!canonical_vault.is_empty() && e.vault_path == canonical_vault)
+            }) {
+                let old_prot = entry.protection;
+                if old_prot == new_protection { continue; }
+
+                let was_locked = old_prot.is_locked();
+                let was_read_only = old_prot.is_read_only();
+                let will_lock = new_protection.is_locked();
+                let will_read_only = new_protection.is_read_only();
+
+                // Fast path: both locked variants (Locked↔LockedLocal) — metadata only
+                if was_locked && will_lock {
+                    entry.protection = new_protection;
+                    affected += 1;
+                    continue;
+                }
+
+                // Fast path: both read-only variants (ReadOnly↔ReadOnlyLocal) — metadata only
+                if was_read_only && will_read_only && !was_locked && !will_lock {
+                    entry.protection = new_protection;
+                    affected += 1;
+                    continue;
+                }
+
+                // === Phase 1: Undo old file-level effects ===
+
+                // If was locked, decrypt to restore original file
+                if was_locked {
+                    if !entry.is_unlocked {
+                        // File is encrypted — decrypt it
+                        let vault_path = Path::new(&entry.vault_path);
+                        if vault_path.exists() {
+                            let (_salt, encrypted_data) = read_vault_file(&entry.vault_path)?;
+                            let plaintext = encryptor.decrypt(&encrypted_data, VAULT_AAD)?;
+                            fs::write(&entry.original_path, &plaintext)?;
+                            fs::remove_file(vault_path)?;
+                        }
+                    } else {
+                        // Already unlocked (original exists), just clean up .vault
+                        let vault_path = Path::new(&entry.vault_path);
+                        if vault_path.exists() {
+                            if let Err(e) = fs::remove_file(vault_path) {
+                                eprintln!("Warning: failed to remove vault file {}: {}", vault_path.display(), e);
+                            }
+                        }
+                    }
+                    entry.vault_path = String::new();
+                    entry.is_unlocked = false;
+                }
+
+                // If was read-only, restore write permissions
+                if was_read_only {
+                    #[cfg(unix)]
+                    {
+                        use std::os::unix::fs::PermissionsExt;
+                        let path = Path::new(&entry.original_path);
+                        if path.exists() {
+                            let perms = std::fs::Permissions::from_mode(0o644);
+                            if let Err(e) = fs::set_permissions(path, perms) {
+                                eprintln!("Warning: failed to restore permissions on {}: {}", path.display(), e);
+                            }
+                        }
+                    }
+                }
+
+                // === Phase 2: Apply new file-level effects ===
+
+                // If new is locked, encrypt the file
+                if will_lock {
+                    let original_path = Path::new(&entry.original_path);
+                    if !original_path.exists() {
+                        return Err(VaultError::FileNotFound(entry.original_path.clone()));
+                    }
+                    let salt = fs::read(&self.salt_path)?;
+                    let content = fs::read(original_path)?;
+                    let vault_path_str = format!("{}.vault", entry.original_path);
+                    let encrypted = encryptor.encrypt(&content, VAULT_AAD)?;
+                    write_vault_file(&vault_path_str, &salt, &encrypted)?;
+                    secure_delete(original_path)?;
+                    entry.vault_path = vault_path_str;
+                    entry.is_unlocked = false;
+                    entry.sha256_original = sha256_hex(&content);
+                }
+
+                // If new is read-only, set chmod 444
+                if will_read_only {
+                    #[cfg(unix)]
+                    {
+                        use std::os::unix::fs::PermissionsExt;
+                        let path = Path::new(&entry.original_path);
+                        if path.exists() {
+                            let perms = std::fs::Permissions::from_mode(0o444);
+                            fs::set_permissions(path, perms)?;
+                        }
+                    }
+                }
+
+                // Update protection level
+                entry.protection = new_protection;
+                affected += 1;
+            }
+        }
+
+        self.save_manifest_passphrase(&manifest, passphrase)?;
+
+        Ok(VaultResult {
+            success: true,
+            message: format!("{} entry(ies) changed to {}", affected, new_protection),
+            entries_affected: affected,
+        })
+    }
+
     // ─── Private helpers ────────────────────────────────────────────────
+
+    /// Find a vault entry by path, trying exact match first then canonicalized path.
+    /// This handles cases where the caller passes a non-canonical path
+    /// (e.g., relative, or with unresolved symlinks/components).
+    fn find_entry_mut<'a>(entries: &'a mut [VaultEntry], path_str: &str) -> Option<&'a mut VaultEntry> {
+        // First try exact match
+        if let Some(idx) = entries.iter().position(|e| {
+            e.original_path == path_str || e.vault_path == path_str
+        }) {
+            return Some(&mut entries[idx]);
+        }
+        // Try canonicalized path
+        if let Ok(canonical) = Path::new(path_str).canonicalize() {
+            let canonical_str = canonical.to_string_lossy();
+            if let Some(idx) = entries.iter().position(|e| {
+                e.original_path == *canonical_str || e.vault_path == *canonical_str
+            }) {
+                return Some(&mut entries[idx]);
+            }
+        }
+        None
+    }
+
+    /// Find a vault entry's index by path, trying exact match first then canonicalized path.
+    fn find_entry_index(entries: &[VaultEntry], path_str: &str) -> Option<usize> {
+        // First try exact match
+        if let Some(idx) = entries.iter().position(|e| {
+            e.original_path == path_str || e.vault_path == path_str
+        }) {
+            return Some(idx);
+        }
+        // Try canonicalized path
+        if let Ok(canonical) = Path::new(path_str).canonicalize() {
+            let canonical_str = canonical.to_string_lossy();
+            if let Some(idx) = entries.iter().position(|e| {
+                e.original_path == *canonical_str || e.vault_path == *canonical_str
+            }) {
+                return Some(idx);
+            }
+        }
+        None
+    }
 
     fn make_encryptor(&self, passphrase: &str) -> Result<Encryptor, VaultError> {
         let salt = fs::read(&self.salt_path)?;
@@ -480,13 +822,17 @@ impl Vault {
         Ok(Encryptor::new(&salted))
     }
 
+    /// Encrypt/protect a single file and add it to the manifest.
+    /// Returns `Some(path)` if the original file needs secure-deleting (for locked files).
+    /// The caller MUST save the manifest BEFORE performing the secure delete,
+    /// so that a crash between delete and save doesn't lose track of the .vault file.
     fn add_single_file(
         &self,
         path: &Path,
         protection: ProtectionLevel,
         encryptor: &Encryptor,
         manifest: &mut VaultManifest,
-    ) -> Result<(), VaultError> {
+    ) -> Result<Option<PathBuf>, VaultError> {
         let path_str = path.to_string_lossy().to_string();
         let metadata = fs::metadata(path)?;
         let size = metadata.len();
@@ -499,11 +845,15 @@ impl Vault {
         let now = chrono::Utc::now().to_rfc3339();
 
         // Apply encryption if protection includes locking
-        if protection.is_locked() {
+        // NOTE: secure_delete is deferred — caller does it after manifest save
+        let needs_secure_delete = if protection.is_locked() {
+            let salt = fs::read(&self.salt_path)?;
             let encrypted = encryptor.encrypt(&content, VAULT_AAD)?;
-            fs::write(&vault_path, encrypted.to_bytes())?;
-            secure_delete(path)?;
-        }
+            write_vault_file(&vault_path, &salt, &encrypted)?;
+            true
+        } else {
+            false
+        };
 
         // Apply read-only permissions if protection includes read-only
         if protection.is_read_only() {
@@ -528,7 +878,7 @@ impl Vault {
             is_unlocked: false,
         });
 
-        Ok(())
+        Ok(if needs_secure_delete { Some(path.to_path_buf()) } else { None })
     }
 
     fn add_directory(
@@ -537,6 +887,7 @@ impl Vault {
         protection: ProtectionLevel,
         encryptor: &Encryptor,
         manifest: &mut VaultManifest,
+        pending_deletes: &mut Vec<PathBuf>,
     ) -> Result<usize, VaultError> {
         let mut count = 0;
         let entries = fs::read_dir(dir)?;
@@ -547,13 +898,15 @@ impl Vault {
                 continue;
             }
             if path.is_dir() {
-                count += self.add_directory(&path, protection, encryptor, manifest)?;
+                count += self.add_directory(&path, protection, encryptor, manifest, pending_deletes)?;
             } else if path.is_file() {
                 let path_str = path.to_string_lossy().to_string();
                 if manifest.entries.iter().any(|e| e.original_path == path_str) {
                     continue;
                 }
-                self.add_single_file(&path, protection, encryptor, manifest)?;
+                if let Some(del_path) = self.add_single_file(&path, protection, encryptor, manifest)? {
+                    pending_deletes.push(del_path);
+                }
                 count += 1;
             }
         }
@@ -585,7 +938,10 @@ impl Vault {
         let json = serde_json::to_string_pretty(manifest)
             .map_err(|e| VaultError::ManifestCorrupted(format!("serialize: {}", e)))?;
         let encrypted = encryptor.encrypt(json.as_bytes(), VAULT_MANIFEST_AAD)?;
-        fs::write(&self.manifest_path, encrypted.to_bytes())?;
+        // Atomic write: write to tmp file then rename (prevents corrupt manifest on crash)
+        let tmp_path = self.manifest_path.with_extension("enc.tmp");
+        fs::write(&tmp_path, encrypted.to_bytes())?;
+        fs::rename(&tmp_path, &self.manifest_path)?;
         Ok(())
     }
 
@@ -597,7 +953,10 @@ impl Vault {
         let json = serde_json::to_string_pretty(manifest)
             .map_err(|e| VaultError::ManifestCorrupted(format!("serialize: {}", e)))?;
         let encrypted = encryptor.encrypt(json.as_bytes(), VAULT_MANIFEST_AAD)?;
-        fs::write(&self.manifest_path, encrypted.to_bytes())?;
+        // Atomic write: write to tmp file then rename (prevents corrupt manifest on crash)
+        let tmp_path = self.manifest_path.with_extension("enc.tmp");
+        fs::write(&tmp_path, encrypted.to_bytes())?;
+        fs::rename(&tmp_path, &self.manifest_path)?;
         Ok(())
     }
 
@@ -669,6 +1028,42 @@ SUPPORT:
     }
 }
 
+// ─── Portable vault file format ─────────────────────────────────────────────
+//
+// Format: AISECVAULT1 (11 bytes) || salt (32 bytes) || nonce (12 bytes) || ciphertext
+//
+// This makes .vault files self-contained — decryptable on any machine with just
+// the passphrase. No need for the vault manifest or salt file.
+
+/// Write a portable .vault file with embedded salt.
+fn write_vault_file(path: &str, salt: &[u8], encrypted: &EncryptedData) -> Result<(), VaultError> {
+    let enc_bytes = encrypted.to_bytes();
+    let mut out = Vec::with_capacity(VAULT_FILE_MAGIC.len() + VAULT_FILE_SALT_LEN + enc_bytes.len());
+    out.extend_from_slice(VAULT_FILE_MAGIC);
+    out.extend_from_slice(salt);
+    out.extend_from_slice(&enc_bytes);
+    fs::write(path, out)?;
+    Ok(())
+}
+
+/// Read a portable .vault file. Returns (salt, EncryptedData).
+/// Also handles legacy format (no header — just nonce || ciphertext).
+fn read_vault_file(path: &str) -> Result<(Vec<u8>, EncryptedData), VaultError> {
+    let data = fs::read(path)?;
+    let header_len = VAULT_FILE_MAGIC.len() + VAULT_FILE_SALT_LEN;
+
+    if data.len() > header_len && &data[..VAULT_FILE_MAGIC.len()] == VAULT_FILE_MAGIC {
+        // New portable format
+        let salt = data[VAULT_FILE_MAGIC.len()..header_len].to_vec();
+        let encrypted = EncryptedData::from_bytes(&data[header_len..])?;
+        Ok((salt, encrypted))
+    } else {
+        // Legacy format (no header) — use empty salt (caller must supply vault salt)
+        let encrypted = EncryptedData::from_bytes(&data)?;
+        Ok((Vec::new(), encrypted))
+    }
+}
+
 // ─── Utility functions ──────────────────────────────────────────────────────
 
 /// Secure delete: overwrite with random bytes 3 times, then unlink.
@@ -713,7 +1108,8 @@ mod tests {
     fn temp_dir() -> PathBuf {
         let dir = std::env::temp_dir().join(format!("vault_test_{}", rand::random::<u32>()));
         fs::create_dir_all(&dir).unwrap();
-        dir
+        // Canonicalize to resolve symlinks (e.g., /tmp → /private/tmp on macOS)
+        dir.canonicalize().unwrap_or(dir)
     }
 
     #[test]
@@ -857,6 +1253,120 @@ mod tests {
 
         let entries = vault.list("pass").unwrap();
         assert_eq!(entries.len(), 2);
+
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn change_protection_locked_to_readonly() {
+        let dir = temp_dir();
+        let vault = Vault::new(dir.to_str().unwrap());
+        vault.setup().unwrap();
+        vault.set_initial_passphrase("pass").unwrap();
+
+        let f = dir.join("secret.txt");
+        fs::write(&f, "secret data").unwrap();
+        let p = f.to_str().unwrap();
+
+        // Add as Locked
+        vault.add(&[p], ProtectionLevel::Locked, "pass").unwrap();
+        assert!(!f.exists());
+        assert!(dir.join("secret.txt.vault").exists());
+
+        // Change to ReadOnly
+        let result = vault.change_protection(&[p], ProtectionLevel::ReadOnly, "pass").unwrap();
+        assert_eq!(result.entries_affected, 1);
+        assert!(f.exists()); // decrypted back
+        assert!(!dir.join("secret.txt.vault").exists()); // .vault removed
+        assert_eq!(fs::read_to_string(&f).unwrap(), "secret data");
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let perms = fs::metadata(&f).unwrap().permissions();
+            assert_eq!(perms.mode() & 0o777, 0o444);
+        }
+
+        let entries = vault.list("pass").unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].protection, ProtectionLevel::ReadOnly);
+
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn change_protection_readonly_to_locked() {
+        let dir = temp_dir();
+        let vault = Vault::new(dir.to_str().unwrap());
+        vault.setup().unwrap();
+        vault.set_initial_passphrase("pass").unwrap();
+
+        let f = dir.join("doc.txt");
+        fs::write(&f, "my document").unwrap();
+        let p = f.to_str().unwrap();
+
+        // Add as ReadOnly
+        vault.add(&[p], ProtectionLevel::ReadOnly, "pass").unwrap();
+        assert!(f.exists());
+
+        // Change to Locked
+        let result = vault.change_protection(&[p], ProtectionLevel::Locked, "pass").unwrap();
+        assert_eq!(result.entries_affected, 1);
+        assert!(!f.exists()); // original deleted
+        assert!(dir.join("doc.txt.vault").exists()); // encrypted
+
+        // Verify we can still decrypt
+        vault.unlock(&[p], "pass").unwrap();
+        assert_eq!(fs::read_to_string(&f).unwrap(), "my document");
+
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn change_protection_locked_to_locked_local_metadata_only() {
+        let dir = temp_dir();
+        let vault = Vault::new(dir.to_str().unwrap());
+        vault.setup().unwrap();
+        vault.set_initial_passphrase("pass").unwrap();
+
+        let f = dir.join("data.txt");
+        fs::write(&f, "data").unwrap();
+        let p = f.to_str().unwrap();
+
+        vault.add(&[p], ProtectionLevel::Locked, "pass").unwrap();
+        let vault_file = dir.join("data.txt.vault");
+        assert!(vault_file.exists());
+        let vault_bytes_before = fs::read(&vault_file).unwrap();
+
+        // Change Locked → LockedLocal (metadata only — .vault file unchanged)
+        let result = vault.change_protection(&[p], ProtectionLevel::LockedLocal, "pass").unwrap();
+        assert_eq!(result.entries_affected, 1);
+        assert!(vault_file.exists());
+        let vault_bytes_after = fs::read(&vault_file).unwrap();
+        assert_eq!(vault_bytes_before, vault_bytes_after); // file untouched
+
+        let entries = vault.list("pass").unwrap();
+        assert_eq!(entries[0].protection, ProtectionLevel::LockedLocal);
+
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn change_protection_same_level_no_op() {
+        let dir = temp_dir();
+        let vault = Vault::new(dir.to_str().unwrap());
+        vault.setup().unwrap();
+        vault.set_initial_passphrase("pass").unwrap();
+
+        let f = dir.join("file.txt");
+        fs::write(&f, "content").unwrap();
+        let p = f.to_str().unwrap();
+
+        vault.add(&[p], ProtectionLevel::LocalOnly, "pass").unwrap();
+
+        // Change to same level — should be no-op
+        let result = vault.change_protection(&[p], ProtectionLevel::LocalOnly, "pass").unwrap();
+        assert_eq!(result.entries_affected, 0);
 
         fs::remove_dir_all(&dir).unwrap();
     }
