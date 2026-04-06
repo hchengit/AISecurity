@@ -137,8 +137,6 @@ final class MessagesScanner: @unchecked Sendable {
                     )
                     logger.alert(alert)
                     onAlert?(alert)
-                    VaultAuditLog.shared.log(.threatDetected, path: "",
-                        detail: "message threat from \(sender): \(topThreat.label)")
                 }
             }
 

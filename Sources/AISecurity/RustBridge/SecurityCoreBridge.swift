@@ -424,6 +424,32 @@ enum SecurityCoreBridge {
         )
     }
 
+    // MARK: - Protection Tier
+
+    /// Get the current protection tier from config.toml.
+    static func getProtectionTier(configPath: String? = nil) -> ProtectionTier {
+        let path = configPath ?? SecurityConfig.shared.configFilePath
+        let raw = path.withCString { sec_get_protection_tier($0) }
+        return ProtectionTier.from(rawValue: Int(raw))
+    }
+
+    /// Set the protection tier in config.toml. Returns true on success.
+    static func setProtectionTier(_ tier: ProtectionTier, configPath: String? = nil) -> Bool {
+        let path = configPath ?? SecurityConfig.shared.configFilePath
+        return path.withCString { sec_set_protection_tier($0, Int8(tier.rustValue)) }
+    }
+
+    /// Get the fully resolved effective security config from Rust.
+    static func getEffectiveConfig(configPath: String? = nil) -> EffectiveSecurityConfig? {
+        let path = configPath ?? SecurityConfig.shared.configFilePath
+        let ptr = path.withCString { sec_get_effective_config($0) }
+        guard ptr != nil else { return nil }
+        defer { sec_free_string(ptr) }
+        let json = String(cString: ptr!)
+        guard let data = json.data(using: .utf8) else { return nil }
+        return try? JSONDecoder().decode(EffectiveSecurityConfig.self, from: data)
+    }
+
     // MARK: - Helpers
 
     private static func threatsFromFFI(_ ptr: UnsafeMutablePointer<ThreatsArrayFFI>?) -> [Threat] {

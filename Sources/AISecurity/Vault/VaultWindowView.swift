@@ -55,7 +55,7 @@ struct VaultWindowView: View {
                         .font(.system(size: 64))
                         .foregroundColor(.secondary)
                     Text("Your vault is empty")
-                        .font(.title2)
+                        .font(.system(size: 20))
                     Text("Use \"Protect Files...\" from the menu bar to add files.")
                         .foregroundColor(.secondary)
                 }
@@ -76,14 +76,14 @@ struct VaultWindowView: View {
                     .buttonStyle(.plain)
 
                     Text("Select All")
-                        .font(.body)
+                        .font(.system(size: 16))
                         .foregroundColor(.secondary)
 
                     Spacer()
 
                     if !selectedPaths.isEmpty {
                         Text("\(selectedPaths.count) selected")
-                            .font(.body)
+                            .font(.system(size: 16))
                             .foregroundColor(.accentColor)
                     }
                 }
@@ -197,7 +197,7 @@ struct VaultWindowView: View {
                 .padding()
             }
         }
-        .frame(minWidth: 900, minHeight: 650)
+        .frame(minWidth: 1200, minHeight: 900)
         .sheet(isPresented: $showAuditLog) {
             VaultAuditLogView()
         }
@@ -234,7 +234,7 @@ struct VaultWindowView: View {
             Image(systemName: icon)
                 .foregroundColor(iconColor)
             Text("\(title) (\(count))")
-                .font(.title3.bold())
+                .font(.system(size: 18, weight: .bold))
             Spacer()
         }
         .padding(.top, 8)
@@ -270,10 +270,10 @@ struct VaultWindowView: View {
             // File name + path
             VStack(alignment: .leading, spacing: 2) {
                 Text((entry.originalPath as NSString).lastPathComponent)
-                    .font(.title3)
+                    .font(.system(size: 17))
                     .lineLimit(1)
                 Text(shortenedFolder((entry.originalPath as NSString).deletingLastPathComponent))
-                    .font(.body)
+                    .font(.system(size: 15))
                     .foregroundColor(.secondary)
                     .lineLimit(1)
             }
@@ -285,9 +285,9 @@ struct VaultWindowView: View {
 
             // Size
             Text(formatSize(entry.sizeBytes))
-                .font(.body)
+                .font(.system(size: 15))
                 .foregroundColor(.secondary)
-                .frame(width: 80, alignment: .trailing)
+                .frame(width: 90, alignment: .trailing)
         }
         .padding(.vertical, 6)
         .contentShape(Rectangle())
@@ -322,12 +322,12 @@ struct VaultWindowView: View {
     @ViewBuilder
     private func badge(_ text: String, color: Color) -> some View {
         Text(text)
-            .font(.callout.bold())
+            .font(.system(size: 14, weight: .bold))
             .padding(.horizontal, 8)
             .padding(.vertical, 4)
             .background(color.opacity(0.2))
             .foregroundColor(color)
-            .clipShape(RoundedRectangle(cornerRadius: 4))
+            .clipShape(RoundedRectangle(cornerRadius: 5))
     }
 
     // MARK: - Actions
@@ -682,7 +682,7 @@ struct VaultAuditLogView: View {
 
     private let eventTypes = ["All", "FILE_ADDED", "FILE_REMOVED", "FILE_MOVED", "FILE_DELETED",
                               "PROTECTION_CHANGED", "FILE_UNLOCKED", "FILE_LOCKED",
-                              "FILE_MODIFIED", "UNAUTHORIZED_ACCESS", "THREAT_DETECTED",
+                              "FILE_MODIFIED", "UNAUTHORIZED_ACCESS",
                               "PASSPHRASE_CHANGED"]
 
     var filteredEntries: [VaultAuditLog.AuditEntry] {
@@ -721,24 +721,24 @@ struct VaultAuditLogView: View {
                     VStack(alignment: .leading, spacing: 4) {
                         HStack {
                             Text(entry.event)
-                                .font(.caption.bold())
+                                .font(.system(size: 15, weight: .bold))
                                 .padding(.horizontal, 6)
                                 .padding(.vertical, 2)
                                 .background(colorForEvent(entry.event).opacity(0.2))
                                 .cornerRadius(4)
                             Text(formatTimestamp(entry.timestamp))
-                                .font(.body)
+                                .font(.system(size: 16))
                                 .foregroundColor(.secondary)
                         }
                         if !entry.path.isEmpty {
                             Text(entry.path)
-                                .font(.body)
+                                .font(.system(size: 16))
                                 .lineLimit(1)
                                 .truncationMode(.middle)
                         }
                         if !entry.detail.isEmpty {
                             Text(entry.detail)
-                                .font(.body)
+                                .font(.system(size: 16))
                                 .foregroundColor(.secondary)
                                 .lineLimit(2)
                         }
@@ -748,7 +748,7 @@ struct VaultAuditLogView: View {
                 .listStyle(.plain)
             }
         }
-        .frame(minWidth: 800, minHeight: 550)
+        .frame(minWidth: 1200, idealWidth: 1400, minHeight: 800, idealHeight: 1000)
         .onAppear {
             entries = VaultAuditLog.shared.getEntries(limit: 500)
         }

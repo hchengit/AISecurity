@@ -15,6 +15,13 @@
 # Env override: MACSEC_MODE
 mode = "PRODUCTION"
 
+# User-facing protection tier (switchable from menu bar):
+#   relaxed  = baseline safety net, minimal interruption
+#   balanced = recommended — block critical, ask about medium
+#   strict   = maximum enforcement, everything monitored
+# Env override: MACSEC_PROTECTION_TIER
+protection_tier = "balanced"
+
 [paths]
 # Base directory for logs, quarantine, state files
 # Env override: MACSEC_SECURITY_DIR
@@ -106,6 +113,8 @@ max_log_age_days = 90
 # ]
 
 [always_forbidden]
+# These are security floor controls — always active regardless of tier.
+# Disabling them here is silently ignored.
 wallet_key_access = true
 credit_card_transmission = true
 ssn_transmission = true
@@ -115,3 +124,18 @@ keychain_dump = true
 env_file_upload = true
 private_pem_key_upload = true
 turbotax_upload = true
+
+# [overrides]
+# Optional: override specific controls within the selected tier.
+# Only set what you want to change — omitted values use tier defaults.
+# Floor controls cannot be weakened (silently ignored).
+#
+# clipboard_monitoring_enabled = false
+# clipboard_interval_ms = 10000
+# email_intent_enabled = false
+# email_intent_threshold = 4
+# messages_scanning_enabled = false
+# messages_scan_interval_ms = 120000
+# scheduled_scan_enabled = false
+# scheduled_scan_interval_hours = 24
+# auto_quarantine = false

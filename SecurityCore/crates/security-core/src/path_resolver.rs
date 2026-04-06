@@ -59,6 +59,18 @@ impl PathResolver {
         }
     }
 
+    pub fn downloads_dir(&self) -> String {
+        format!("{}/Downloads", self.home)
+    }
+
+    pub fn desktop_dir(&self) -> String {
+        format!("{}/Desktop", self.home)
+    }
+
+    pub fn documents_dir(&self) -> String {
+        format!("{}/Documents", self.home)
+    }
+
     /// Default directories to monitor for new files.
     pub fn default_monitored_dirs(&self) -> Vec<String> {
         vec![

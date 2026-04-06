@@ -15,8 +15,12 @@ final class SecurityDaemon: ObservableObject {
     @Published var messagesScanned = 0
     @Published var messageThreats = 0
     @Published var mode: SecurityMode
+    @Published var protectionTier: ProtectionTier
     @Published var scanStatusMessage: String?
     @Published var emailScannerStatus: String = "Starting..."
+
+    /// The resolved effective config from Rust. Updated on tier change.
+    private(set) var effectiveConfig: EffectiveSecurityConfig?
 
     /// Called when state changes so the menu can rebuild.
     var onStateChange: (() -> Void)?
@@ -48,6 +52,7 @@ final class SecurityDaemon: ObservableObject {
         let cfg = SecurityConfig.shared
         self.config = cfg
         self.mode = cfg.mode
+        self.protectionTier = cfg.protectionTier
     }
 
     /// Create all modules. Called once from start() or on-demand.
@@ -134,6 +139,14 @@ final class SecurityDaemon: ObservableObject {
                 self.threatCount += 1
             }
         }
+        emailScanner.onStatusUpdate = { [weak self] scanned, threats, status in
+            Task { @MainActor in
+                guard let self else { return }
+                self.emailsScanned = scanned
+                self.emailThreats = threats
+                self.emailScannerStatus = status
+            }
+        }
         emailScanner.start()
 
         // Delayed email scanner verification (5s after start) + FDA retry at 30s
@@ -180,21 +193,21 @@ final class SecurityDaemon: ObservableObject {
         }
         messagesScanner.start()
 
-        // 5. Clipboard monitor
-        if config.promptInjectionGuard.enabled {
-            startClipboardMonitor()
+        // 5. Load effective config from Rust (tier-aware settings)
+        loadEffectiveConfig()
+
+        // 5b. Clipboard monitor — use effective config if available, else fall back to direct config
+        let clipboardEnabled = effectiveConfig?.clipboardMonitoringEnabled ?? config.promptInjectionGuard.enabled
+        let clipboardMs = effectiveConfig?.clipboardIntervalMs ?? UInt64(config.promptInjectionGuard.clipboardMonitorIntervalMs)
+        if clipboardEnabled {
+            startClipboardMonitor(intervalMs: clipboardMs)
         }
 
-        // 6. Scheduled scan
-        if config.scheduledScan.enabled {
-            let intervalSecs = Double(config.scheduledScan.intervalHours) * 3600
-            let timer = DispatchSource.makeTimerSource(queue: DispatchQueue.global(qos: .utility))
-            timer.schedule(deadline: .now() + intervalSecs, repeating: intervalSecs)
-            timer.setEventHandler { [weak self] in
-                self?.runScheduledScan()
-            }
-            timer.resume()
-            scheduledScanTimer = timer
+        // 6. Scheduled scan — use effective config if available
+        let scanEnabled = effectiveConfig?.scheduledScanEnabled ?? config.scheduledScan.enabled
+        let scanHours = effectiveConfig?.scheduledScanIntervalHours ?? UInt32(config.scheduledScan.intervalHours)
+        if scanEnabled {
+            startScheduledScan(intervalHours: scanHours)
         }
 
         // 7. Self-protection monitor (watch own binary, config, logs)
@@ -232,16 +245,6 @@ final class SecurityDaemon: ObservableObject {
     }
 
     // MARK: - Clipboard Monitor
-
-    private func startClipboardMonitor() {
-        let intervalSec = Double(config.promptInjectionGuard.clipboardMonitorIntervalMs) / 1000.0
-        clipboardTimer = Timer.scheduledTimer(withTimeInterval: intervalSec, repeats: true) { [weak self] _ in
-            Task { @MainActor in
-                self?.checkClipboard()
-            }
-        }
-        logger.info("\u{1F4CB} Clipboard monitor active (every \(config.promptInjectionGuard.clipboardMonitorIntervalMs)ms)")
-    }
 
     private func checkClipboard() {
         guard let content = NSPasteboard.general.string(forType: .string),
@@ -423,5 +426,128 @@ final class SecurityDaemon: ObservableObject {
     func getRecentAlerts() -> [SecurityAlert] {
         guard modulesReady else { return [] }
         return logger.getRecentAlerts(limit: 50)
+    }
+
+    // MARK: - Protection Tier
+
+    /// Load the effective config from Rust on startup.
+    func loadEffectiveConfig() {
+        effectiveConfig = SecurityCoreBridge.getEffectiveConfig()
+        if let eff = effectiveConfig {
+            protectionTier = eff.protectionTier
+        }
+    }
+
+    /// Switch to a new protection tier at runtime.
+    /// Persists to config.toml via Rust FFI, then hot-reloads affected modules.
+    func setProtectionTier(_ tier: ProtectionTier) {
+        let oldTier = protectionTier
+        NSLog("[AISecurity] setProtectionTier called: %@ → %@", oldTier.displayName, tier.displayName)
+
+        // 1. Persist to config.toml via Rust
+        let persisted = SecurityCoreBridge.setProtectionTier(tier)
+        NSLog("[AISecurity] setProtectionTier persisted=%d", persisted ? 1 : 0)
+        guard persisted else {
+            logger?.warn("Failed to persist protection tier to config.toml")
+            return
+        }
+
+        // 2. Get the new effective config
+        let newConfig = SecurityCoreBridge.getEffectiveConfig()
+        NSLog("[AISecurity] getEffectiveConfig returned=%@", newConfig != nil ? "OK tier=\(newConfig!.protectionTier.displayName)" : "NIL")
+        guard let newConfig = newConfig else {
+            // Even if effective config fails to load, still update the tier
+            protectionTier = tier
+            logger?.warn("Failed to load effective config after tier change — tier updated anyway")
+            onStateChange?()
+            return
+        }
+
+        let oldConfig = effectiveConfig
+        effectiveConfig = newConfig
+        protectionTier = tier
+
+        // 3. Hot-reload: diff old vs new and start/stop only what changed
+        applyEffectiveConfig(old: oldConfig, new: newConfig)
+
+        logger?.info("🛡️ Protection tier changed: \(oldTier.displayName) → \(tier.displayName)")
+        onStateChange?()
+    }
+
+    /// Apply the effective config by diffing old vs new and starting/stopping modules.
+    private func applyEffectiveConfig(old: EffectiveSecurityConfig?, new: EffectiveSecurityConfig) {
+        guard modulesReady else { return }
+
+        // -- Clipboard monitor --
+        let oldClipboard = old?.clipboardMonitoringEnabled ?? config.promptInjectionGuard.enabled
+        if new.clipboardMonitoringEnabled && !oldClipboard {
+            // Start clipboard monitor
+            startClipboardMonitor(intervalMs: new.clipboardIntervalMs)
+        } else if !new.clipboardMonitoringEnabled && oldClipboard {
+            // Stop clipboard monitor
+            clipboardTimer?.invalidate()
+            clipboardTimer = nil
+            logger.info("📋 Clipboard monitor stopped (tier change)")
+        } else if new.clipboardMonitoringEnabled,
+                  let oldMs = old?.clipboardIntervalMs,
+                  new.clipboardIntervalMs != oldMs {
+            // Interval changed — restart
+            clipboardTimer?.invalidate()
+            clipboardTimer = nil
+            startClipboardMonitor(intervalMs: new.clipboardIntervalMs)
+        }
+
+        // -- Messages scanner --
+        let oldMessages = old?.messagesScanningEnabled ?? config.messagesScanner.enabled
+        if new.messagesScanningEnabled && !oldMessages {
+            messagesScanner.start()
+            logger.info("💬 Messages scanner started (tier change)")
+        } else if !new.messagesScanningEnabled && oldMessages {
+            messagesScanner.stop()
+            logger.info("💬 Messages scanner stopped (tier change)")
+        }
+
+        // -- Scheduled scan --
+        let oldScheduled = old?.scheduledScanEnabled ?? config.scheduledScan.enabled
+        if new.scheduledScanEnabled && !oldScheduled {
+            startScheduledScan(intervalHours: new.scheduledScanIntervalHours)
+        } else if !new.scheduledScanEnabled && oldScheduled {
+            scheduledScanTimer?.cancel()
+            scheduledScanTimer = nil
+            logger.info("⏰ Scheduled scan stopped (tier change)")
+        } else if new.scheduledScanEnabled,
+                  let oldHours = old?.scheduledScanIntervalHours,
+                  new.scheduledScanIntervalHours != oldHours {
+            // Interval changed — restart
+            scheduledScanTimer?.cancel()
+            scheduledScanTimer = nil
+            startScheduledScan(intervalHours: new.scheduledScanIntervalHours)
+        }
+
+        logger.info("🛡️ Effective config applied: \(new.protectionTier.displayName)")
+    }
+
+    /// Start clipboard monitor with configurable interval.
+    private func startClipboardMonitor(intervalMs: UInt64) {
+        let intervalSec = Double(intervalMs) / 1000.0
+        clipboardTimer = Timer.scheduledTimer(withTimeInterval: intervalSec, repeats: true) { [weak self] _ in
+            Task { @MainActor in
+                self?.checkClipboard()
+            }
+        }
+        logger.info("📋 Clipboard monitor active (every \(intervalMs)ms)")
+    }
+
+    /// Start scheduled scan with configurable interval.
+    private func startScheduledScan(intervalHours: UInt32) {
+        let intervalSecs = Double(intervalHours) * 3600
+        let timer = DispatchSource.makeTimerSource(queue: DispatchQueue.global(qos: .utility))
+        timer.schedule(deadline: .now() + intervalSecs, repeating: intervalSecs)
+        timer.setEventHandler { [weak self] in
+            self?.runScheduledScan()
+        }
+        timer.resume()
+        scheduledScanTimer = timer
+        logger.info("⏰ Scheduled scan active (every \(intervalHours)h)")
     }
 }

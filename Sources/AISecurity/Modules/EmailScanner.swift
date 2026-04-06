@@ -96,6 +96,9 @@ final class EmailScanner: @unchecked Sendable {
 
     // MARK: - Start / Stop
 
+    /// Callback for status updates (so daemon can refresh menu even without threats).
+    var onStatusUpdate: ((_ scanned: Int, _ threats: Int, _ status: String) -> Void)?
+
     func start() {
         guard !isRunning else { return }
         let mailDir = config.emailScanner.mailDir
@@ -124,7 +127,9 @@ final class EmailScanner: @unchecked Sendable {
             scannerStatus = "Active — waiting for new emails"
         }
 
-        // Watch for file system changes
+        // Watch for file system changes in the ENTIRE mail tree, not just top-level.
+        // Apple Mail stores .emlx in deep subdirectories (V10/.../Messages/).
+        // We still watch the top level but rely mainly on the poll timer.
         let fd = open(mailDir, O_EVTONLY)
         if fd >= 0 {
             fileDescriptor = fd
@@ -133,24 +138,23 @@ final class EmailScanner: @unchecked Sendable {
                 queue: DispatchQueue.global(qos: .utility)
             )
             src.setEventHandler { [weak self] in
-                self?.pollRecentEmails(windowMs: 300000) // 5 minutes
+                self?.pollRecentEmails(windowMs: 600_000) // 10 minutes
             }
             src.setCancelHandler { close(fd) }
             src.resume()
             source = src
         }
 
-        // Poll fallback every 60s
+        // Poll every 60s — scan emails from last 10 minutes (generous overlap)
         let timer = DispatchSource.makeTimerSource(queue: DispatchQueue.global(qos: .utility))
         timer.schedule(deadline: .now() + 60, repeating: 60)
         timer.setEventHandler { [weak self] in
-            self?.pollRecentEmails(windowMs: 300000) // 5 minutes
+            self?.pollRecentEmails(windowMs: 600_000) // 10 minutes
         }
         timer.resume()
         pollTimer = timer
 
-        // Startup scan: scan ALL emails on first launch (no prior state),
-        // otherwise scan last 30 days to catch anything missed while app was closed
+        // Startup scan: first launch → scan ALL, subsequent → scan last 30 days
         let isFirstLaunch = scannedFiles.isEmpty
         DispatchQueue.global(qos: .utility).async { [weak self] in
             if isFirstLaunch {
@@ -235,6 +239,7 @@ final class EmailScanner: @unchecked Sendable {
             if !fdaRequired {
                 fdaRequired = true
                 scannerStatus = "Inactive — FDA required (0 .emlx files found)"
+                notifyStatus()
             }
             logger.warn("\u{1F4E7} Email poll: 0 .emlx files found — FDA may not be active")
             return
@@ -243,14 +248,6 @@ final class EmailScanner: @unchecked Sendable {
         // FDA is working if we found files
         if fdaRequired {
             fdaRequired = false
-        }
-
-        // Reset daily counter at midnight
-        let today = Calendar.current.ordinality(of: .day, in: .year, for: Date()) ?? 0
-        if today != lastResetDay {
-            emailsScanned = 0
-            threatsFound = 0
-            lastResetDay = today
         }
 
         var newCount = 0
@@ -273,8 +270,15 @@ final class EmailScanner: @unchecked Sendable {
             logger.info("\u{1F4E7} Scan complete: \(emlxFiles.count) emails checked, \(emailsScanned) total scanned, \(threatsFound) threats")
         }
 
-        // Update status for UI (always, even if no new emails)
-        scannerStatus = "Active — \(emailsScanned) scanned, \(threatsFound) threats"
+        // Update status for UI — always, so the menu reflects current state
+        let lastScan = DateFormatter.localizedString(from: Date(), dateStyle: .none, timeStyle: .short)
+        scannerStatus = "Active — \(emailsScanned) scanned, \(threatsFound) threats (last: \(lastScan))"
+        notifyStatus()
+    }
+
+    /// Push status to daemon so menu bar updates even when no threats fire.
+    private func notifyStatus() {
+        onStatusUpdate?(emailsScanned, threatsFound, scannerStatus)
     }
 
     // MARK: - Scan Email
@@ -380,8 +384,6 @@ final class EmailScanner: @unchecked Sendable {
             )
             logger.alert(alert)
             onAlert?(alert)
-            VaultAuditLog.shared.log(.threatDetected, path: filePath,
-                detail: "email threat: \(confirmedThreats.map(\.label).joined(separator: ", ")) from \(from)")
         } else if !warnings.isEmpty {
             logger.warn("\u{26A0}\u{FE0F} Suspicious email from \(from.isEmpty ? "unknown" : from): \(subject)")
         } else {

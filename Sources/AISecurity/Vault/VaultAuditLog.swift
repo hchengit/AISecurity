@@ -19,9 +19,6 @@ final class VaultAuditLog {
         case fileModified = "FILE_MODIFIED"
         case unauthorizedAccess = "UNAUTHORIZED_ACCESS"
         case passphraseChanged = "PASSPHRASE_CHANGED"
-        case emailScanned = "EMAIL_SCANNED"
-        case messageScanned = "MESSAGE_SCANNED"
-        case threatDetected = "THREAT_DETECTED"
     }
 
     struct AuditEntry: Codable {

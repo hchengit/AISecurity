@@ -1,11 +1,156 @@
 import Foundation
 import TOMLKit
 
-/// Security operating mode — mirrors SecurityMode in security.config.js
+/// Security operating mode — deployment context (set by developer/deployer).
 enum SecurityMode: String, Codable, Sendable {
     case production  = "PRODUCTION"   // Maximum security — all alerts, auto-quarantine
     case testing     = "TESTING"      // Alert but do NOT quarantine
     case development = "DEVELOPMENT"  // Logging only
+}
+
+/// User-facing protection tier — monitoring aggressiveness (set by end user).
+/// Orthogonal to SecurityMode: mode = deployment context, tier = user preference.
+enum ProtectionTier: String, Codable, Sendable, CaseIterable {
+    case relaxed  = "relaxed"    // Baseline safety net, minimal interruption
+    case balanced = "balanced"   // Recommended default — block critical, ask about medium
+    case strict   = "strict"     // Maximum enforcement, everything monitored
+
+    /// Map from Rust FFI value (0/1/2).
+    static func from(rawValue: Int) -> ProtectionTier {
+        switch rawValue {
+        case 0:  return .relaxed
+        case 2:  return .strict
+        default: return .balanced
+        }
+    }
+
+    /// Numeric value to pass to Rust FFI.
+    var rustValue: Int {
+        switch self {
+        case .relaxed:  return 0
+        case .balanced: return 1
+        case .strict:   return 2
+        }
+    }
+
+    /// Int-based tag for NSMenuItem (needed since raw type is now String).
+    var menuTag: Int { rustValue }
+
+    var displayName: String {
+        switch self {
+        case .relaxed:  return "Relaxed"
+        case .balanced: return "Balanced"
+        case .strict:   return "Strict"
+        }
+    }
+
+    var description: String {
+        switch self {
+        case .relaxed:  return "Baseline monitoring"
+        case .balanced: return "Recommended"
+        case .strict:   return "Maximum enforcement"
+        }
+    }
+
+    var menuBarIcon: String {
+        switch self {
+        case .relaxed:  return "shield"
+        case .balanced: return "shield.lefthalf.filled"
+        case .strict:   return "lock.shield"
+        }
+    }
+
+    /// Whether this tier is less restrictive than another.
+    func isDowngradeFrom(_ other: ProtectionTier) -> Bool {
+        rustValue < other.rustValue
+    }
+}
+
+/// Fully resolved security configuration from Rust.
+/// Produced by `SecurityCoreBridge.getEffectiveConfig()`.
+/// All tier logic, overrides, and floor enforcement are already applied.
+struct EffectiveSecurityConfig: Codable, Sendable {
+    // Tier identity
+    let protectionTier: ProtectionTier
+
+    // Quarantine
+    let autoQuarantine: Bool
+    let autoQuarantineMinSeverity: String  // "CRITICAL", "HIGH", etc.
+
+    // File watcher
+    let fileWatcherEnabled: Bool
+    let fileWatcherDirectories: [String]
+
+    // Clipboard
+    let clipboardMonitoringEnabled: Bool
+    let clipboardIntervalMs: UInt64
+
+    // Email
+    let emailScanningEnabled: Bool
+    let emailIntentEnabled: Bool
+    let emailIntentThreshold: UInt8
+    let emailIntentThresholdWhitelisted: UInt8
+
+    // Messages
+    let messagesScanningEnabled: Bool
+    let messagesScanIntervalMs: UInt64
+
+    // Scheduled scan
+    let scheduledScanEnabled: Bool
+    let scheduledScanIntervalHours: UInt32
+
+    // Notifications
+    let notificationsEnabled: Bool
+    let notificationsExternalMinSeverity: String
+
+    // Whitelist
+    let whitelistBypassMaxSeverity: String
+
+    // Dangerous extensions
+    let dangerousExtAction: String  // "log_only", "flag_notify", "auto_quarantine"
+
+    // Protected paths
+    let protectedPathScope: String  // "core", "default", "default_plus_custom"
+
+    // Floor controls (always true)
+    let alwaysForbiddenEnabled: Bool
+    let vaultRateLimitingEnabled: Bool
+    let selfProtectionEnabled: Bool
+    let autoReencryptEnabled: Bool
+    let autoReencryptTimeoutMinutes: UInt32
+    let startupScanEnabled: Bool
+    let auditLoggingEnabled: Bool
+
+    // JSON key mapping: Rust uses snake_case, Swift uses camelCase
+    enum CodingKeys: String, CodingKey {
+        case protectionTier = "protection_tier"
+        case autoQuarantine = "auto_quarantine"
+        case autoQuarantineMinSeverity = "auto_quarantine_min_severity"
+        case fileWatcherEnabled = "file_watcher_enabled"
+        case fileWatcherDirectories = "file_watcher_directories"
+        case clipboardMonitoringEnabled = "clipboard_monitoring_enabled"
+        case clipboardIntervalMs = "clipboard_interval_ms"
+        case emailScanningEnabled = "email_scanning_enabled"
+        case emailIntentEnabled = "email_intent_enabled"
+        case emailIntentThreshold = "email_intent_threshold"
+        case emailIntentThresholdWhitelisted = "email_intent_threshold_whitelisted"
+        case messagesScanningEnabled = "messages_scanning_enabled"
+        case messagesScanIntervalMs = "messages_scan_interval_ms"
+        case scheduledScanEnabled = "scheduled_scan_enabled"
+        case scheduledScanIntervalHours = "scheduled_scan_interval_hours"
+        case notificationsEnabled = "notifications_enabled"
+        case notificationsExternalMinSeverity = "notifications_external_min_severity"
+        case whitelistBypassMaxSeverity = "whitelist_bypass_max_severity"
+        case dangerousExtAction = "dangerous_ext_action"
+        case protectedPathScope = "protected_path_scope"
+        case alwaysForbiddenEnabled = "always_forbidden_enabled"
+        case vaultRateLimitingEnabled = "vault_rate_limiting_enabled"
+        case selfProtectionEnabled = "self_protection_enabled"
+        case autoReencryptEnabled = "auto_reencrypt_enabled"
+        case autoReencryptTimeoutMinutes = "auto_reencrypt_timeout_minutes"
+        case startupScanEnabled = "startup_scan_enabled"
+        case auditLoggingEnabled = "audit_logging_enabled"
+    }
 }
 
 /// Central configuration — reads from config.toml with env var overrides.
@@ -16,8 +161,10 @@ struct SecurityConfig: Sendable {
     static let shared = SecurityConfig()
 
     let mode: SecurityMode
+    let protectionTier: ProtectionTier
     let home: String
     let securityDir: String
+    let configFilePath: String
     let paths: PathResolver
 
     // ── File Watcher ────────────────────────────────────────────────
@@ -237,6 +384,16 @@ struct SecurityConfig: Sendable {
         let tomlMode = Self.tomlString(toml, "general", "mode")
         self.mode = SecurityMode(rawValue: envMode ?? tomlMode ?? "PRODUCTION") ?? .production
 
+        // Protection Tier: env > toml > default (balanced)
+        let envTier = ProcessInfo.processInfo.environment["MACSEC_PROTECTION_TIER"]
+        let tomlTier = Self.tomlString(toml, "general", "protection_tier")
+        let tierStr = envTier ?? tomlTier ?? "balanced"
+        switch tierStr.lowercased() {
+        case "relaxed":  self.protectionTier = .relaxed
+        case "strict":   self.protectionTier = .strict
+        default:         self.protectionTier = .balanced
+        }
+
         // PathResolver handles all path resolution with env > toml > default
         let resolver = PathResolver(
             configSecurityDir: Self.tomlString(toml, "paths", "security_dir"),
@@ -251,6 +408,7 @@ struct SecurityConfig: Sendable {
         self.paths = resolver
         self.home = resolver.home
         self.securityDir = resolver.securityDir
+        self.configFilePath = (resolver.securityDir as NSString).appendingPathComponent("config.toml")
 
         // ── File Watcher ────────────────────────────────────────────
         self.fileWatcher = FileWatcherConfig(

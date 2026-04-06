@@ -37,9 +37,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         // Create status item in applicationDidFinishLaunching (run loop is active)
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         if let button = statusItem.button {
-            button.image = NSImage(systemSymbolName: "shield.lefthalf.filled",
-                                   accessibilityDescription: "AISecurity")
-            button.image?.isTemplate = true   // adapts to light/dark menu bar
+            updateMenuBarIcon(tier: SecurityConfig.shared.protectionTier, hasThreats: false)
             diag += "[\(Date())] Status item created. Frame: \(button.frame)\n"
         } else {
             diag += "[\(Date())] ERROR: statusItem.button is nil!\n"
@@ -176,19 +174,19 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     private func rebuildMenu() {
         guard let daemon = daemon else { return }
         let menu = NSMenu()
-        menu.autoenablesItems = false
 
         let running = daemon.isRunning
         let hasFDA = checkFDA()
 
-        // Status header with FDA indicator
+        // Status header with tier and FDA indicator
+        let tierName = daemon.protectionTier.displayName
         let statusText: String
         if !running {
             statusText = "\u{23F8}\u{FE0F}  AISecurity Sleeping"
         } else if hasFDA {
-            statusText = "\u{1F7E2}  AISecurity Active"
+            statusText = "\u{1F7E2}  AISecurity — \(tierName)"
         } else {
-            statusText = "\u{1F534}  AISecurity Active (No FDA)"
+            statusText = "\u{1F534}  AISecurity — \(tierName) (No FDA)"
         }
         let header = NSMenuItem(title: statusText, action: nil, keyEquivalent: "")
         header.isEnabled = false
@@ -200,6 +198,23 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             fdaWarn.isEnabled = false
             menu.addItem(fdaWarn)
         }
+
+        menu.addItem(.separator())
+
+        // -- Protection Level selector (submenu) --
+        let tierSubmenu = NSMenu()
+        for tier in ProtectionTier.allCases {
+            let isCurrent = (tier == daemon.protectionTier)
+            let title = "\(tier.displayName) — \(tier.description)"
+            let item = NSMenuItem(title: title, action: #selector(changeTier(_:)), keyEquivalent: "")
+            item.target = self
+            item.tag = tier.menuTag
+            item.state = isCurrent ? .on : .off
+            tierSubmenu.addItem(item)
+        }
+        let tierParent = NSMenuItem(title: "\u{1F6E1} Protection: \(daemon.protectionTier.displayName)", action: nil, keyEquivalent: "")
+        tierParent.submenu = tierSubmenu
+        menu.addItem(tierParent)
 
         menu.addItem(.separator())
 
@@ -251,22 +266,73 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
         statusItem.menu = menu
 
-        // Update icon — SF Symbols adapt to light/dark menu bar
-        let symbolName = daemon.threatCount > 0
-            ? "exclamationmark.shield.fill"
-            : "shield.lefthalf.filled"
-        if let img = NSImage(systemSymbolName: symbolName,
-                             accessibilityDescription: "AISecurity") {
-            img.isTemplate = true
-            statusItem.button?.image = img
+        // Update icon — tier-aware + threat indicator, colored & sized for visibility
+        debugLog("rebuildMenu: tier=\(daemon.protectionTier.displayName) threats=\(daemon.threatCount)")
+        updateMenuBarIcon(tier: daemon.protectionTier, hasThreats: daemon.threatCount > 0)
+    }
+
+    /// Render the menu bar icon: always shows tier symbol + color. Threats = red tint instead.
+    private func updateMenuBarIcon(tier: ProtectionTier, hasThreats: Bool) {
+        guard let button = statusItem?.button else { return }
+
+        // Always use the tier-specific symbol so the icon visually changes per tier
+        let symbolName: String
+        switch tier {
+        case .relaxed:  symbolName = "shield"                 // outline
+        case .balanced: symbolName = "shield.lefthalf.filled" // half-filled
+        case .strict:   symbolName = "lock.shield"            // lock + shield
         }
+
+        // Color: tier color normally, red if threats active
+        let tintColor: NSColor
+        if hasThreats {
+            tintColor = .systemRed
+        } else {
+            switch tier {
+            case .relaxed:  tintColor = .systemGreen
+            case .balanced: tintColor = .systemBlue
+            case .strict:   tintColor = .systemOrange
+            }
+        }
+
+        let pointSize: CGFloat = 20
+        let config = NSImage.SymbolConfiguration(pointSize: pointSize, weight: .medium)
+
+        let baseImage: NSImage
+        if let img = NSImage(systemSymbolName: symbolName, accessibilityDescription: "AISecurity") {
+            baseImage = img
+        } else if let img = NSImage(systemSymbolName: "shield.fill", accessibilityDescription: "AISecurity") {
+            // Fallback if symbol not found on this macOS version
+            baseImage = img
+        } else {
+            return
+        }
+
+        let sized = baseImage.withSymbolConfiguration(config) ?? baseImage
+
+        // Draw tinted — NOT template, we want the color to show
+        let drawSize = sized.size
+        let tinted = NSImage(size: drawSize, flipped: false) { rect in
+            sized.draw(in: rect)
+            tintColor.set()
+            rect.fill(using: .sourceAtop)
+            return true
+        }
+        tinted.isTemplate = false
+        button.image = tinted
     }
 
     private func addStat(_ menu: NSMenu, _ title: String) {
         let item = NSMenuItem(title: title, action: nil, keyEquivalent: "")
-        item.isEnabled = true
+        // With autoenablesItems=true (default), action:nil items get greyed out.
+        // Re-enable autoenablesItems=false at menu level is risky for other items.
+        // Instead, use a dummy action to keep them visually enabled.
+        item.action = #selector(noOp)
+        item.target = self
         menu.addItem(item)
     }
+
+    @objc func noOp() { /* dummy action so stat items appear enabled in menu */ }
 
     private func makeItem(_ title: String, action: Selector) -> NSMenuItem {
         let item = NSMenuItem(title: title, action: action, keyEquivalent: "")
@@ -294,6 +360,104 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     @objc private func showLog() {
         guard let daemon = daemon else { return }
         WindowManager.shared.showLog(config: daemon.config)
+    }
+
+    /// Retained auth gate for tier change — must survive until callback fires.
+    private var tierAuthGate: AuthGate?
+
+    @objc func changeTier(_ sender: NSMenuItem) {
+        guard let daemon = daemon else { return }
+        let newTier = ProtectionTier.from(rawValue: sender.tag)
+        guard newTier != daemon.protectionTier else { return }
+
+        let isDowngrade = newTier.isDowngradeFrom(daemon.protectionTier)
+
+        if isDowngrade {
+            // Downgrade = risky action → require vault passphrase
+            NSApplication.shared.activate(ignoringOtherApps: true)
+            guard ensureVaultSetup() else { return }
+
+            VaultManager.shared.withAuth(
+                reason: "Authenticate to lower protection level",
+                passphrasePrompt: "Enter Vault Passphrase to Downgrade",
+                onPassphrase: { [weak self] _ in
+                    // Passphrase verified — show confirmation
+                    let alert = NSAlert()
+                    alert.messageText = "Switch to \(newTier.displayName) protection?"
+                    alert.informativeText = self?.downgradeDescription(from: daemon.protectionTier, to: newTier) ?? ""
+                    alert.alertStyle = .warning
+                    alert.addButton(withTitle: "Switch to \(newTier.displayName)")
+                    alert.addButton(withTitle: "Cancel")
+                    let response = alert.runModal()
+                    guard response == .alertFirstButtonReturn else { return }
+
+                    daemon.setProtectionTier(newTier)
+                    self?.rebuildMenu()
+                },
+                onCancel: { },
+                onError: { msg in
+                    let alert = NSAlert()
+                    alert.messageText = "Authentication Failed"
+                    alert.informativeText = msg
+                    alert.alertStyle = .warning
+                    alert.runModal()
+                }
+            )
+        } else {
+            // Upgrade = safe action → Touch ID / system password (fast)
+            tierAuthGate = AuthGate(sessionTimeoutSeconds: 60)
+            tierAuthGate?.authenticate(reason: "Authenticate to increase protection level") { [weak self] success, error in
+                defer { self?.tierAuthGate = nil }
+                guard success else {
+                    if let error = error {
+                        let alert = NSAlert()
+                        alert.messageText = "Authentication Failed"
+                        alert.informativeText = error
+                        alert.alertStyle = .warning
+                        alert.runModal()
+                    }
+                    return
+                }
+                daemon.setProtectionTier(newTier)
+                self?.rebuildMenu()
+            }
+        }
+    }
+
+    private func debugLog(_ msg: String) {
+        let path = (NSHomeDirectory() as NSString).appendingPathComponent(".mac-security/logs/tier-debug.log")
+        let line = "[\(Date())] \(msg)\n"
+        if let fh = FileHandle(forWritingAtPath: path) {
+            fh.seekToEndOfFile()
+            fh.write(line.data(using: .utf8)!)
+            fh.closeFile()
+        } else {
+            try? line.write(toFile: path, atomically: true, encoding: .utf8)
+        }
+    }
+
+    /// Describe what gets disabled when downgrading tiers.
+    private func downgradeDescription(from: ProtectionTier, to: ProtectionTier) -> String {
+        var disabled: [String] = []
+
+        if from != .relaxed && to == .relaxed {
+            disabled.append("Clipboard monitoring")
+            disabled.append("Messages scanning")
+            disabled.append("Scheduled full scans")
+            disabled.append("Auto-quarantine")
+            disabled.append("Email intent analysis")
+        } else if from == .strict && to == .balanced {
+            disabled.append("Desktop directory monitoring")
+            disabled.append("Auto-quarantine for HIGH severity (kept for CRITICAL)")
+            disabled.append("Faster clipboard polling (5s instead of 2s)")
+        }
+
+        var text = "This will disable:\n"
+        for item in disabled {
+            text += "  • \(item)\n"
+        }
+        text += "\nAlways-forbidden protections (SSN, credit cards, wallet keys, etc.) remain active regardless of tier."
+        return text
     }
 
     @objc private func resumeAgent() {
@@ -594,7 +758,7 @@ final class WindowManager {
         let controller = NSHostingController(rootView: view)
         let window = NSWindow(contentViewController: controller)
         window.title = "AISecurity \u{2014} Recent Threats"
-        window.setContentSize(NSSize(width: 850, height: 650))
+        window.setContentSize(NSSize(width: 1200, height: 900))
         window.styleMask = [.titled, .closable, .resizable, .miniaturizable]
         window.center()
         window.makeKeyAndOrderFront(nil)
@@ -612,7 +776,7 @@ final class WindowManager {
         let controller = NSHostingController(rootView: view)
         let window = NSWindow(contentViewController: controller)
         window.title = "AISecurity \u{2014} Vault"
-        window.setContentSize(NSSize(width: 900, height: 650))
+        window.setContentSize(NSSize(width: 1200, height: 900))
         window.styleMask = [.titled, .closable, .resizable, .miniaturizable]
         window.center()
         window.makeKeyAndOrderFront(nil)
@@ -630,7 +794,7 @@ final class WindowManager {
         let controller = NSHostingController(rootView: view)
         let window = NSWindow(contentViewController: controller)
         window.title = "AISecurity \u{2014} Activity Log"
-        window.setContentSize(NSSize(width: 850, height: 550))
+        window.setContentSize(NSSize(width: 1200, height: 900))
         window.styleMask = [.titled, .closable, .resizable, .miniaturizable]
         window.center()
         window.makeKeyAndOrderFront(nil)
@@ -656,9 +820,9 @@ struct ThreatsWindowView: View {
         VStack(spacing: 0) {
             HStack {
                 Image(systemName: "shield.lefthalf.filled")
-                    .font(.title2)
+                    .font(.title)
                 Text("Recent Threats")
-                    .font(.title2.bold())
+                    .font(.title.bold())
                 Spacer()
                 if !visibleAlerts.isEmpty {
                     Button("Clear All") {
@@ -666,14 +830,17 @@ struct ThreatsWindowView: View {
                         Self.saveDismissed(dismissed)
                     }
                     .buttonStyle(.bordered)
+                    .controlSize(.large)
 
                     Button(action: { showDeleteConfirm = true }) {
                         Label("Delete All", systemImage: "trash")
                     }
                     .buttonStyle(.bordered)
+                    .controlSize(.large)
                     .tint(.red)
                 }
                 Text("\(visibleAlerts.count) alert\(visibleAlerts.count == 1 ? "" : "s")")
+                    .font(.title3)
                     .foregroundColor(.secondary)
             }
             .padding()
@@ -753,7 +920,7 @@ struct ThreatsWindowView: View {
                 }
             }
         }
-        .frame(minWidth: 560, minHeight: 350)
+        .frame(minWidth: 1000, minHeight: 600)
         .alert("Delete All Threats?", isPresented: $showDeleteConfirm) {
             Button("Cancel", role: .cancel) {}
             Button("Delete All", role: .destructive) {
@@ -803,43 +970,43 @@ struct ThreatsWindowView: View {
     @ViewBuilder
     private func threatRow(_ alert: SecurityAlert) -> some View {
         let typeInfo = alertTypeLabel(alert.type)
-        VStack(alignment: .leading, spacing: 4) {
+        VStack(alignment: .leading, spacing: 6) {
             HStack {
                 SeverityBadge(severity: alert.severity)
                 Text(typeInfo.text)
-                    .font(.headline.monospaced())
+                    .font(.system(size: 18, weight: .bold, design: .monospaced))
                 Spacer()
                 Text(formatTimestamp(alert.timestamp))
-                    .font(.caption)
+                    .font(.system(size: 16))
                     .foregroundColor(.secondary)
             }
             Text(alert.message)
-                .font(.body)
+                .font(.system(size: 17))
                 .lineLimit(3)
             if let from = alert.from ?? alert.sender, !from.isEmpty {
                 Label(from, systemImage: "person")
-                    .font(.caption)
+                    .font(.system(size: 16))
                     .foregroundColor(.secondary)
             }
             if let subject = alert.subject, !subject.isEmpty {
                 Label(subject, systemImage: "envelope")
-                    .font(.caption)
+                    .font(.system(size: 16))
                     .foregroundColor(.secondary)
             }
             if let preview = alert.preview, !preview.isEmpty {
                 Text(preview)
-                    .font(.caption)
+                    .font(.system(size: 15))
                     .foregroundColor(.secondary)
                     .lineLimit(2)
             }
             if let filePath = alert.filePath,
                alert.type != "EMAIL_THREAT_DETECTED" && alert.type != "MESSAGE_THREAT_DETECTED" {
                 Label((filePath as NSString).lastPathComponent, systemImage: "doc")
-                    .font(.caption)
+                    .font(.system(size: 16))
                     .foregroundColor(.secondary)
             }
         }
-        .padding(.vertical, 4)
+        .padding(.vertical, 6)
     }
 
     // MARK: - Actions
@@ -965,14 +1132,15 @@ struct LogWindowView: View {
         VStack(spacing: 0) {
             HStack {
                 Image(systemName: "doc.text")
-                    .font(.title2)
+                    .font(.title)
                 Text("Activity Log")
-                    .font(.title2.bold())
+                    .font(.title.bold())
                 Spacer()
                 Button("Refresh") {
                     DispatchQueue.main.async { loadLog() }
                 }
                 .buttonStyle(.bordered)
+                .controlSize(.large)
             }
             .padding()
             .background(.bar)
@@ -982,24 +1150,25 @@ struct LogWindowView: View {
             if logLines.isEmpty {
                 Spacer()
                 Text("No log entries yet.")
+                    .font(.title3)
                     .foregroundColor(.secondary)
                 Spacer()
             } else {
                 ScrollView {
-                    LazyVStack(alignment: .leading, spacing: 2) {
+                    LazyVStack(alignment: .leading, spacing: 4) {
                         ForEach(Array(logLines.enumerated()), id: \.offset) { i, line in
                             Text(line)
-                                .font(.system(.caption, design: .monospaced))
+                                .font(.system(size: 17, design: .monospaced))
                                 .textSelection(.enabled)
-                                .padding(.horizontal, 8)
+                                .padding(.horizontal, 12)
                         }
                     }
-                    .padding(.vertical, 8)
-                    .id(refreshID) // force ScrollView to re-render
+                    .padding(.vertical, 12)
+                    .id(refreshID)
                 }
             }
         }
-        .frame(minWidth: 700, minHeight: 350)
+        .frame(minWidth: 1000, minHeight: 600)
         .onAppear { loadLog() }
     }
 
@@ -1024,12 +1193,12 @@ struct SeverityBadge: View {
 
     var body: some View {
         Text(severity.rawValue)
-            .font(.caption2.bold())
-            .padding(.horizontal, 6)
-            .padding(.vertical, 2)
+            .font(.system(size: 15, weight: .bold))
+            .padding(.horizontal, 8)
+            .padding(.vertical, 3)
             .background(color.opacity(0.2))
             .foregroundColor(color)
-            .clipShape(RoundedRectangle(cornerRadius: 4))
+            .clipShape(RoundedRectangle(cornerRadius: 5))
     }
 
     private var color: Color {

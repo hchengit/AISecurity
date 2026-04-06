@@ -294,4 +294,27 @@ void sec_free_vault_result(struct VaultResultFFI *ptr);
  */
 void sec_free_vault_entries(struct VaultEntryArrayFFI *ptr);
 
+/**
+ * Get the current protection tier from config. Returns 0=relaxed, 1=balanced, 2=strict.
+ * Returns -1 on error.
+ */
+int8_t sec_get_protection_tier(const char *configPath);
+
+/**
+ * Set the protection tier in config.toml. tier: 0=relaxed, 1=balanced, 2=strict.
+ * Returns true on success.
+ */
+bool sec_set_protection_tier(const char *configPath, int8_t tier);
+
+/**
+ * Get the fully resolved effective security config as a JSON string.
+ * Caller must free with sec_free_string.
+ */
+char *sec_get_effective_config(const char *configPath);
+
+/**
+ * Free a string returned by sec_get_effective_config.
+ */
+void sec_free_string(char *ptr);
+
 #endif  /* SECURITY_CORE_H */

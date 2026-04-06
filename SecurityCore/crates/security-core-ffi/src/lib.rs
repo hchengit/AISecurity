@@ -7,6 +7,7 @@
 use std::ffi::{c_char, CStr, CString};
 use std::ptr;
 
+use security_core::config::{self, ProtectionTier, SecurityConfig};
 use security_core::email_patterns;
 use security_core::vault;
 use security_core::file_sanitizer;
@@ -797,6 +798,68 @@ pub extern "C" fn sec_free_vault_entries(ptr: *mut VaultEntryArrayFFI) {
                 free_c_string(item.encrypted_at);
             }
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Protection Tier & Effective Config
+// ---------------------------------------------------------------------------
+
+/// Get the current protection tier from config. Returns 0=relaxed, 1=balanced, 2=strict.
+/// Returns -1 on error.
+#[no_mangle]
+pub extern "C" fn sec_get_protection_tier(config_path: *const c_char) -> i8 {
+    let path = match unsafe { from_c_str(config_path) } {
+        Some(p) => p,
+        None => return 1, // default to balanced
+    };
+    let config = SecurityConfig::load_or_default(&path);
+    config.general.protection_tier.level() as i8
+}
+
+/// Set the protection tier in config.toml. tier: 0=relaxed, 1=balanced, 2=strict.
+/// Returns true on success.
+#[no_mangle]
+pub extern "C" fn sec_set_protection_tier(config_path: *const c_char, tier: i8) -> bool {
+    let path = match unsafe { from_c_str(config_path) } {
+        Some(p) => p,
+        None => return false,
+    };
+    let tier = match tier {
+        0 => ProtectionTier::Relaxed,
+        1 => ProtectionTier::Balanced,
+        2 => ProtectionTier::Strict,
+        _ => return false,
+    };
+    config::set_protection_tier_in_file(&path, tier).is_ok()
+}
+
+/// Get the fully resolved effective security config as a JSON string.
+/// Caller must free with sec_free_string.
+#[no_mangle]
+pub extern "C" fn sec_get_effective_config(config_path: *const c_char) -> *mut c_char {
+    let path = match unsafe { from_c_str(config_path) } {
+        Some(p) => p,
+        None => {
+            let config = SecurityConfig::default();
+            let eff = config.resolve_effective();
+            return serde_json::to_string(&eff)
+                .map(|s| to_c_string(&s))
+                .unwrap_or(ptr::null_mut());
+        }
+    };
+    let config = SecurityConfig::load_or_default(&path);
+    let eff = config.resolve_effective();
+    serde_json::to_string(&eff)
+        .map(|s| to_c_string(&s))
+        .unwrap_or(ptr::null_mut())
+}
+
+/// Free a string returned by sec_get_effective_config.
+#[no_mangle]
+pub extern "C" fn sec_free_string(ptr: *mut c_char) {
+    if !ptr.is_null() {
+        unsafe { drop(CString::from_raw(ptr)); }
     }
 }
 
