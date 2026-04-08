@@ -3,6 +3,13 @@ import Foundation
 /// Apple Mail email scanner — monitors ~/Library/Mail/ for new .emlx files.
 /// Pattern matching now backed by Rust security-core via FFI.
 /// .emlx parsing, file watching, attachment checks, and whitelist logic stay in Swift.
+///
+/// Scanning strategy:
+/// - Only scans Inbox and custom folders (skips Deleted, Junk, Sent, Drafts)
+/// - Tracks unique emails scanned (not rescan count)
+/// - Deduplicates via file path (same file modified = update, not new count)
+/// - Polls every 60s for emails from the last 10 minutes
+/// - Startup: scans last 30 days (or ALL on first launch)
 final class EmailScanner: @unchecked Sendable {
 
     typealias AlertHandler = @Sendable (SecurityAlert) -> Void
@@ -15,13 +22,13 @@ final class EmailScanner: @unchecked Sendable {
     private var source: DispatchSourceFileSystemObject?
     private var fileDescriptor: Int32 = -1
     private var pollTimer: DispatchSourceTimer?
-    private var scannedFiles: [String: TimeInterval] = [:] // path → mtime
+    private var scannedFiles: [String: TimeInterval] = [:] // path → mtime (last scanned)
     private let stateFile: String
     private(set) var isRunning = false
+    /// Unique emails scanned (each email counted once, rescans don't inflate)
     private(set) var emailsScanned = 0
     private(set) var threatsFound = 0
     private(set) var byCategory: [String: Int] = [:]
-    private var lastResetDay: Int = 0  // day-of-year for daily counter reset
     var onAlert: AlertHandler?
 
     /// Whether Full Disk Access appears to be missing (cannot traverse Mail directory).
@@ -29,37 +36,42 @@ final class EmailScanner: @unchecked Sendable {
     /// Human-readable status for menu bar display.
     private(set) var scannerStatus: String = "Starting..."
 
+    /// Callback for status updates (so daemon can refresh menu even without threats).
+    var onStatusUpdate: ((_ scanned: Int, _ threats: Int, _ status: String) -> Void)?
+
+    // MARK: - Mailbox filtering
+
+    /// Mailbox name prefixes to SKIP (lowercased, compared against .mbox dir names).
+    /// Covers Apple Mail, Gmail, Exchange/Outlook, and generic IMAP names.
+    /// Only Inbox and custom user folders are scanned.
+    private let skippedMailboxPrefixes: [String] = [
+        "deleted", "trash", "bin",           // deleted/trash
+        "junk", "spam",                       // junk/spam
+        "sent", "outbox",                     // sent mail
+        "drafts", "draft",                    // drafts
+        "archive", "all mail",                // archive
+        "[gmail]",                            // Gmail container (has Sent/Trash/Spam inside)
+        "sync issues",                        // Exchange sync artifacts
+        "notes",                              // Apple Notes sync folder
+    ]
+
     // MARK: - Attachment checks (stay in Swift — operate on parsed email structure)
 
     private let dangerousExtensions: Set<String>
     private let suspiciousAttachmentNames: [NSRegularExpression]
 
-    // MARK: - Trusted domains
-
-    private let trustedDomains: Set<String> = [
-        "americanexpress.com", "welcome.americanexpress.com",
-        "turbotax.intuit.com", "intuit.com",
-        "dell.com", "americas.comm.dell.com",
-        "chase.com", "jpmorgan.com",
-        "wellsfargo.com", "bankofamerica.com",
-        "apple.com", "id.apple.com",
-        "amazon.com", "amazon-ppe.com",
-        "paypal.com",
-        "google.com", "accounts.google.com",
-        "microsoft.com", "microsoftonline.com",
-        "substack.com",
-        "followmyhealth.com",
-        "coinbureau.com",
-        "gemini.com", "news.gemini.com",
-    ]
+    // Trusted domains list replaced by dynamic SenderHistory tracking.
+    // Sender trust is now earned through clean email history, not a static list.
 
     // MARK: - Init
 
     private let whitelist: SenderWhitelist
+    private let senderHistory: SenderHistory
 
-    init(logger: SecurityLogger, whitelist: SenderWhitelist? = nil) {
+    init(logger: SecurityLogger, whitelist: SenderWhitelist? = nil, senderHistory: SenderHistory? = nil) {
         self.logger = logger
         self.whitelist = whitelist ?? SenderWhitelist(securityDir: SecurityConfig.shared.securityDir)
+        self.senderHistory = senderHistory ?? SenderHistory(securityDir: SecurityConfig.shared.securityDir)
         self.stateFile = (SecurityConfig.shared.securityDir as NSString)
             .appendingPathComponent("email-scanned-state.json")
         // Load previously scanned files so we don't re-alert on restart
@@ -72,11 +84,16 @@ final class EmailScanner: @unchecked Sendable {
             if dict.count < beforeCount {
                 logger.info("\u{1F4E7} Pruned \(beforeCount - dict.count) old email scan entries (>90 days)")
             }
+            // Also prune entries from skipped mailboxes (cleanup from before filtering was added)
+            let beforeMailboxPrune = dict.count
+            let prefixes = skippedMailboxPrefixes
+            dict = dict.filter { path, _ in !Self.isSkippedMailbox(path: path, prefixes: prefixes) }
+            if dict.count < beforeMailboxPrune {
+                logger.info("\u{1F4E7} Pruned \(beforeMailboxPrune - dict.count) entries from skipped mailboxes (Deleted/Junk/Sent)")
+            }
             self.scannedFiles = dict
-            // Restore cumulative scan count from persisted state
+            // Unique emails = number of paths in the state dict
             self.emailsScanned = dict.count
-            // Initialize lastResetDay to today so the daily reset doesn't zero our restored count
-            self.lastResetDay = Calendar.current.ordinality(of: .day, in: .year, for: Date()) ?? 0
         }
 
         self.dangerousExtensions = [
@@ -95,9 +112,6 @@ final class EmailScanner: @unchecked Sendable {
     }
 
     // MARK: - Start / Stop
-
-    /// Callback for status updates (so daemon can refresh menu even without threats).
-    var onStatusUpdate: ((_ scanned: Int, _ threats: Int, _ status: String) -> Void)?
 
     func start() {
         guard !isRunning else { return }
@@ -118,7 +132,7 @@ final class EmailScanner: @unchecked Sendable {
             "emlxCount": "\(fdaCheck.emlxCount)"
         ])
         if fdaCheck.canTraverse && fdaCheck.emlxCount > 0 {
-            scannerStatus = "Active — \(fdaCheck.emlxCount) emails found"
+            scannerStatus = "Active — \(fdaCheck.emlxCount) inbox emails found"
         } else if !fdaCheck.canTraverse {
             fdaRequired = true
             scannerStatus = "Inactive — FDA required"
@@ -127,9 +141,7 @@ final class EmailScanner: @unchecked Sendable {
             scannerStatus = "Active — waiting for new emails"
         }
 
-        // Watch for file system changes in the ENTIRE mail tree, not just top-level.
-        // Apple Mail stores .emlx in deep subdirectories (V10/.../Messages/).
-        // We still watch the top level but rely mainly on the poll timer.
+        // Watch for file system changes
         let fd = open(mailDir, O_EVTONLY)
         if fd >= 0 {
             fileDescriptor = fd
@@ -154,7 +166,9 @@ final class EmailScanner: @unchecked Sendable {
         timer.resume()
         pollTimer = timer
 
-        // Startup scan: first launch → scan ALL, subsequent → scan last 30 days
+        // Startup scan: first launch → scan ALL, subsequent → scan last 30 days.
+        // Sender history persists across restarts, so trusted senders are recognized immediately.
+        // On the very first run (no history), some false positives may appear until trust builds.
         let isFirstLaunch = scannedFiles.isEmpty
         DispatchQueue.global(qos: .utility).async { [weak self] in
             if isFirstLaunch {
@@ -164,7 +178,7 @@ final class EmailScanner: @unchecked Sendable {
             }
         }
 
-        logger.info("\u{1F4E7} Email Scanner started", data: ["mailDir": mailDir, "mode": fd >= 0 ? "watch+poll" : "poll-only"])
+        logger.info("\u{1F4E7} Email Scanner started (skipping: Deleted, Junk, Sent, Drafts)", data: ["mailDir": mailDir, "mode": fd >= 0 ? "watch+poll" : "poll-only"])
     }
 
     /// Diagnostic check: can we actually read the Mail directory tree?
@@ -185,7 +199,6 @@ final class EmailScanner: @unchecked Sendable {
                     do {
                         let sub = try fm.contentsOfDirectory(atPath: subdir)
                         emlxCount += sub.filter { $0.hasSuffix(".emlx") }.count
-                        // Also check one level deeper (Mailboxes/)
                         for subItem in sub {
                             let deeper = (subdir as NSString).appendingPathComponent(subItem)
                             var isDir: ObjCBool = false
@@ -215,6 +228,24 @@ final class EmailScanner: @unchecked Sendable {
         if fileDescriptor >= 0 { close(fileDescriptor); fileDescriptor = -1 }
         isRunning = false
         logger.info("\u{1F4E7} Email Scanner stopped")
+    }
+
+    // MARK: - Mailbox Filtering
+
+    /// Check if a file path is inside a skipped mailbox (Deleted, Junk, Sent, Drafts).
+    private static func isSkippedMailbox(path: String, prefixes: [String]) -> Bool {
+        // Extract all .mbox directory names from the path
+        let lower = path.lowercased()
+        let components = lower.components(separatedBy: "/")
+        for comp in components where comp.hasSuffix(".mbox") {
+            let mboxName = String(comp.dropLast(".mbox".count))
+            for prefix in prefixes {
+                if mboxName.hasPrefix(prefix) {
+                    return true
+                }
+            }
+        }
+        return false
     }
 
     // MARK: - State Persistence
@@ -251,23 +282,38 @@ final class EmailScanner: @unchecked Sendable {
         }
 
         var newCount = 0
+        var rescanCount = 0
         for filePath in emlxFiles {
             guard let attrs = try? FileManager.default.attributesOfItem(atPath: filePath),
                   let mdate = attrs[.modificationDate] as? Date else { continue }
             let mtime = mdate.timeIntervalSince1970
             guard mtime >= cutoff else { continue }
-            guard scannedFiles[filePath] != mtime else { continue }
-            scannedFiles[filePath] = mtime
-            scanEmail(filePath)
-            newCount += 1
+
+            let existingMtime = scannedFiles[filePath]
+            if existingMtime == nil {
+                // Brand new email — never seen before
+                scannedFiles[filePath] = mtime
+                scanEmail(filePath)
+                emailsScanned += 1
+                newCount += 1
+            } else if existingMtime != mtime {
+                // File modified (e.g. marked read/unread) — rescan for threats but don't inflate count
+                scannedFiles[filePath] = mtime
+                scanEmail(filePath)
+                rescanCount += 1
+            }
+            // If existingMtime == mtime: skip entirely (already scanned, unchanged)
         }
 
-        if newCount > 0 {
-            logger.info("\u{1F4E7} Poll scanned \(newCount) new/updated email(s), total: \(emailsScanned), threats: \(threatsFound)")
+        if newCount > 0 || rescanCount > 0 {
+            var logMsg = "\u{1F4E7} Poll: \(newCount) new"
+            if rescanCount > 0 { logMsg += ", \(rescanCount) updated" }
+            logMsg += " — unique: \(emailsScanned), threats: \(threatsFound), domains: \(senderHistory.domainCount)"
+            logger.info(logMsg)
             persistScannedFiles()
+            senderHistory.persistIfDirty()
         } else if windowMs == 0 || windowMs > 600000 {
-            // Log even when no new emails on large scans to confirm it ran
-            logger.info("\u{1F4E7} Scan complete: \(emlxFiles.count) emails checked, \(emailsScanned) total scanned, \(threatsFound) threats")
+            logger.info("\u{1F4E7} Scan complete: \(emlxFiles.count) emails checked, \(emailsScanned) unique scanned, \(threatsFound) threats")
         }
 
         // Update status for UI — always, so the menu reflects current state
@@ -286,8 +332,6 @@ final class EmailScanner: @unchecked Sendable {
     private func scanEmail(_ filePath: String) {
         guard FileManager.default.fileExists(atPath: filePath),
               let email = parseEmlx(filePath) else { return }
-
-        emailsScanned += 1
 
         var threats: [(type: String, label: String, severity: SeverityLevel, category: String)] = []
         var warnings: [(label: String, detail: String)] = []
@@ -333,39 +377,90 @@ final class EmailScanner: @unchecked Sendable {
             }
         }
 
-        // 7-Layer Intent Validation (now via Rust through ThreatIntentParser)
+        // ── Intent Analysis (Rust) ──────────────────────────────────
         let intent = intentParser.parse(fullText, channel: .email)
-        let senderDomain = extractSenderDomain(from)
-        let isTrusted = senderDomain.map { sd in
-            trustedDomains.contains(where: { sd == $0 || sd.hasSuffix("." + $0) })
-        } ?? false
 
-        let layerThreshold = isTrusted ? 5 : 3
+        // Hard bypass: ALWAYS alert regardless of sender trust or auth.
+        // These indicate actual weaponized content, not just keyword matches.
+        let hardBypassCategories: Set<String> = [
+            "dangerous_attachment", "malware_dropper", "prompt_injection"
+        ]
 
-        let bypassCategories: Set<String> = ["dangerous_attachment", "malicious_url", "prompt_injection", "malware_dropper", "crypto_scam"]
+        // Soft bypass: alert for unknown/suspicious senders, suppress for trusted.
+        // Crypto newsletters legitimately discuss bitcoin; banks mention SSN/CC in context.
+        let softBypassCategories: Set<String> = [
+            "sensitive_data_request", "crypto_scam", "malicious_url"
+        ]
 
+        // Pattern threats confirmed if: hard bypass, soft bypass, or intent fires
         var confirmedThreats = threats.filter { t in
-            bypassCategories.contains(t.category) || intent.layersFired >= layerThreshold
+            hardBypassCategories.contains(t.category) ||
+            softBypassCategories.contains(t.category) ||
+            intent.isThreat
         }
 
-        if intent.isThreat && confirmedThreats.isEmpty && intent.layersFired >= layerThreshold {
+        // Intent-only synthetic threat (no pattern match, but intent score high)
+        if intent.isThreat && confirmedThreats.isEmpty {
             confirmedThreats.append((
                 type: "intent_detected",
-                label: "Intent: \(intent.label)",
+                label: "Intent: \(intent.label) [\(intent.score)%]",
                 severity: intent.severity ?? .medium,
                 category: "intent_detected"
             ))
         }
 
-        // Apply whitelist policy
-        let senderPolicy = whitelist.policy(for: from)
-        if senderPolicy.isWhitelisted {
+        // ── Sender History + Auth — contextual trust ────────────────
+        let senderDomain = extractSenderDomain(from) ?? ""
+        let trust = senderHistory.trustLevel(for: senderDomain)
+        let auth = email.auth
+
+        // Trusted sender (10+ clean emails, <5% threat rate):
+        // Only flag hard bypass (dangerous attachments, malware, prompt injection).
+        // Soft bypass (crypto_scam, sensitive_data, malicious_url) suppressed for trusted.
+        if trust == .trusted {
             confirmedThreats = confirmedThreats.filter { t in
-                senderPolicy.shouldAlert(category: t.category, intentLayers: intent.layersFired)
+                hardBypassCategories.contains(t.category)
             }
         }
 
-        // Report
+        // Fully authenticated (SPF+DKIM+DMARC pass):
+        // Suppress intent-only threats from authenticated senders
+        if auth.allPass && !confirmedThreats.isEmpty {
+            confirmedThreats = confirmedThreats.filter { t in
+                hardBypassCategories.contains(t.category) ||
+                softBypassCategories.contains(t.category) ||
+                t.category != "intent_detected"
+            }
+        }
+
+        // First-contact heuristic: unknown sender + urgency + credential request = boost
+        if trust == .unknown && !confirmedThreats.isEmpty {
+            // Unknown sender with threats — keep them all, this is suspicious
+        } else if trust == .unknown && intent.layers.l1 && intent.layers.l6 {
+            // First contact + credential harvest + urgency — flag even below threshold
+            confirmedThreats.append((
+                type: "first_contact_risk",
+                label: "First-contact sender with credential request + urgency",
+                severity: .high,
+                category: "intent_detected"
+            ))
+        }
+
+        // Apply whitelist policy (final pass)
+        let senderPolicy = whitelist.policy(for: from)
+        if senderPolicy.isWhitelisted {
+            confirmedThreats = confirmedThreats.filter { t in
+                senderPolicy.shouldAlert(category: t.category, intentLayers: intent.score)
+            }
+        }
+
+        // ── Record sender history ───────────────────────────────────
+        let hadThreat = !confirmedThreats.isEmpty
+        if !senderDomain.isEmpty {
+            senderHistory.recordScan(domain: senderDomain, hadThreat: hadThreat)
+        }
+
+        // ── Report ──────────────────────────────────────────────────
         if !confirmedThreats.isEmpty {
             threatsFound += 1
 
@@ -386,19 +481,59 @@ final class EmailScanner: @unchecked Sendable {
             onAlert?(alert)
         } else if !warnings.isEmpty {
             logger.warn("\u{26A0}\u{FE0F} Suspicious email from \(from.isEmpty ? "unknown" : from): \(subject)")
-        } else {
-            let sender = from.isEmpty ? "unknown" : from
-            let subj = subject.isEmpty ? "(no subject)" : subject
-            logger.info("\u{2705} Email clean: \(sender) — \(subj)")
         }
+        // Clean emails: no log (reduces log noise significantly)
     }
 
     // MARK: - .emlx Parser (stays in Swift — file I/O)
+
+    enum AuthStatus { case pass, fail, softfail, none }
+
+    struct AuthResult {
+        var spf: AuthStatus = .none
+        var dkim: AuthStatus = .none
+        var dmarc: AuthStatus = .none
+
+        var allPass: Bool { spf == .pass && dkim == .pass && dmarc == .pass }
+        var anyFail: Bool { spf == .fail || dkim == .fail || dmarc == .fail }
+    }
 
     private struct ParsedEmail {
         var headers: [String: String] = [:]
         var body: String = ""
         var attachmentNames: [String] = []
+        var auth: AuthResult = AuthResult()
+    }
+
+    /// Parse Authentication-Results header for SPF/DKIM/DMARC status.
+    private func parseAuthResults(_ headerValue: String?) -> AuthResult {
+        guard let header = headerValue?.lowercased() else { return AuthResult() }
+        var result = AuthResult()
+
+        // SPF
+        if header.contains("spf=pass") {
+            result.spf = .pass
+        } else if header.contains("spf=fail") || header.contains("spf=hardfail") {
+            result.spf = .fail
+        } else if header.contains("spf=softfail") {
+            result.spf = .softfail
+        }
+
+        // DKIM
+        if header.contains("dkim=pass") {
+            result.dkim = .pass
+        } else if header.contains("dkim=fail") {
+            result.dkim = .fail
+        }
+
+        // DMARC
+        if header.contains("dmarc=pass") {
+            result.dmarc = .pass
+        } else if header.contains("dmarc=fail") {
+            result.dmarc = .fail
+        }
+
+        return result
     }
 
     private func parseEmlx(_ filePath: String) -> ParsedEmail? {
@@ -442,6 +577,9 @@ final class EmailScanner: @unchecked Sendable {
 
         email.body = bodySection
 
+        // Parse authentication results (SPF/DKIM/DMARC)
+        email.auth = parseAuthResults(email.headers["authentication-results"])
+
         // Extract attachment filenames
         let attachPattern = try? NSRegularExpression(
             pattern: #"Content-Disposition:.*?filename[*]?=["']?([^"';\r\n]+)"#,
@@ -469,6 +607,16 @@ final class EmailScanner: @unchecked Sendable {
 
         func walk(_ d: String) {
             guard files.count < limit else { return }
+
+            // Skip mailboxes we don't care about (Deleted, Junk, Sent, Drafts, etc.)
+            let dirName = (d as NSString).lastPathComponent.lowercased()
+            if dirName.hasSuffix(".mbox") {
+                let mboxName = String(dirName.dropLast(".mbox".count))
+                for prefix in skippedMailboxPrefixes {
+                    if mboxName.hasPrefix(prefix) { return }
+                }
+            }
+
             do {
                 let entries = try fm.contentsOfDirectory(atPath: d)
                 for entry in entries {

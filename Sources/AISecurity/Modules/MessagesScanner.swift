@@ -95,12 +95,13 @@ final class MessagesScanner: @unchecked Sendable {
                 let rawThreats = analyzeMessage(text)
                 let intent = intentParser.parse(text, channel: .sms)
 
+                // Score-based: SMS threshold is 50/100 (lower than email's 70)
                 var threats = rawThreats.filter { t in
-                    ["malicious_url", "crypto_scam"].contains(t.category) || intent.layersFired >= 2
+                    ["malicious_url", "crypto_scam"].contains(t.category) || intent.isThreat
                 }
 
                 if intent.isThreat && threats.isEmpty {
-                    threats.append((type: "intent_detected", label: "Intent: \(intent.label)",
+                    threats.append((type: "intent_detected", label: "Intent: \(intent.label) [\(intent.score)%]",
                                     severity: intent.severity ?? .medium, category: "intent_detected"))
                 }
 
@@ -109,7 +110,7 @@ final class MessagesScanner: @unchecked Sendable {
                 let senderPolicy = whitelist.policy(for: sender)
                 if senderPolicy.isWhitelisted {
                     threats = threats.filter { t in
-                        senderPolicy.shouldAlert(category: t.category, intentLayers: intent.layersFired)
+                        senderPolicy.shouldAlert(category: t.category, intentLayers: intent.score)
                     }
                 }
 

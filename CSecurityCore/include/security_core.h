@@ -17,6 +17,7 @@ typedef struct IntentResultFFI {
     bool is_threat;
     int8_t severity;
     uint8_t layers_fired;
+    uint32_t score;
     bool l1;
     bool l2;
     bool l3;

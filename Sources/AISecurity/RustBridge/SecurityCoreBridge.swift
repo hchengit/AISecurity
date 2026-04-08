@@ -20,6 +20,7 @@ enum SecurityCoreBridge {
         let isThreat: Bool
         let severity: SeverityLevel?
         let layersFired: Int
+        let score: Int  // weighted score out of 100
         let layers: Layers
         let label: String
         let confidence: String
@@ -37,7 +38,7 @@ enum SecurityCoreBridge {
     static func parseIntent(_ text: String, channel: Channel = .email) -> IntentResult {
         let ptr = text.withCString { sec_parse_intent($0, channel.rawValue) }
         guard let r = ptr else {
-            return IntentResult(isThreat: false, severity: nil, layersFired: 0,
+            return IntentResult(isThreat: false, severity: nil, layersFired: 0, score: 0,
                                 layers: .init(l1: false, l2: false, l3: false, l4: false, l5: false, l6: false),
                                 label: "", confidence: "0%")
         }
@@ -47,6 +48,7 @@ enum SecurityCoreBridge {
             isThreat: p.is_threat,
             severity: severityFromI8(p.severity),
             layersFired: Int(p.layers_fired),
+            score: Int(p.score),
             layers: .init(l1: p.l1, l2: p.l2, l3: p.l3, l4: p.l4, l5: p.l5, l6: p.l6),
             label: safeString(p.label),
             confidence: safeString(p.confidence)

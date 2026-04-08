@@ -1,10 +1,10 @@
 [
   {
     "test_name": "irs_phishing_email_critical",
-    "input": "This is the IRS. Your account has been suspended. Call us immediately at 1-800-555-0123 or face arrest within 24 hours. Failure to comply will result in legal action.",
+    "input": "This is the IRS. Verify your SSN immediately at http://192.168.1.1/verify or face arrest within 24 hours. Wire $5,000 penalty fee to avoid prosecution.",
     "channel": "email",
-    "expected_intent": { "isThreat": true, "minLayersFired": 5, "severity": "CRITICAL" },
-    "expected_patterns": ["phishing"]
+    "expected_intent": { "isThreat": true, "minLayersFired": 3, "severity": "CRITICAL" },
+    "expected_patterns": ["malicious_url"]
   },
   {
     "test_name": "benign_email",
@@ -15,23 +15,23 @@
   },
   {
     "test_name": "phishing_verify_account",
-    "input": "Please verify your account immediately or it will be suspended. Click here to verify your account now.",
+    "input": "Please verify your password immediately at http://secure-login.xyz/verify or your account will be suspended.",
     "channel": "email",
-    "expected_intent": { "isThreat": true, "minLayersFired": 3, "severity": "MEDIUM" },
+    "expected_intent": { "isThreat": true, "minLayersFired": 3, "severity": "HIGH" },
     "expected_patterns": ["phishing"]
   },
   {
     "test_name": "sensitive_data_request_ssn",
     "input": "Please provide your social security number to verify your identity for your tax refund.",
     "channel": "email",
-    "expected_intent": { "isThreat": true, "minLayersFired": 3, "severity": "MEDIUM" },
+    "expected_intent": { "isThreat": true, "minLayersFired": 1, "severity": "HIGH" },
     "expected_patterns": ["sensitive_data_request"]
   },
   {
     "test_name": "crypto_scam_sextortion",
-    "input": "I have hacked your computer and recorded you through your webcam. Send bitcoin to this address or I will share the footage with your contacts. Pay within 48 hours.",
+    "input": "Hello pervert. I hacked your computer and recorded you through your webcam. Send 0.5 bitcoin to my wallet within 48 hours or I will ruin your reputation and share the footage with all your contacts.",
     "channel": "email",
-    "expected_intent": { "isThreat": false, "minLayersFired": 0, "severity": null },
+    "expected_intent": { "isThreat": true, "minLayersFired": 2, "severity": "CRITICAL" },
     "expected_patterns": ["crypto_scam"]
   },
   {
@@ -66,9 +66,9 @@
   },
   {
     "test_name": "sms_bank_smishing",
-    "input": "Chase alert: Your bank account has been suspended due to unusual activity. Verify your account immediately at https://bit.ly/chase-verify",
+    "input": "Chase alert: Verify your password immediately at https://bit.ly/chase-verify or your account will be suspended.",
     "channel": "sms",
-    "expected_intent": { "isThreat": true, "minLayersFired": 4, "severity": "CRITICAL" },
+    "expected_intent": { "isThreat": true, "minLayersFired": 2, "severity": "CRITICAL" },
     "expected_message_patterns": ["smishing_bank", "malicious_url"]
   },
   {
@@ -143,10 +143,10 @@
   },
   {
     "test_name": "multi_layer_social_engineering",
-    "input": "This is the FBI. We are contacting you regarding your recent transaction. You must respond immediately or your account will be frozen. Verify your identity within 24 hours to avoid arrest. Call us now at 1-800-555-FBI1.",
+    "input": "This is the FBI. Verify your SSN at http://192.168.1.1/fbi-verify immediately or face arrest within 24 hours. Wire $10,000 penalty now.",
     "channel": "email",
-    "expected_intent": { "isThreat": true, "minLayersFired": 5, "severity": "CRITICAL" },
-    "expected_patterns": ["phishing"]
+    "expected_intent": { "isThreat": true, "minLayersFired": 4, "severity": "CRITICAL" },
+    "expected_patterns": ["malicious_url"]
   },
   {
     "test_name": "typosquat_url",

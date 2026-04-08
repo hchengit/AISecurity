@@ -53,6 +53,22 @@ final class SecurityLogger: @unchecked Sendable {
         NotificationManager.shared.send(securityAlert)
     }
 
+    /// Clear all email threat alerts from the log (used before rescan to avoid stale entries).
+    func clearEmailAlerts() {
+        queue.sync {
+            guard FileManager.default.fileExists(atPath: alertFile),
+                  let data = FileManager.default.contents(atPath: alertFile),
+                  let content = String(data: data, encoding: .utf8) else { return }
+            // Keep non-email alerts, remove EMAIL_THREAT_DETECTED entries
+            let filtered = content
+                .split(separator: "\n", omittingEmptySubsequences: true)
+                .filter { !$0.contains("EMAIL_THREAT_DETECTED") }
+                .joined(separator: "\n")
+            let output = filtered.isEmpty ? "" : filtered + "\n"
+            try? output.data(using: .utf8)?.write(to: URL(fileURLWithPath: alertFile))
+        }
+    }
+
     func getRecentAlerts(limit: Int = 50) -> [SecurityAlert] {
         guard FileManager.default.fileExists(atPath: alertFile),
               let data = FileManager.default.contents(atPath: alertFile),

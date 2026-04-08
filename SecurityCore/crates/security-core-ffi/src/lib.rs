@@ -27,6 +27,7 @@ pub struct IntentResultFFI {
     pub is_threat: bool,
     pub severity: i8, // -1 = none, 1..4 = Low..Critical
     pub layers_fired: u8,
+    pub score: u32, // weighted score out of 100
     pub l1: bool,
     pub l2: bool,
     pub l3: bool,
@@ -153,6 +154,7 @@ pub extern "C" fn sec_parse_intent(text: *const c_char, channel: u8) -> *mut Int
         is_threat: r.is_threat,
         severity: severity_to_i8(r.severity),
         layers_fired: r.layers_fired,
+        score: r.score,
         l1: r.layers.l1,
         l2: r.layers.l2,
         l3: r.layers.l3,
