@@ -17,6 +17,8 @@ pub mod aad {
     pub const WHITELIST: &[u8] = b"securitycore:whitelist:v1";
     pub const ALERT_LOG: &[u8] = b"securitycore:alertlog:v1";
     pub const GENERAL: &[u8] = b"securitycore:general:v1";
+    pub const MODEL_MANIFEST: &[u8] = b"securitycore:models:v1";
+    pub const POLICY_AUDIT: &[u8] = b"securitycore:policyaudit:v1";
 }
 
 /// Default passphrase — must be overridden in production.

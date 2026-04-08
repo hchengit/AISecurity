@@ -7,8 +7,11 @@
 use std::ffi::{c_char, CStr, CString};
 use std::ptr;
 
+use security_core::command_policy;
 use security_core::config::{self, ProtectionTier, SecurityConfig};
 use security_core::email_patterns;
+use security_core::model_verifier;
+use security_core::policy_audit::PolicyAuditLog;
 use security_core::vault;
 use security_core::file_sanitizer;
 use security_core::message_patterns;
@@ -800,6 +803,133 @@ pub extern "C" fn sec_free_vault_entries(ptr: *mut VaultEntryArrayFFI) {
                 free_c_string(item.encrypted_at);
             }
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Command Policy Engine
+// ---------------------------------------------------------------------------
+
+/// FFI-safe command check result.
+#[repr(C)]
+pub struct CommandCheckResultFFI {
+    pub decision: i8,          // 0=allow, 1=deny, 2=ask
+    pub reason: *mut c_char,
+    pub matched_rule: *mut c_char,
+}
+
+/// Check a command against the policy. Caller must free with sec_free_command_check.
+#[no_mangle]
+pub extern "C" fn sec_command_check(
+    command: *const c_char,
+    config_path: *const c_char,
+) -> *mut CommandCheckResultFFI {
+    let command = match unsafe { from_c_str(command) } {
+        Some(c) => c,
+        None => return ptr::null_mut(),
+    };
+    let config = match unsafe { from_c_str(config_path) } {
+        Some(p) => SecurityConfig::load_or_default(&p),
+        None => SecurityConfig::default(),
+    };
+
+    let result = command_policy::check_command(&command, &config.command_policy);
+    let decision = match result.decision {
+        command_policy::Decision::Allow => 0i8,
+        command_policy::Decision::Deny => 1i8,
+        command_policy::Decision::Ask => 2i8,
+    };
+
+    Box::into_raw(Box::new(CommandCheckResultFFI {
+        decision,
+        reason: to_c_string(&result.reason),
+        matched_rule: to_c_string(&result.matched_rule),
+    }))
+}
+
+/// Free a CommandCheckResultFFI.
+#[no_mangle]
+pub extern "C" fn sec_free_command_check(ptr: *mut CommandCheckResultFFI) {
+    if ptr.is_null() { return; }
+    unsafe {
+        let r = Box::from_raw(ptr);
+        free_c_string(r.reason);
+        free_c_string(r.matched_rule);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Model Weight Verifier
+// ---------------------------------------------------------------------------
+
+/// Verify all tracked model files. Returns JSON array of results.
+/// Caller must free with sec_free_string.
+#[no_mangle]
+pub extern "C" fn sec_model_verify(security_dir: *const c_char) -> *mut c_char {
+    let dir = match unsafe { from_c_str(security_dir) } {
+        Some(d) => d,
+        None => return ptr::null_mut(),
+    };
+    let config = SecurityConfig::load_or_default(
+        &format!("{}/config.toml", dir),
+    );
+    let paths = if config.model_verification.paths.is_empty() {
+        model_verifier::default_model_paths()
+    } else {
+        config.model_verification.paths.clone()
+    };
+    let results = model_verifier::verify_models(&dir, &paths);
+    serde_json::to_string(&results)
+        .map(|s| to_c_string(&s))
+        .unwrap_or(ptr::null_mut())
+}
+
+/// Scan for model files and return JSON array of discovered paths.
+/// Caller must free with sec_free_string.
+#[no_mangle]
+pub extern "C" fn sec_model_scan(security_dir: *const c_char) -> *mut c_char {
+    let dir = match unsafe { from_c_str(security_dir) } {
+        Some(d) => d,
+        None => return ptr::null_mut(),
+    };
+    let config = SecurityConfig::load_or_default(
+        &format!("{}/config.toml", dir),
+    );
+    let paths = if config.model_verification.paths.is_empty() {
+        model_verifier::default_model_paths()
+    } else {
+        config.model_verification.paths.clone()
+    };
+    let found = model_verifier::scan_model_directories(&paths);
+    serde_json::to_string(&found)
+        .map(|s| to_c_string(&s))
+        .unwrap_or(ptr::null_mut())
+}
+
+// ---------------------------------------------------------------------------
+// Policy Audit Log
+// ---------------------------------------------------------------------------
+
+/// Log a policy decision. entry_json is a JSON string of PolicyDecision.
+/// Returns true on success.
+#[no_mangle]
+pub extern "C" fn sec_audit_log(
+    security_dir: *const c_char,
+    entry_json: *const c_char,
+) -> bool {
+    let dir = match unsafe { from_c_str(security_dir) } {
+        Some(d) => d,
+        None => return false,
+    };
+    let json = match unsafe { from_c_str(entry_json) } {
+        Some(j) => j,
+        None => return false,
+    };
+    let entry: PolicyAuditLog = PolicyAuditLog::new(&dir);
+    if let Ok(decision) = serde_json::from_str::<security_core::policy_audit::PolicyDecision>(&json) {
+        entry.log(&decision).is_ok()
+    } else {
+        false
     }
 }
 

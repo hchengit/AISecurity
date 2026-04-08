@@ -386,6 +386,26 @@ pub struct SecurityConfig {
     pub notifications: NotificationsConfig,
     pub protected_paths: ProtectedPathsConfig,
     pub overrides: OverridesConfig,
+    pub model_verification: ModelVerificationConfig,
+    pub command_policy: crate::command_policy::CommandPolicyConfig,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct ModelVerificationConfig {
+    pub enabled: bool,
+    pub paths: Vec<String>,
+    pub verify_interval_hours: u32,
+}
+
+impl Default for ModelVerificationConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            paths: Vec::new(), // empty = use default model directories
+            verify_interval_hours: 6,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -463,6 +483,8 @@ impl Default for SecurityConfig {
             notifications: NotificationsConfig::default(),
             protected_paths: ProtectedPathsConfig::default(),
             overrides: OverridesConfig::default(),
+            model_verification: ModelVerificationConfig::default(),
+            command_policy: crate::command_policy::CommandPolicyConfig::default(),
         }
     }
 }

@@ -133,6 +133,15 @@ typedef bool (*VaultProgressCallback)(uint32_t current,
                                       void *user_data);
 
 /**
+ * FFI-safe command check result.
+ */
+typedef struct CommandCheckResultFFI {
+    int8_t decision;
+    char *reason;
+    char *matched_rule;
+} CommandCheckResultFFI;
+
+/**
  * Initialize with an optional config path. Returns true on success.
  */
 bool sec_init(const char *configPath);
@@ -294,6 +303,34 @@ void sec_free_vault_result(struct VaultResultFFI *ptr);
  * Free a VaultEntryArrayFFI.
  */
 void sec_free_vault_entries(struct VaultEntryArrayFFI *ptr);
+
+/**
+ * Check a command against the policy. Caller must free with sec_free_command_check.
+ */
+struct CommandCheckResultFFI *sec_command_check(const char *command, const char *configPath);
+
+/**
+ * Free a CommandCheckResultFFI.
+ */
+void sec_free_command_check(struct CommandCheckResultFFI *ptr);
+
+/**
+ * Verify all tracked model files. Returns JSON array of results.
+ * Caller must free with sec_free_string.
+ */
+char *sec_model_verify(const char *securityDir);
+
+/**
+ * Scan for model files and return JSON array of discovered paths.
+ * Caller must free with sec_free_string.
+ */
+char *sec_model_scan(const char *securityDir);
+
+/**
+ * Log a policy decision. entry_json is a JSON string of PolicyDecision.
+ * Returns true on success.
+ */
+bool sec_audit_log(const char *securityDir, const char *entryJson);
 
 /**
  * Get the current protection tier from config. Returns 0=relaxed, 1=balanced, 2=strict.

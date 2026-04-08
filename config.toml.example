@@ -139,3 +139,22 @@ turbotax_upload = true
 # scheduled_scan_enabled = false
 # scheduled_scan_interval_hours = 24
 # auto_quarantine = false
+
+# ── Phase 13: AI Agent Threat Defense ────────────────────────────
+
+[model_verification]
+# Verify LLM model file integrity (SHA-256 hash on startup)
+enabled = true
+verify_interval_hours = 6
+# Additional model directories to scan (beyond default Ollama/LMStudio/HuggingFace/MLX)
+# paths = ["~/custom-models"]
+
+[command_policy]
+# Command policy engine: validate bash commands before execution
+enabled = true
+# Additional allowed command prefixes (beyond built-in safe list)
+# allow_prefixes = ["docker", "kubectl"]
+# Additional blocked patterns
+# deny_patterns = ["docker run --privileged"]
+# Commands that require user confirmation
+# ask_prefixes = ["brew install", "pip install"]

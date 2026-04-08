@@ -15,3 +15,6 @@ pub mod wasm_sandbox;
 pub mod tls_transport;
 pub mod process_manager;
 pub mod vault;
+pub mod policy_audit;
+pub mod model_verifier;
+pub mod command_policy;

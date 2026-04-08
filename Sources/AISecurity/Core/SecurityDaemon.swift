@@ -36,6 +36,8 @@ final class SecurityDaemon: ObservableObject {
     private(set) var watcher: FileWatcher!
     private var emailScanner: EmailScanner!
     private var messagesScanner: MessagesScanner!
+    private var processMonitor: ProcessMonitor!
+    private var tccMonitor: TCCMonitor!
     private var modulesReady = false
 
     // MARK: - Timers
@@ -71,6 +73,8 @@ final class SecurityDaemon: ObservableObject {
         // Initialize vault file tracker
         VaultManager.shared.tracker = VaultFileTracker(logger: logger)
         emailScanner = EmailScanner(logger: logger, whitelist: whitelist)
+        processMonitor = ProcessMonitor(logger: logger)
+        tccMonitor = TCCMonitor(logger: logger)
         messagesScanner = MessagesScanner(
             logger: logger,
             whitelist: whitelist,
@@ -215,7 +219,19 @@ final class SecurityDaemon: ObservableObject {
         // 7. Self-protection monitor (watch own binary, config, logs)
         startSelfProtectionMonitor()
 
-        // 8. Status file writer (every 10s)
+        // 8. Process monitor + TCC monitor (Phase 13: AI Agent Threat Defense)
+        processMonitor.start()
+        tccMonitor.start()
+
+        // 9. Model weight verification (background, on startup)
+        DispatchQueue.global(qos: .utility).async { [weak self] in
+            guard let self else { return }
+            if let json = SecurityCoreBridge.modelVerify(securityDir: self.config.securityDir) {
+                self.logger.info("\u{1F9E0} Model verification complete: \(json.prefix(200))")
+            }
+        }
+
+        // 10. Status file writer (every 10s)
         startStatusWriter()
 
         isRunning = true
@@ -233,6 +249,8 @@ final class SecurityDaemon: ObservableObject {
         watcher.stop()
         emailScanner.stop()
         messagesScanner.stop()
+        processMonitor.stop()
+        tccMonitor.stop()
         clipboardTimer?.invalidate()
         clipboardTimer = nil
         scheduledScanTimer?.cancel()

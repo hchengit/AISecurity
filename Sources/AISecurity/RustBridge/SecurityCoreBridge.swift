@@ -452,6 +452,72 @@ enum SecurityCoreBridge {
         return try? JSONDecoder().decode(EffectiveSecurityConfig.self, from: data)
     }
 
+    // MARK: - Command Policy Engine
+
+    enum CommandDecision: Int8, Sendable {
+        case allow = 0
+        case deny = 1
+        case ask = 2
+    }
+
+    struct CommandCheckResult: Sendable {
+        let decision: CommandDecision
+        let reason: String
+        let matchedRule: String
+    }
+
+    /// Check a command against the policy engine.
+    static func commandCheck(_ command: String, configPath: String? = nil) -> CommandCheckResult {
+        let path = configPath ?? SecurityConfig.shared.configFilePath
+        let ptr = command.withCString { cmd in
+            path.withCString { cfg in
+                sec_command_check(cmd, cfg)
+            }
+        }
+        guard let r = ptr else {
+            return CommandCheckResult(decision: .ask, reason: "FFI call failed", matchedRule: "error")
+        }
+        defer { sec_free_command_check(ptr) }
+        let p = r.pointee
+        return CommandCheckResult(
+            decision: CommandDecision(rawValue: p.decision) ?? .ask,
+            reason: safeString(p.reason),
+            matchedRule: safeString(p.matched_rule)
+        )
+    }
+
+    // MARK: - Model Weight Verifier
+
+    /// Verify all tracked model files. Returns JSON string of verification results.
+    static func modelVerify(securityDir: String? = nil) -> String? {
+        let dir = securityDir ?? SecurityConfig.shared.securityDir
+        let ptr = dir.withCString { sec_model_verify($0) }
+        guard ptr != nil else { return nil }
+        defer { sec_free_string(ptr) }
+        return String(cString: ptr!)
+    }
+
+    /// Scan for model files. Returns JSON string of discovered paths.
+    static func modelScan(securityDir: String? = nil) -> String? {
+        let dir = securityDir ?? SecurityConfig.shared.securityDir
+        let ptr = dir.withCString { sec_model_scan($0) }
+        guard ptr != nil else { return nil }
+        defer { sec_free_string(ptr) }
+        return String(cString: ptr!)
+    }
+
+    // MARK: - Policy Audit Log
+
+    /// Log a policy decision to the audit log.
+    static func auditLog(securityDir: String? = nil, entryJson: String) -> Bool {
+        let dir = securityDir ?? SecurityConfig.shared.securityDir
+        return dir.withCString { d in
+            entryJson.withCString { j in
+                sec_audit_log(d, j)
+            }
+        }
+    }
+
     // MARK: - Helpers
 
     private static func threatsFromFFI(_ ptr: UnsafeMutablePointer<ThreatsArrayFFI>?) -> [Threat] {
