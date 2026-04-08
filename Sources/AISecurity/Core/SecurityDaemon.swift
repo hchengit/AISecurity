@@ -145,6 +145,8 @@ final class SecurityDaemon: ObservableObject {
                 self.emailsScanned = scanned
                 self.emailThreats = threats
                 self.emailScannerStatus = status
+                // Sync total threat count from all scanners
+                self.threatCount = threats + self.messageThreats
             }
         }
         emailScanner.start()
