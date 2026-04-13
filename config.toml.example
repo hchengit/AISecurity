@@ -143,11 +143,13 @@ turbotax_upload = true
 # ── Phase 13: AI Agent Threat Defense ────────────────────────────
 
 [model_verification]
-# Verify LLM model file integrity (SHA-256 hash on startup)
+# Verify LLM model file integrity (SHA-256 hash on startup + real-time)
 enabled = true
 verify_interval_hours = 6
-# Additional model directories to scan (beyond default Ollama/LMStudio/HuggingFace/MLX)
+# Additional model directories to scan (beyond auto-discovered locations)
 # paths = ["~/custom-models"]
+# Paths to ignore tamper alerts for (e.g., models you actively fine-tune)
+# ignore_paths = ["~/LeanInfer/models/my-finetuned-model.gguf"]
 
 [threat_feeds]
 # Real-time threat intelligence feeds (Phase 14)

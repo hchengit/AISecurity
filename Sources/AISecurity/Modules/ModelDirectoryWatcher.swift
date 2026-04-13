@@ -18,11 +18,8 @@ final class ModelDirectoryWatcher: @unchecked Sendable {
     private(set) var isRunning = false
     private(set) var watchedDirectories: [String] = []
 
-    /// Model file extensions to watch for
-    private static let modelExtensions: Set<String> = [
-        "gguf", "ggml", "safetensors", "bin", "pth", "pt",
-        "onnx", "mlmodel", "mlpackage", "npz", "npy",
-    ]
+    /// Reference to process monitor for looking up active processes at modification time
+    weak var processMonitor: ProcessMonitor?
 
     init(logger: SecurityLogger) {
         self.logger = logger
@@ -34,12 +31,11 @@ final class ModelDirectoryWatcher: @unchecked Sendable {
         guard !isRunning else { return }
         isRunning = true
 
-        // Discover model directories (background — may take a few seconds on first run)
         DispatchQueue.global(qos: .utility).async { [weak self] in
             self?.discoverAndWatch()
         }
 
-        // Re-discover directories every 6 hours (catches new installs, external drives)
+        // Re-discover every 6 hours (new installs, external drives)
         let timer = DispatchSource.makeTimerSource(queue: DispatchQueue.global(qos: .utility))
         timer.schedule(deadline: .now() + 6 * 3600, repeating: 6 * 3600)
         timer.setEventHandler { [weak self] in
@@ -52,14 +48,9 @@ final class ModelDirectoryWatcher: @unchecked Sendable {
     }
 
     func stop() {
-        // Cancel all DispatchSources
-        for source in sources {
-            source.cancel()
-        }
+        for source in sources { source.cancel() }
         sources.removeAll()
-        for fd in fileDescriptors {
-            close(fd)
-        }
+        for fd in fileDescriptors { close(fd) }
         fileDescriptors.removeAll()
         rediscoveryTimer?.cancel()
         rediscoveryTimer = nil
@@ -70,7 +61,6 @@ final class ModelDirectoryWatcher: @unchecked Sendable {
     // MARK: - Discovery + Watch
 
     private func discoverAndWatch() {
-        // Ask Rust to scan home + /Volumes/ for model files
         let dirs = SecurityCoreBridge.modelDiscoverDirs(securityDir: config.securityDir)
 
         guard !dirs.isEmpty else {
@@ -88,51 +78,13 @@ final class ModelDirectoryWatcher: @unchecked Sendable {
 
         watchedDirectories = dirs
 
-        // Watch each directory for changes
         for dir in dirs {
             watchDirectory(dir)
         }
 
-        // Also run a verification to hash any new models found
+        // Verify models
         DispatchQueue.global(qos: .utility).async { [weak self] in
-            guard let self else { return }
-            if let json = SecurityCoreBridge.modelVerify(securityDir: self.config.securityDir),
-               json.contains("NewModel") {
-                // Count new models
-                if let data = json.data(using: .utf8),
-                   let results = try? JSONDecoder().decode([ModelVerifyResult].self, from: data) {
-                    let newCount = results.filter { $0.status == "NewModel" }.count
-                    let tamperedCount = results.filter { $0.status == "Tampered" }.count
-                    if newCount > 0 {
-                        self.logger.info("\u{1F9E0} Model verification: \(newCount) new model(s) hashed")
-                    }
-                    if tamperedCount > 0 {
-                        let tampered = results.filter { $0.status == "Tampered" }
-                        for t in tampered {
-                            let fileName = (t.path as NSString).lastPathComponent
-                            let modDate = self.fileModDate(t.path)
-                            self.logger.alert(SecurityAlert(
-                                type: "MODEL_TAMPERED",
-                                severity: .critical,
-                                message: """
-                                \u{1F6A8} MODEL TAMPERED: \(fileName)
-                                Location: \(t.path)
-                                Expected hash: \(t.expected_hash?.prefix(16) ?? "?")...
-                                Actual hash: \(t.actual_hash?.prefix(16) ?? "?")...
-                                Last modified: \(modDate)
-
-                                ACTION REQUIRED:
-                                1. Do NOT run this model
-                                2. If you updated/fine-tuned it yourself, this is expected
-                                3. Otherwise: delete and re-download from original source
-                                4. Check Activity Log for processes running at modification time
-                                """,
-                                filePath: t.path
-                            ))
-                        }
-                    }
-                }
-            }
+            self?.runVerification()
         }
     }
 
@@ -148,7 +100,6 @@ final class ModelDirectoryWatcher: @unchecked Sendable {
         )
 
         source.setEventHandler { [weak self] in
-            // Directory changed — check for new model files
             self?.onDirectoryChanged(dir)
         }
         source.setCancelHandler { close(fd) }
@@ -163,42 +114,65 @@ final class ModelDirectoryWatcher: @unchecked Sendable {
         DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + 2) { [weak self] in
             guard let self else { return }
             self.logger.info("\u{1F4C1} Model directory changed: \(dir) — verifying...")
-            if let json = SecurityCoreBridge.modelVerify(securityDir: self.config.securityDir),
-               let data = json.data(using: .utf8),
-               let results = try? JSONDecoder().decode([ModelVerifyResult].self, from: data) {
-                let newCount = results.filter { $0.status == "NewModel" }.count
-                let tamperedCount = results.filter { $0.status == "Tampered" }.count
-                if newCount > 0 {
-                    self.logger.info("\u{1F9E0} New model detected and hashed in \(dir): \(newCount) file(s)")
-                }
-                if tamperedCount > 0 {
-                    let tampered = results.filter { $0.status == "Tampered" }
-                    for t in tampered {
-                        let fileName = (t.path as NSString).lastPathComponent
-                        let modDate = self.fileModDate(t.path)
-                        self.logger.alert(SecurityAlert(
-                            type: "MODEL_TAMPERED",
-                            severity: .critical,
-                            message: """
-                            \u{1F6A8} MODEL TAMPERED: \(fileName)
-                            Location: \(t.path)
-                            Expected hash: \(t.expected_hash?.prefix(16) ?? "?")...
-                            Actual hash: \(t.actual_hash?.prefix(16) ?? "?")...
-                            Last modified: \(modDate)
-
-                            ACTION REQUIRED:
-                            1. Do NOT run this model — it may produce unsafe outputs
-                            2. If you fine-tuned or updated it yourself, this is expected (new hash recorded)
-                            3. If you did NOT modify it: delete the file and re-download from the original source
-                            4. Check View Activity Log for processes that were running when the file changed
-                            """,
-                            filePath: t.path
-                        ))
-                    }
-                }
-            }
+            self.runVerification()
         }
     }
+
+    // MARK: - Verification + Alerts
+
+    private func runVerification() {
+        guard let json = SecurityCoreBridge.modelVerify(securityDir: config.securityDir),
+              let data = json.data(using: .utf8),
+              let results = try? JSONDecoder().decode([ModelVerifyResult].self, from: data) else {
+            return
+        }
+
+        let newModels = results.filter { $0.status == "NewModel" }
+        let tampered = results.filter { $0.status == "Tampered" }
+
+        if !newModels.isEmpty {
+            logger.info("\u{1F9E0} \(newModels.count) new model(s) discovered and hashed")
+        }
+
+        for t in tampered {
+            emitTamperAlert(t)
+        }
+    }
+
+    private func emitTamperAlert(_ result: ModelVerifyResult) {
+        let fileName = (result.path as NSString).lastPathComponent
+        let modDate = fileModDate(result.path)
+        let activeProcesses = getActiveProcessNames()
+
+        let message = """
+        \u{1F6A8} MODEL CHANGED: \(fileName)
+        Location: \(result.path)
+        Expected hash: \(result.expected_hash?.prefix(16) ?? "?")...
+        Actual hash: \(result.actual_hash?.prefix(16) ?? "?")...
+        Last modified: \(modDate)
+        Active processes: \(activeProcesses)
+
+        \u{2705} If you updated, fine-tuned, or re-downloaded this model:
+           No action needed — new hash has been automatically recorded.
+
+        \u{26A0}\u{FE0F} If you did NOT modify this model:
+           1. Do NOT run it — tampered weights may produce unsafe outputs
+           2. Delete the file
+           3. Re-download from the original source (Ollama/LM Studio/HuggingFace)
+
+        To stop alerts for actively developed models, add the path to
+        [model_verification] ignore_paths in ~/.mac-security/config.toml
+        """
+
+        logger.alert(SecurityAlert(
+            type: "MODEL_TAMPERED",
+            severity: .critical,
+            message: message,
+            filePath: result.path
+        ))
+    }
+
+    // MARK: - Helpers
 
     /// Get human-readable modification date for a file.
     private func fileModDate(_ path: String) -> String {
@@ -210,6 +184,18 @@ final class ModelDirectoryWatcher: @unchecked Sendable {
         formatter.dateStyle = .medium
         formatter.timeStyle = .medium
         return formatter.string(from: date)
+    }
+
+    /// Get names of currently active processes from ProcessMonitor.
+    private func getActiveProcessNames() -> String {
+        guard let monitor = processMonitor else {
+            return "Process Monitor not available"
+        }
+        let agents = monitor.activeAgents()
+        if agents.isEmpty {
+            return "No AI agents running"
+        }
+        return agents.map { $0.name }.joined(separator: ", ")
     }
 
     /// JSON-decodable verification result (matches Rust VerificationResult)

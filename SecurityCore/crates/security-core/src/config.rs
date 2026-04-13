@@ -395,6 +395,7 @@ pub struct SecurityConfig {
 pub struct ModelVerificationConfig {
     pub enabled: bool,
     pub paths: Vec<String>,
+    pub ignore_paths: Vec<String>,
     pub verify_interval_hours: u32,
 }
 
@@ -402,7 +403,8 @@ impl Default for ModelVerificationConfig {
     fn default() -> Self {
         Self {
             enabled: true,
-            paths: Vec::new(), // empty = use default model directories
+            paths: Vec::new(),
+            ignore_paths: Vec::new(), // paths to skip tamper alerts for (actively developed models)
             verify_interval_hours: 6,
         }
     }

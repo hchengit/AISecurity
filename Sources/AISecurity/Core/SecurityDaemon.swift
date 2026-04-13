@@ -250,6 +250,7 @@ final class SecurityDaemon: ObservableObject {
         }
 
         // 9. Model directory watcher (discovers + watches + verifies in real-time)
+        modelWatcher.processMonitor = processMonitor
         modelWatcher.start()
 
         // 10. Status file writer (every 10s)
