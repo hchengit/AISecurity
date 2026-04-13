@@ -107,12 +107,29 @@ final class ModelDirectoryWatcher: @unchecked Sendable {
                         self.logger.info("\u{1F9E0} Model verification: \(newCount) new model(s) hashed")
                     }
                     if tamperedCount > 0 {
-                        self.logger.alert(SecurityAlert(
-                            type: "MODEL_TAMPERED",
-                            severity: .critical,
-                            message: "\u{1F6A8} \(tamperedCount) model file(s) have been tampered with! Hash mismatch detected.",
-                            filePath: nil
-                        ))
+                        let tampered = results.filter { $0.status == "Tampered" }
+                        for t in tampered {
+                            let fileName = (t.path as NSString).lastPathComponent
+                            let modDate = self.fileModDate(t.path)
+                            self.logger.alert(SecurityAlert(
+                                type: "MODEL_TAMPERED",
+                                severity: .critical,
+                                message: """
+                                \u{1F6A8} MODEL TAMPERED: \(fileName)
+                                Location: \(t.path)
+                                Expected hash: \(t.expected_hash?.prefix(16) ?? "?")...
+                                Actual hash: \(t.actual_hash?.prefix(16) ?? "?")...
+                                Last modified: \(modDate)
+
+                                ACTION REQUIRED:
+                                1. Do NOT run this model
+                                2. If you updated/fine-tuned it yourself, this is expected
+                                3. Otherwise: delete and re-download from original source
+                                4. Check Activity Log for processes running at modification time
+                                """,
+                                filePath: t.path
+                            ))
+                        }
                     }
                 }
             }
@@ -155,15 +172,44 @@ final class ModelDirectoryWatcher: @unchecked Sendable {
                     self.logger.info("\u{1F9E0} New model detected and hashed in \(dir): \(newCount) file(s)")
                 }
                 if tamperedCount > 0 {
-                    self.logger.alert(SecurityAlert(
-                        type: "MODEL_TAMPERED",
-                        severity: .critical,
-                        message: "\u{1F6A8} Model tampered in \(dir)! \(tamperedCount) file(s) have mismatched hashes.",
-                        filePath: dir
-                    ))
+                    let tampered = results.filter { $0.status == "Tampered" }
+                    for t in tampered {
+                        let fileName = (t.path as NSString).lastPathComponent
+                        let modDate = self.fileModDate(t.path)
+                        self.logger.alert(SecurityAlert(
+                            type: "MODEL_TAMPERED",
+                            severity: .critical,
+                            message: """
+                            \u{1F6A8} MODEL TAMPERED: \(fileName)
+                            Location: \(t.path)
+                            Expected hash: \(t.expected_hash?.prefix(16) ?? "?")...
+                            Actual hash: \(t.actual_hash?.prefix(16) ?? "?")...
+                            Last modified: \(modDate)
+
+                            ACTION REQUIRED:
+                            1. Do NOT run this model — it may produce unsafe outputs
+                            2. If you fine-tuned or updated it yourself, this is expected (new hash recorded)
+                            3. If you did NOT modify it: delete the file and re-download from the original source
+                            4. Check View Activity Log for processes that were running when the file changed
+                            """,
+                            filePath: t.path
+                        ))
+                    }
                 }
             }
         }
+    }
+
+    /// Get human-readable modification date for a file.
+    private func fileModDate(_ path: String) -> String {
+        guard let attrs = try? FileManager.default.attributesOfItem(atPath: path),
+              let date = attrs[.modificationDate] as? Date else {
+            return "unknown"
+        }
+        let formatter = DateFormatter()
+        formatter.dateStyle = .medium
+        formatter.timeStyle = .medium
+        return formatter.string(from: date)
     }
 
     /// JSON-decodable verification result (matches Rust VerificationResult)
