@@ -380,16 +380,17 @@ final class SecurityDaemon: ObservableObject {
 
     private var selfProtectionSources: [DispatchSourceFileSystemObject] = []
 
-    /// Monitor critical app files for tampering: binary, config, logs directory.
+    /// Monitor critical app files for tampering: binary, config (NOT data files we write to).
+    /// We only watch files that should NOT change during normal operation.
+    /// Data files (sender-history.json, threat-feeds.db, email state, etc.) are excluded
+    /// because the app itself writes to them constantly.
     private func startSelfProtectionMonitor() {
         let criticalPaths = [
-            config.securityDir,                                                           // config directory
             (config.securityDir as NSString).appendingPathComponent("config.toml"),        // config file
             (config.securityDir as NSString).appendingPathComponent("notification-config.json"), // credentials
-            config.audit.logDir,                                                          // logs directory
         ]
 
-        // Also monitor the app bundle if it exists
+        // Also monitor the app bundle
         let appBundlePath = Bundle.main.bundlePath
         let allPaths = criticalPaths + [appBundlePath]
 
