@@ -144,6 +144,156 @@ pub fn default_model_paths() -> Vec<String> {
         .collect()
 }
 
+/// Discovered model directories — stored at ~/.mac-security/model-directories.json
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DiscoveredDirectories {
+    pub directories: Vec<String>,
+    pub last_scan: String,
+}
+
+/// Load previously discovered model directories.
+pub fn load_discovered_dirs(security_dir: &str) -> Vec<String> {
+    let path = PathBuf::from(security_dir).join("model-directories.json");
+    match fs::read_to_string(&path) {
+        Ok(content) => {
+            if let Ok(dd) = serde_json::from_str::<DiscoveredDirectories>(&content) {
+                dd.directories
+            } else {
+                Vec::new()
+            }
+        }
+        Err(_) => Vec::new(),
+    }
+}
+
+/// Save discovered model directories.
+pub fn save_discovered_dirs(security_dir: &str, dirs: &[String]) -> Result<(), String> {
+    let path = PathBuf::from(security_dir).join("model-directories.json");
+    let dd = DiscoveredDirectories {
+        directories: dirs.to_vec(),
+        last_scan: chrono::Utc::now().to_rfc3339(),
+    };
+    let json = serde_json::to_string_pretty(&dd)
+        .map_err(|e| format!("Serialize error: {}", e))?;
+    fs::write(&path, &json)
+        .map_err(|e| format!("Write error: {}", e))?;
+    Ok(())
+}
+
+/// Discover model directories by scanning home + /Volumes/ for model files.
+/// Returns a deduplicated list of parent directories where models were found.
+/// This is the "first install" scan — runs once, results persisted.
+pub fn discover_model_directories() -> Vec<String> {
+    let resolver = PathResolver::new();
+    let home = resolver.home();
+    let mut model_dirs: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+    // 1. Always include known default locations (even if empty — they might get models later)
+    for d in DEFAULT_MODEL_DIRS {
+        let full = format!("{}/{}", home, d);
+        if Path::new(&full).exists() {
+            model_dirs.insert(full);
+        }
+    }
+
+    // 2. Scan home directory (depth 4) for model files
+    discover_in_dir(&home, &mut model_dirs, 0, 4);
+
+    // 3. Scan /Volumes/ for external drives with model files (depth 4)
+    if Path::new("/Volumes").exists() {
+        if let Ok(entries) = fs::read_dir("/Volumes") {
+            for entry in entries.flatten() {
+                let vol_path = entry.path();
+                // Skip the boot volume (it's just a symlink to /)
+                if vol_path.to_str().map_or(false, |p| p == "/Volumes/Macintosh HD") {
+                    continue;
+                }
+                if vol_path.is_dir() {
+                    discover_in_dir(
+                        vol_path.to_str().unwrap_or(""),
+                        &mut model_dirs, 0, 4,
+                    );
+                }
+            }
+        }
+    }
+
+    let mut result: Vec<String> = model_dirs.into_iter().collect();
+    result.sort();
+    result
+}
+
+/// Recursively scan a directory for model files, recording parent dirs.
+fn discover_in_dir(
+    dir: &str,
+    found_dirs: &mut std::collections::HashSet<String>,
+    depth: u32,
+    max_depth: u32,
+) {
+    if depth > max_depth { return; }
+    if dir.is_empty() { return; }
+
+    // Skip directories that are slow to scan or irrelevant
+    let basename = Path::new(dir).file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("");
+    let skip_names = [
+        "Library", "Applications", ".Trash", "node_modules", ".git",
+        ".npm", ".cargo", "target", "build", ".build", "Caches",
+        "Logs", "Mail", "Photos", "Music", "Movies",
+    ];
+    if skip_names.contains(&basename) { return; }
+
+    let entries = match fs::read_dir(dir) {
+        Ok(e) => e,
+        Err(_) => return,
+    };
+
+    let mut has_model = false;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            discover_in_dir(
+                path.to_str().unwrap_or(""),
+                found_dirs, depth + 1, max_depth,
+            );
+        } else if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+            if is_model_file(name) {
+                has_model = true;
+            }
+        }
+    }
+
+    if has_model {
+        found_dirs.insert(dir.to_string());
+    }
+}
+
+/// Get effective model paths: merge discovered dirs + default dirs + user-configured.
+pub fn effective_model_paths(security_dir: &str, user_paths: &[String]) -> Vec<String> {
+    let mut all: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+    // 1. Previously discovered directories
+    for d in load_discovered_dirs(security_dir) {
+        all.insert(d);
+    }
+
+    // 2. Default paths
+    for d in default_model_paths() {
+        all.insert(d);
+    }
+
+    // 3. User-configured paths
+    for d in user_paths {
+        let expanded = expand_home(d);
+        all.insert(expanded);
+    }
+
+    let mut result: Vec<String> = all.into_iter().collect();
+    result.sort();
+    result
+}
+
 /// Verify all tracked models + discover new ones.
 /// Returns a list of verification results.
 pub fn verify_models(security_dir: &str, scan_paths: &[String]) -> Vec<VerificationResult> {

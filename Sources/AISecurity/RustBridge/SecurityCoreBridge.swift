@@ -497,6 +497,19 @@ enum SecurityCoreBridge {
         return String(cString: ptr!)
     }
 
+    /// Discover model directories by scanning home + /Volumes/.
+    /// Persists results to model-directories.json. Returns JSON array of directory paths.
+    static func modelDiscoverDirs(securityDir: String? = nil) -> [String] {
+        let dir = securityDir ?? SecurityConfig.shared.securityDir
+        let ptr = dir.withCString { sec_model_discover_dirs($0) }
+        guard ptr != nil else { return [] }
+        defer { sec_free_string(ptr) }
+        let json = String(cString: ptr!)
+        guard let data = json.data(using: .utf8),
+              let dirs = try? JSONDecoder().decode([String].self, from: data) else { return [] }
+        return dirs
+    }
+
     /// Scan for model files. Returns JSON string of discovered paths.
     static func modelScan(securityDir: String? = nil) -> String? {
         let dir = securityDir ?? SecurityConfig.shared.securityDir

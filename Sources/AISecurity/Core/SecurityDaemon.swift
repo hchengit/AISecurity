@@ -38,6 +38,7 @@ final class SecurityDaemon: ObservableObject {
     private var messagesScanner: MessagesScanner!
     private var processMonitor: ProcessMonitor!
     private var tccMonitor: TCCMonitor!
+    private var modelWatcher: ModelDirectoryWatcher!
     private var modulesReady = false
 
     // MARK: - Timers
@@ -76,6 +77,7 @@ final class SecurityDaemon: ObservableObject {
         emailScanner = EmailScanner(logger: logger, whitelist: whitelist)
         processMonitor = ProcessMonitor(logger: logger)
         tccMonitor = TCCMonitor(logger: logger)
+        modelWatcher = ModelDirectoryWatcher(logger: logger)
         messagesScanner = MessagesScanner(
             logger: logger,
             whitelist: whitelist,
@@ -247,13 +249,8 @@ final class SecurityDaemon: ObservableObject {
             logger.warn("\u{1F310} Threat feeds: failed to initialize database")
         }
 
-        // 9. Model weight verification (background, on startup)
-        DispatchQueue.global(qos: .utility).async { [weak self] in
-            guard let self else { return }
-            if let json = SecurityCoreBridge.modelVerify(securityDir: self.config.securityDir) {
-                self.logger.info("\u{1F9E0} Model verification complete: \(json.prefix(200))")
-            }
-        }
+        // 9. Model directory watcher (discovers + watches + verifies in real-time)
+        modelWatcher.start()
 
         // 10. Status file writer (every 10s)
         startStatusWriter()
@@ -275,6 +272,7 @@ final class SecurityDaemon: ObservableObject {
         messagesScanner.stop()
         processMonitor.stop()
         tccMonitor.stop()
+        modelWatcher.stop()
         feedRefreshTimer?.cancel()
         feedRefreshTimer = nil
         clipboardTimer?.invalidate()

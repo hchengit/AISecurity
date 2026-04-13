@@ -864,6 +864,7 @@ pub extern "C" fn sec_free_command_check(ptr: *mut CommandCheckResultFFI) {
 // ---------------------------------------------------------------------------
 
 /// Verify all tracked model files. Returns JSON array of results.
+/// Uses effective paths: discovered + default + user-configured.
 /// Caller must free with sec_free_string.
 #[no_mangle]
 pub extern "C" fn sec_model_verify(security_dir: *const c_char) -> *mut c_char {
@@ -874,13 +875,24 @@ pub extern "C" fn sec_model_verify(security_dir: *const c_char) -> *mut c_char {
     let config = SecurityConfig::load_or_default(
         &format!("{}/config.toml", dir),
     );
-    let paths = if config.model_verification.paths.is_empty() {
-        model_verifier::default_model_paths()
-    } else {
-        config.model_verification.paths.clone()
-    };
+    let paths = model_verifier::effective_model_paths(&dir, &config.model_verification.paths);
     let results = model_verifier::verify_models(&dir, &paths);
     serde_json::to_string(&results)
+        .map(|s| to_c_string(&s))
+        .unwrap_or(ptr::null_mut())
+}
+
+/// Discover model directories by scanning home + /Volumes/.
+/// Returns JSON array of directory paths. Caller must free with sec_free_string.
+#[no_mangle]
+pub extern "C" fn sec_model_discover_dirs(security_dir: *const c_char) -> *mut c_char {
+    let dir = match unsafe { from_c_str(security_dir) } {
+        Some(d) => d,
+        None => return ptr::null_mut(),
+    };
+    let dirs = model_verifier::discover_model_directories();
+    let _ = model_verifier::save_discovered_dirs(&dir, &dirs);
+    serde_json::to_string(&dirs)
         .map(|s| to_c_string(&s))
         .unwrap_or(ptr::null_mut())
 }

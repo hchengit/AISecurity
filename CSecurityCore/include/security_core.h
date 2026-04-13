@@ -325,9 +325,16 @@ void sec_free_command_check(struct CommandCheckResultFFI *ptr);
 
 /**
  * Verify all tracked model files. Returns JSON array of results.
+ * Uses effective paths: discovered + default + user-configured.
  * Caller must free with sec_free_string.
  */
 char *sec_model_verify(const char *securityDir);
+
+/**
+ * Discover model directories by scanning home + /Volumes/.
+ * Returns JSON array of directory paths. Caller must free with sec_free_string.
+ */
+char *sec_model_discover_dirs(const char *securityDir);
 
 /**
  * Scan for model files and return JSON array of discovered paths.
