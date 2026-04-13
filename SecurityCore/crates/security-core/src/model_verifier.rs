@@ -34,10 +34,12 @@ const MODEL_EXTENSIONS: &[&str] = &[
 /// Directories to scan for model files (relative to home).
 const DEFAULT_MODEL_DIRS: &[&str] = &[
     ".ollama/models",                           // Ollama
-    ".cache/lm-studio/models",                  // LM Studio
+    ".lmstudio/models",                         // LM Studio (current default location)
+    ".cache/lm-studio/models",                  // LM Studio (legacy location)
     ".cache/huggingface/hub",                   // HuggingFace
     ".cache/mlx",                               // Apple MLX cache
     "models",                                   // Common user convention
+    "LeanInfer/models",                         // LeanInfer / custom llama.cpp builds
     ".local/share/nomic.ai/GPT4All",            // GPT4All
 ];
 
