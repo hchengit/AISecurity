@@ -44,6 +44,7 @@ final class SecurityDaemon: ObservableObject {
 
     private var clipboardTimer: Timer?
     private var scheduledScanTimer: DispatchSourceTimer?
+    private var feedRefreshTimer: DispatchSourceTimer?
     private var statusWriterTimer: DispatchSourceTimer?
     private var lastClipboard = ""
     private var startedAt = ""
@@ -223,6 +224,29 @@ final class SecurityDaemon: ObservableObject {
         processMonitor.start()
         tccMonitor.start()
 
+        // 8b. Threat intelligence feeds (Phase 14)
+        let feedInitOk = SecurityCoreBridge.feedInit(securityDir: config.securityDir)
+        if feedInitOk {
+            // Initial refresh on background thread
+            DispatchQueue.global(qos: .utility).async { [weak self] in
+                let count = SecurityCoreBridge.feedRefresh()
+                let entries = SecurityCoreBridge.feedTotalEntries()
+                self?.logger?.info("\u{1F310} Threat feeds refreshed: \(count) entries downloaded, \(entries) total cached")
+            }
+            // Periodic refresh every 5 hours
+            let refreshTimer = DispatchSource.makeTimerSource(queue: DispatchQueue.global(qos: .utility))
+            refreshTimer.schedule(deadline: .now() + 5 * 3600, repeating: 5 * 3600)
+            refreshTimer.setEventHandler { [weak self] in
+                let count = SecurityCoreBridge.feedRefresh()
+                let entries = SecurityCoreBridge.feedTotalEntries()
+                self?.logger?.info("\u{1F310} Threat feeds auto-refresh: \(count) entries, \(entries) total")
+            }
+            refreshTimer.resume()
+            feedRefreshTimer = refreshTimer
+        } else {
+            logger.warn("\u{1F310} Threat feeds: failed to initialize database")
+        }
+
         // 9. Model weight verification (background, on startup)
         DispatchQueue.global(qos: .utility).async { [weak self] in
             guard let self else { return }
@@ -251,6 +275,8 @@ final class SecurityDaemon: ObservableObject {
         messagesScanner.stop()
         processMonitor.stop()
         tccMonitor.stop()
+        feedRefreshTimer?.cancel()
+        feedRefreshTimer = nil
         clipboardTimer?.invalidate()
         clipboardTimer = nil
         scheduledScanTimer?.cancel()

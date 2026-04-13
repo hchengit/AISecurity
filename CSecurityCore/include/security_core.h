@@ -142,6 +142,15 @@ typedef struct CommandCheckResultFFI {
 } CommandCheckResultFFI;
 
 /**
+ * FFI-safe feed check result.
+ */
+typedef struct FeedCheckResultFFI {
+    int8_t threat_level;
+    char *feed_name;
+    char *indicator;
+} FeedCheckResultFFI;
+
+/**
  * Initialize with an optional config path. Returns true on success.
  */
 bool sec_init(const char *configPath);
@@ -331,6 +340,42 @@ char *sec_model_scan(const char *securityDir);
  * Returns true on success.
  */
 bool sec_audit_log(const char *securityDir, const char *entryJson);
+
+/**
+ * Initialize threat feeds database. Call once at startup.
+ */
+bool sec_feed_init(const char *securityDir);
+
+/**
+ * Check a URL against threat feeds. Caller must free with sec_free_feed_check.
+ */
+struct FeedCheckResultFFI *sec_feed_check_url(const char *url);
+
+/**
+ * Check a domain against threat feeds. Caller must free with sec_free_feed_check.
+ */
+struct FeedCheckResultFFI *sec_feed_check_domain(const char *domain);
+
+/**
+ * Refresh all threat feeds. Returns count of entries refreshed, -1 on error.
+ * BLOCKING — call from a background thread.
+ */
+int32_t sec_feed_refresh(void);
+
+/**
+ * Get feed stats as JSON string. Caller must free with sec_free_string.
+ */
+char *sec_feed_stats(void);
+
+/**
+ * Get total entries count across all feeds.
+ */
+uint32_t sec_feed_total_entries(void);
+
+/**
+ * Free a FeedCheckResultFFI.
+ */
+void sec_free_feed_check(struct FeedCheckResultFFI *ptr);
 
 /**
  * Get the current protection tier from config. Returns 0=relaxed, 1=balanced, 2=strict.

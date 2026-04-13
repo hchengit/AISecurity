@@ -9,6 +9,7 @@ use std::ptr;
 
 use security_core::command_policy;
 use security_core::config::{self, ProtectionTier, SecurityConfig};
+use security_core::threat_feeds;
 use security_core::email_patterns;
 use security_core::model_verifier;
 use security_core::policy_audit::PolicyAuditLog;
@@ -930,6 +931,94 @@ pub extern "C" fn sec_audit_log(
         entry.log(&decision).is_ok()
     } else {
         false
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Threat Intelligence Feeds
+// ---------------------------------------------------------------------------
+
+/// FFI-safe feed check result.
+#[repr(C)]
+pub struct FeedCheckResultFFI {
+    pub threat_level: i8, // -1 = no match, 1-4 = Low..Critical
+    pub feed_name: *mut c_char,  // null if no match
+    pub indicator: *mut c_char,  // null if no match
+}
+
+/// Initialize threat feeds database. Call once at startup.
+#[no_mangle]
+pub extern "C" fn sec_feed_init(security_dir: *const c_char) -> bool {
+    let dir = match unsafe { from_c_str(security_dir) } {
+        Some(d) => d,
+        None => return threat_feeds::init_default().is_ok(),
+    };
+    threat_feeds::init(&dir).is_ok()
+}
+
+/// Check a URL against threat feeds. Caller must free with sec_free_feed_check.
+#[no_mangle]
+pub extern "C" fn sec_feed_check_url(url: *const c_char) -> *mut FeedCheckResultFFI {
+    let url = match unsafe { from_c_str(url) } {
+        Some(u) => u,
+        None => return ptr::null_mut(),
+    };
+    let result = threat_feeds::check_url(&url);
+    Box::into_raw(Box::new(FeedCheckResultFFI {
+        threat_level: result.threat_level,
+        feed_name: result.feed_name.as_deref().map(to_c_string).unwrap_or(ptr::null_mut()),
+        indicator: result.indicator.as_deref().map(to_c_string).unwrap_or(ptr::null_mut()),
+    }))
+}
+
+/// Check a domain against threat feeds. Caller must free with sec_free_feed_check.
+#[no_mangle]
+pub extern "C" fn sec_feed_check_domain(domain: *const c_char) -> *mut FeedCheckResultFFI {
+    let domain = match unsafe { from_c_str(domain) } {
+        Some(d) => d,
+        None => return ptr::null_mut(),
+    };
+    let result = threat_feeds::check_domain(&domain);
+    Box::into_raw(Box::new(FeedCheckResultFFI {
+        threat_level: result.threat_level,
+        feed_name: result.feed_name.as_deref().map(to_c_string).unwrap_or(ptr::null_mut()),
+        indicator: result.indicator.as_deref().map(to_c_string).unwrap_or(ptr::null_mut()),
+    }))
+}
+
+/// Refresh all threat feeds. Returns count of entries refreshed, -1 on error.
+/// BLOCKING — call from a background thread.
+#[no_mangle]
+pub extern "C" fn sec_feed_refresh() -> i32 {
+    match threat_feeds::refresh_all() {
+        Ok(count) => count as i32,
+        Err(_) => -1,
+    }
+}
+
+/// Get feed stats as JSON string. Caller must free with sec_free_string.
+#[no_mangle]
+pub extern "C" fn sec_feed_stats() -> *mut c_char {
+    let stats = threat_feeds::get_stats();
+    serde_json::to_string(&stats)
+        .map(|s| to_c_string(&s))
+        .unwrap_or(ptr::null_mut())
+}
+
+/// Get total entries count across all feeds.
+#[no_mangle]
+pub extern "C" fn sec_feed_total_entries() -> u32 {
+    threat_feeds::total_entries()
+}
+
+/// Free a FeedCheckResultFFI.
+#[no_mangle]
+pub extern "C" fn sec_free_feed_check(ptr: *mut FeedCheckResultFFI) {
+    if ptr.is_null() { return; }
+    unsafe {
+        let r = Box::from_raw(ptr);
+        free_c_string(r.feed_name);
+        free_c_string(r.indicator);
     }
 }
 

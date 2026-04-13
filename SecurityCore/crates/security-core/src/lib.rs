@@ -18,3 +18,4 @@ pub mod vault;
 pub mod policy_audit;
 pub mod model_verifier;
 pub mod command_policy;
+pub mod threat_feeds;

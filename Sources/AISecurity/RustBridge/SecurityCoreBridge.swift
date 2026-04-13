@@ -506,6 +506,61 @@ enum SecurityCoreBridge {
         return String(cString: ptr!)
     }
 
+    // MARK: - Threat Intelligence Feeds
+
+    struct FeedCheckResult: Sendable {
+        let threatLevel: Int8   // -1 = no match, 1-4 = Low..Critical
+        let feedName: String?
+        let indicator: String?
+        var isMatch: Bool { threatLevel > 0 }
+    }
+
+    /// Initialize threat feeds database.
+    static func feedInit(securityDir: String? = nil) -> Bool {
+        let dir = securityDir ?? SecurityConfig.shared.securityDir
+        return dir.withCString { sec_feed_init($0) }
+    }
+
+    /// Check a URL against threat feeds.
+    static func feedCheckUrl(_ url: String) -> FeedCheckResult {
+        let ptr = url.withCString { sec_feed_check_url($0) }
+        guard let r = ptr else {
+            return FeedCheckResult(threatLevel: -1, feedName: nil, indicator: nil)
+        }
+        defer { sec_free_feed_check(ptr) }
+        let p = r.pointee
+        return FeedCheckResult(
+            threatLevel: p.threat_level,
+            feedName: optionalString(p.feed_name),
+            indicator: optionalString(p.indicator)
+        )
+    }
+
+    /// Check a domain against threat feeds.
+    static func feedCheckDomain(_ domain: String) -> FeedCheckResult {
+        let ptr = domain.withCString { sec_feed_check_domain($0) }
+        guard let r = ptr else {
+            return FeedCheckResult(threatLevel: -1, feedName: nil, indicator: nil)
+        }
+        defer { sec_free_feed_check(ptr) }
+        let p = r.pointee
+        return FeedCheckResult(
+            threatLevel: p.threat_level,
+            feedName: optionalString(p.feed_name),
+            indicator: optionalString(p.indicator)
+        )
+    }
+
+    /// Refresh all threat feeds (BLOCKING — call from background thread).
+    static func feedRefresh() -> Int32 {
+        sec_feed_refresh()
+    }
+
+    /// Get total entries across all feeds.
+    static func feedTotalEntries() -> UInt32 {
+        sec_feed_total_entries()
+    }
+
     // MARK: - Policy Audit Log
 
     /// Log a policy decision to the audit log.

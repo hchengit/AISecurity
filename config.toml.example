@@ -149,6 +149,13 @@ verify_interval_hours = 6
 # Additional model directories to scan (beyond default Ollama/LMStudio/HuggingFace/MLX)
 # paths = ["~/custom-models"]
 
+[threat_feeds]
+# Real-time threat intelligence feeds (Phase 14)
+# Downloads known-bad URL/domain lists, caches locally in SQLite
+# All lookups are local — no user data leaves the machine
+enabled = true
+refresh_interval_hours = 5
+
 [command_policy]
 # Command policy engine: validate bash commands before execution
 enabled = true

@@ -166,15 +166,17 @@ final class EmailScanner: @unchecked Sendable {
         timer.resume()
         pollTimer = timer
 
-        // Startup scan: first launch → scan ALL, subsequent → scan last 30 days.
-        // Sender history persists across restarts, so trusted senders are recognized immediately.
-        // On the very first run (no history), some false positives may appear until trust builds.
+        // Startup scan: delayed 30s to let Apple Mail sync new emails after wake/boot.
+        // First launch → scan ALL, subsequent → scan last 30 days.
         let isFirstLaunch = scannedFiles.isEmpty
-        DispatchQueue.global(qos: .utility).async { [weak self] in
+        DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + (isFirstLaunch ? 0 : 30)) { [weak self] in
+            guard let self else { return }
             if isFirstLaunch {
-                self?.pollRecentEmails(windowMs: 0) // 0 = scan all
+                self.logger.info("\u{1F4E7} First launch: scanning all emails...")
+                self.pollRecentEmails(windowMs: 0) // 0 = scan all
             } else {
-                self?.pollRecentEmails(windowMs: 30 * 24 * 60 * 60 * 1000) // 30 days
+                self.logger.info("\u{1F4E7} Startup scan (delayed 30s for Mail sync)...")
+                self.pollRecentEmails(windowMs: 30 * 24 * 60 * 60 * 1000) // 30 days
             }
         }
 
@@ -317,8 +319,12 @@ final class EmailScanner: @unchecked Sendable {
         }
 
         // Update status for UI — always, so the menu reflects current state
-        let lastScan = DateFormatter.localizedString(from: Date(), dateStyle: .none, timeStyle: .short)
-        scannerStatus = "Active — \(emailsScanned) scanned, \(threatsFound) threats (last: \(lastScan))"
+        let now = DateFormatter.localizedString(from: Date(), dateStyle: .none, timeStyle: .short)
+        if newCount > 0 {
+            scannerStatus = "Active — \(emailsScanned) scanned, \(newCount) new (\(now))"
+        } else {
+            scannerStatus = "Active — \(emailsScanned) scanned, up to date (\(now))"
+        }
         notifyStatus()
     }
 
@@ -347,6 +353,41 @@ final class EmailScanner: @unchecked Sendable {
         for t in rustThreats {
             threats.append((type: t.type, label: t.label, severity: t.severity, category: t.category))
             byCategory[t.category, default: 0] += 1
+        }
+
+        // ── Threat feed lookups (Phase 14) ──────────────────────────
+        // Check sender domain against cached threat intelligence feeds
+        let senderDomain = extractSenderDomain(from) ?? ""
+        if !senderDomain.isEmpty {
+            let domainCheck = SecurityCoreBridge.feedCheckDomain(senderDomain)
+            if domainCheck.isMatch {
+                threats.append((
+                    type: "threat_feed_domain",
+                    label: "Threat feed: sender domain \(senderDomain) on \(domainCheck.feedName ?? "feed")",
+                    severity: .critical,
+                    category: "threat_feed_domain"
+                ))
+            }
+        }
+
+        // Check URLs in email body against cached feeds
+        let urlPattern = try? NSRegularExpression(pattern: #"https?://[^\s<>"']{5,}"#)
+        if let urlPat = urlPattern {
+            let bodyNS = email.body as NSString
+            let urlMatches = urlPat.matches(in: email.body, range: NSRange(location: 0, length: bodyNS.length))
+            for match in urlMatches.prefix(20) { // check up to 20 URLs per email
+                let urlStr = bodyNS.substring(with: match.range)
+                let urlCheck = SecurityCoreBridge.feedCheckUrl(urlStr)
+                if urlCheck.isMatch {
+                    threats.append((
+                        type: "threat_feed_url",
+                        label: "Threat feed: URL on \(urlCheck.feedName ?? "feed"): \(urlCheck.indicator ?? urlStr)",
+                        severity: .critical,
+                        category: "threat_feed_url"
+                    ))
+                    break // one feed match per email is sufficient
+                }
+            }
         }
 
         // Check attachment names (stays in Swift — operates on parsed email structure)
@@ -383,7 +424,8 @@ final class EmailScanner: @unchecked Sendable {
         // Hard bypass: ALWAYS alert regardless of sender trust or auth.
         // These indicate actual weaponized content, not just keyword matches.
         let hardBypassCategories: Set<String> = [
-            "dangerous_attachment", "malware_dropper", "prompt_injection"
+            "dangerous_attachment", "malware_dropper", "prompt_injection",
+            "threat_feed_url", "threat_feed_domain"  // always alert on feed matches
         ]
 
         // Soft bypass: alert for unknown/suspicious senders, suppress for trusted.
@@ -410,7 +452,7 @@ final class EmailScanner: @unchecked Sendable {
         }
 
         // ── Sender History + Auth — contextual trust ────────────────
-        let senderDomain = extractSenderDomain(from) ?? ""
+        // senderDomain already extracted above for feed check
         let trust = senderHistory.trustLevel(for: senderDomain)
         let auth = email.auth
 
