@@ -452,6 +452,24 @@ enum SecurityCoreBridge {
         return try? JSONDecoder().decode(EffectiveSecurityConfig.self, from: data)
     }
 
+    // MARK: - Encryption Helpers
+
+    /// Encrypt a JSON string for whitelist storage (AES-256-GCM with WHITELIST AAD).
+    static func encryptWhitelist(_ json: String) -> String? {
+        let ptr = json.withCString { sec_encrypt_whitelist($0) }
+        guard ptr != nil else { return nil }
+        defer { sec_free_string(ptr) }
+        return String(cString: ptr!)
+    }
+
+    /// Decrypt a hex string from whitelist storage.
+    static func decryptWhitelist(_ hex: String) -> String? {
+        let ptr = hex.withCString { sec_decrypt_whitelist($0) }
+        guard ptr != nil else { return nil }
+        defer { sec_free_string(ptr) }
+        return String(cString: ptr!)
+    }
+
     // MARK: - Command Policy Engine
 
     enum CommandDecision: Int8, Sendable {

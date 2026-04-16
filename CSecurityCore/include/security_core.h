@@ -314,6 +314,18 @@ void sec_free_vault_result(struct VaultResultFFI *ptr);
 void sec_free_vault_entries(struct VaultEntryArrayFFI *ptr);
 
 /**
+ * Encrypt a JSON string with the WHITELIST AAD tag. Returns hex string.
+ * Caller must free with sec_free_string.
+ */
+char *sec_encrypt_whitelist(const char *json);
+
+/**
+ * Decrypt a hex string with the WHITELIST AAD tag. Returns JSON string.
+ * Caller must free with sec_free_string.
+ */
+char *sec_decrypt_whitelist(const char *hex);
+
+/**
  * Check a command against the policy. Caller must free with sec_free_command_check.
  */
 struct CommandCheckResultFFI *sec_command_check(const char *command, const char *configPath);

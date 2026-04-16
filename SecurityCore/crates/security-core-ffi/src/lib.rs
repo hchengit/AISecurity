@@ -808,6 +808,46 @@ pub extern "C" fn sec_free_vault_entries(ptr: *mut VaultEntryArrayFFI) {
 }
 
 // ---------------------------------------------------------------------------
+// Encryption helpers (for Swift-side encrypted storage)
+// ---------------------------------------------------------------------------
+
+/// Encrypt a JSON string with the WHITELIST AAD tag. Returns hex string.
+/// Caller must free with sec_free_string.
+#[no_mangle]
+pub extern "C" fn sec_encrypt_whitelist(json: *const c_char) -> *mut c_char {
+    let json = match unsafe { from_c_str(json) } {
+        Some(j) => j,
+        None => return ptr::null_mut(),
+    };
+    let enc = match security_core::encryption::Encryptor::from_env(false) {
+        Ok(e) => e,
+        Err(_) => return ptr::null_mut(),
+    };
+    match enc.encrypt_string(&json, security_core::encryption::aad::WHITELIST) {
+        Ok(hex) => to_c_string(&hex),
+        Err(_) => ptr::null_mut(),
+    }
+}
+
+/// Decrypt a hex string with the WHITELIST AAD tag. Returns JSON string.
+/// Caller must free with sec_free_string.
+#[no_mangle]
+pub extern "C" fn sec_decrypt_whitelist(hex: *const c_char) -> *mut c_char {
+    let hex = match unsafe { from_c_str(hex) } {
+        Some(h) => h,
+        None => return ptr::null_mut(),
+    };
+    let enc = match security_core::encryption::Encryptor::from_env(false) {
+        Ok(e) => e,
+        Err(_) => return ptr::null_mut(),
+    };
+    match enc.decrypt_string(&hex, security_core::encryption::aad::WHITELIST) {
+        Ok(json) => to_c_string(&json),
+        Err(_) => ptr::null_mut(),
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Command Policy Engine
 // ---------------------------------------------------------------------------
 

@@ -75,10 +75,17 @@ final class SenderWhitelist: @unchecked Sendable {
         "protonmail.com", "proton.me", "zoho.com", "mail.com", "gmx.com", "yandex.com"
     ]
 
+    /// Path to encrypted whitelist
+    private let encryptedFilePath: String
+    /// Path to legacy plain JSON whitelist (for migration)
+    private let legacyFilePath: String
+
     // MARK: - Init
 
     init(securityDir: String) {
-        self.filePath = (securityDir as NSString).appendingPathComponent("whitelist.json")
+        self.filePath = (securityDir as NSString).appendingPathComponent("whitelist.enc")
+        self.encryptedFilePath = self.filePath
+        self.legacyFilePath = (securityDir as NSString).appendingPathComponent("whitelist.json")
         load()
     }
 
@@ -153,25 +160,58 @@ final class SenderWhitelist: @unchecked Sendable {
         policy(for: sender).isWhitelisted
     }
 
-    // MARK: - Persistence
+    // MARK: - Encrypted Persistence
 
     private func load() {
-        guard let data = FileManager.default.contents(atPath: filePath),
-              let arr = try? JSONDecoder().decode([Entry].self, from: data) else { return }
-        lock.lock()
-        for entry in arr {
-            entries[entry.address.lowercased()] = entry
+        // Try encrypted file first (whitelist.enc)
+        if FileManager.default.fileExists(atPath: encryptedFilePath),
+           let hexData = FileManager.default.contents(atPath: encryptedFilePath),
+           let hex = String(data: hexData, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines),
+           !hex.isEmpty,
+           let json = SecurityCoreBridge.decryptWhitelist(hex),
+           let jsonData = json.data(using: .utf8),
+           let arr = try? JSONDecoder().decode([Entry].self, from: jsonData) {
+            lock.lock()
+            for entry in arr {
+                entries[entry.address.lowercased()] = entry
+            }
+            lock.unlock()
+            return
         }
-        lock.unlock()
+
+        // Fall back to legacy plain JSON (whitelist.json) for migration
+        if FileManager.default.fileExists(atPath: legacyFilePath),
+           let data = FileManager.default.contents(atPath: legacyFilePath),
+           let arr = try? JSONDecoder().decode([Entry].self, from: data) {
+            lock.lock()
+            for entry in arr {
+                entries[entry.address.lowercased()] = entry
+            }
+            lock.unlock()
+            // Migrate: save as encrypted, then remove legacy file
+            save()
+            try? FileManager.default.removeItem(atPath: legacyFilePath)
+            return
+        }
     }
 
     private func save() {
         lock.lock()
         let arr = Array(entries.values)
         lock.unlock()
-        if let data = try? JSONEncoder().encode(arr) {
-            try? data.write(to: URL(fileURLWithPath: filePath))
+
+        // Encrypt and save
+        guard let jsonData = try? JSONEncoder().encode(arr),
+              let json = String(data: jsonData, encoding: .utf8),
+              let hex = SecurityCoreBridge.encryptWhitelist(json) else {
+            // Fallback: save as plain JSON if encryption fails (shouldn't happen)
+            if let data = try? JSONEncoder().encode(arr) {
+                try? data.write(to: URL(fileURLWithPath: legacyFilePath))
+            }
+            return
         }
+
+        try? hex.data(using: .utf8)?.write(to: URL(fileURLWithPath: encryptedFilePath))
     }
 
     // MARK: - Helpers
