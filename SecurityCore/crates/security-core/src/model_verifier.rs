@@ -180,6 +180,30 @@ pub fn save_discovered_dirs(security_dir: &str, dirs: &[String]) -> Result<(), S
     Ok(())
 }
 
+/// Check if a file path should be tracked as a model.
+/// Filters out known false positive sources (build caches, browser profiles, package archives).
+pub fn should_track_path(path: &str) -> bool {
+    let lower = path.to_lowercase();
+    let skip_patterns = [
+        "/.cache/uv/",
+        "/cmakefiles/",
+        "/build-metal/",
+        "/build-cuda/",
+        "/antigravity-browser-profile/",
+        "/chromium-browser/",
+        "/browser-profile/",
+        "/optguideondevicemodel/",
+        "/ondeviceheadsuggestmodel/",
+        "/sync data/",
+        "/.git/",
+        "/node_modules/",
+    ];
+    for pattern in skip_patterns {
+        if lower.contains(pattern) { return false; }
+    }
+    true
+}
+
 /// Discover model directories by scanning home + /Volumes/ for model files.
 /// Returns a deduplicated list of parent directories where models were found.
 /// This is the "first install" scan — runs once, results persisted.
@@ -241,8 +265,31 @@ fn discover_in_dir(
         "Library", "Applications", ".Trash", "node_modules", ".git",
         ".npm", ".cargo", "target", "build", ".build", "Caches",
         "Logs", "Mail", "Photos", "Music", "Movies",
+        // Build artifacts (contain .bin files that aren't models)
+        "CMakeFiles", "cmake-build-debug", "cmake-build-release",
+        "build-metal", "build-cuda", "build-cpu",
+        // Package/tool caches (contain .bin files from packages, not models)
+        ".cache", ".uv", "archive-v0",
+        // Browser profiles (contain .bin model files but they're UI prediction, not LLMs)
+        "antigravity-browser-profile", "BraveSoftware", "Chrome",
+        "OptGuideOnDeviceModel", "OnDeviceHeadSuggestModel",
     ];
     if skip_names.contains(&basename) { return; }
+
+    // Also skip paths containing these patterns
+    let lower_dir = dir.to_lowercase();
+    let skip_patterns = [
+        "/.cache/uv/",
+        "/cmakefiles/",
+        "/build-metal/",
+        "/build-cuda/",
+        "/antigravity-browser-profile/",
+        "/chromium-browser/",
+        "/browser-profile/",
+    ];
+    for pattern in skip_patterns {
+        if lower_dir.contains(pattern) { return; }
+    }
 
     let entries = match fs::read_dir(dir) {
         Ok(e) => e,
@@ -301,8 +348,27 @@ pub fn verify_models(security_dir: &str, scan_paths: &[String]) -> Vec<Verificat
     let mut results = Vec::new();
     let now = chrono::Utc::now().to_rfc3339();
 
-    // 1. Discover model files
-    let discovered = scan_model_directories(scan_paths);
+    // 0. Prune manifest entries that match skip patterns (cleanup false positives)
+    let stale: Vec<String> = manifest.keys()
+        .filter(|k| !should_track_path(k))
+        .cloned()
+        .collect();
+    for path in &stale {
+        manifest.remove(path);
+        results.push(VerificationResult {
+            path: path.clone(),
+            status: VerifyStatus::Removed,
+            expected_hash: None,
+            actual_hash: None,
+            size_bytes: 0,
+        });
+    }
+
+    // 1. Discover model files — filter out skip-pattern paths
+    let discovered: Vec<String> = scan_model_directories(scan_paths)
+        .into_iter()
+        .filter(|p| should_track_path(p))
+        .collect();
 
     // 2. Check each discovered file against manifest
     for path in &discovered {

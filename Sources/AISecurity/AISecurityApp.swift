@@ -247,40 +247,12 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
         menu.addItem(.separator())
 
-        // AI Models
-        let modelsSubmenu = NSMenu()
-        if let manifest = loadModelManifest() {
-            if manifest.isEmpty {
-                let empty = NSMenuItem(title: "    No models tracked", action: nil, keyEquivalent: "")
-                empty.isEnabled = false
-                modelsSubmenu.addItem(empty)
-            } else {
-                // Sort by size descending, show name + size + status
-                let sorted = manifest.sorted { $0.value.sizeBytes > $1.value.sizeBytes }
-                for (path, info) in sorted.prefix(20) {
-                    let name = (path as NSString).lastPathComponent
-                    let size = formatModelSize(info.sizeBytes)
-                    let item = NSMenuItem(title: "    \u{2705} \(name) (\(size))", action: #selector(noOp), keyEquivalent: "")
-                    item.target = self
-                    item.toolTip = path
-                    modelsSubmenu.addItem(item)
-                }
-                if manifest.count > 20 {
-                    let more = NSMenuItem(title: "    ... and \(manifest.count - 20) more", action: nil, keyEquivalent: "")
-                    more.isEnabled = false
-                    modelsSubmenu.addItem(more)
-                }
-            }
-            modelsSubmenu.addItem(.separator())
-            let countItem = NSMenuItem(title: "\(manifest.count) models hashed", action: nil, keyEquivalent: "")
-            countItem.isEnabled = false
-            modelsSubmenu.addItem(countItem)
-        } else {
-            let noData = NSMenuItem(title: "    Model verifier not active", action: nil, keyEquivalent: "")
-            noData.isEnabled = false
-            modelsSubmenu.addItem(noData)
-        }
-        let modelsParent = NSMenuItem(title: "\u{1F9E0} AI Models (\(loadModelManifest()?.count ?? 0) tracked)", action: nil, keyEquivalent: "")
+        // AI Models — grouped by runtime, hides tiny metadata blobs
+        let manifest = loadModelManifest() ?? [:]
+        let displayModels = filterUserFacingModels(manifest)
+        let groupedModels = groupModelsByRuntime(displayModels)
+        let modelsSubmenu = buildModelsSubmenu(grouped: groupedModels, totalHashed: manifest.count, displayCount: displayModels.count)
+        let modelsParent = NSMenuItem(title: "\u{1F9E0} AI Models (\(displayModels.count))", action: nil, keyEquivalent: "")
         modelsParent.submenu = modelsSubmenu
         menu.addItem(modelsParent)
 
@@ -401,6 +373,112 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         if gb >= 1.0 { return String(format: "%.1f GB", gb) }
         if mb >= 1.0 { return String(format: "%.0f MB", mb) }
         return "\(bytes) B"
+    }
+
+    /// Filter manifest to only user-facing models.
+    /// Hides: Ollama metadata blobs (<10MB), duplicates, non-model files in build dirs.
+    private func filterUserFacingModels(_ manifest: [String: ModelManifestEntry]) -> [(String, ModelManifestEntry)] {
+        manifest.filter { path, entry in
+            // Hide Ollama blobs under 10MB (metadata, not model weights)
+            if path.contains("/.ollama/models/blobs/sha256-") && entry.sizeBytes < 10 * 1024 * 1024 {
+                return false
+            }
+            return true
+        }.map { ($0.key, $0.value) }
+    }
+
+    /// Group models by the runtime/source directory they belong to.
+    private func groupModelsByRuntime(_ models: [(String, ModelManifestEntry)]) -> [(String, [(String, ModelManifestEntry)])] {
+        var groups: [String: [(String, ModelManifestEntry)]] = [:]
+
+        for (path, entry) in models {
+            let runtime = detectRuntime(path)
+            groups[runtime, default: []].append((path, entry))
+        }
+
+        // Sort each group by size descending
+        for key in groups.keys {
+            groups[key]?.sort { $0.1.sizeBytes > $1.1.sizeBytes }
+        }
+
+        // Fixed display order
+        let order = ["Ollama", "LM Studio", "LeanInfer", "Lean_llama.cpp", "HuggingFace", "MLX", "GPT4All", "Other"]
+        var result: [(String, [(String, ModelManifestEntry)])] = []
+        for name in order {
+            if let items = groups[name], !items.isEmpty {
+                result.append((name, items))
+            }
+        }
+        return result
+    }
+
+    /// Detect which runtime a model belongs to by its path.
+    private func detectRuntime(_ path: String) -> String {
+        let lower = path.lowercased()
+        if lower.contains("/.ollama/") { return "Ollama" }
+        if lower.contains("/.lmstudio/") || lower.contains("/lm-studio/") { return "LM Studio" }
+        if lower.contains("/leaninfer/") { return "LeanInfer" }
+        if lower.contains("/lean_llama.cpp/") { return "Lean_llama.cpp" }
+        if lower.contains("/huggingface/") { return "HuggingFace" }
+        if lower.contains("/.cache/mlx/") { return "MLX" }
+        if lower.contains("/gpt4all") { return "GPT4All" }
+        return "Other"
+    }
+
+    /// Build the AI Models submenu with grouped, scrollable display.
+    private func buildModelsSubmenu(
+        grouped: [(String, [(String, ModelManifestEntry)])],
+        totalHashed: Int,
+        displayCount: Int
+    ) -> NSMenu {
+        let submenu = NSMenu()
+
+        if grouped.isEmpty {
+            let empty = NSMenuItem(title: "    No models tracked", action: nil, keyEquivalent: "")
+            empty.isEnabled = false
+            submenu.addItem(empty)
+            return submenu
+        }
+
+        for (runtime, models) in grouped {
+            // Group header (bold-looking via prefix)
+            let header = NSMenuItem(title: "\(runtime) (\(models.count))", action: nil, keyEquivalent: "")
+            header.isEnabled = false
+            submenu.addItem(header)
+
+            // Show top 10 per group — most users have a few per runtime
+            for (path, info) in models.prefix(10) {
+                let name = (path as NSString).lastPathComponent
+                // Truncate very long names
+                let displayName = name.count > 45 ? String(name.prefix(42)) + "..." : name
+                let size = formatModelSize(info.sizeBytes)
+                let item = NSMenuItem(
+                    title: "    \u{2705} \(displayName) (\(size))",
+                    action: #selector(noOp),
+                    keyEquivalent: ""
+                )
+                item.target = self
+                item.toolTip = path
+                submenu.addItem(item)
+            }
+            if models.count > 10 {
+                let more = NSMenuItem(title: "    ... and \(models.count - 10) more", action: nil, keyEquivalent: "")
+                more.isEnabled = false
+                submenu.addItem(more)
+            }
+            submenu.addItem(.separator())
+        }
+
+        // Footer stats
+        let hiddenCount = totalHashed - displayCount
+        let summary = hiddenCount > 0
+            ? "\(displayCount) shown, \(hiddenCount) metadata hidden"
+            : "\(displayCount) tracked"
+        let summaryItem = NSMenuItem(title: summary, action: nil, keyEquivalent: "")
+        summaryItem.isEnabled = false
+        submenu.addItem(summaryItem)
+
+        return submenu
     }
 
     private func makeItem(_ title: String, action: Selector) -> NSMenuItem {
