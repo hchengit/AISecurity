@@ -276,6 +276,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         menu.addItem(vaultHeader)
         menu.addItem(makeItem("Protect Files...", action: #selector(vaultProtectFiles)))
         menu.addItem(makeItem("Open Vault...", action: #selector(vaultOpenWindow)))
+        menu.addItem(makeItem("Export Portable Vault...", action: #selector(vaultExportPortable)))
         menu.addItem(makeItem("Change Passphrase...", action: #selector(vaultChangePassphrase)))
         menu.addItem(makeItem("Forgot Passphrase...", action: #selector(vaultForgotPassphrase)))
 
@@ -917,6 +918,16 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             onCancel: {},
             onError: { VaultDialogs.showError($0) }
         )
+    }
+
+    /// "Export Portable Vault..." — bundles one or more .vault files with the
+    /// standalone Python decryptor so the user can move the bundle to a USB
+    /// drive (or any other machine) and still decrypt on a computer without
+    /// AISecurity installed. No passphrase, no key material travels in the
+    /// export — only ciphertext + a public tool.
+    @objc private func vaultExportPortable() {
+        NSApplication.shared.activate(ignoringOtherApps: true)
+        PortableVaultExport.run()
     }
 
     @objc private func vaultOpenWindow() {

@@ -102,6 +102,16 @@ if [ -f "$SCRIPT_DIR/Sources/AISecurity/AppIcon.icns" ]; then
     cp "$SCRIPT_DIR/Sources/AISecurity/AppIcon.icns" "$APP_BUNDLE/Contents/Resources/AppIcon.icns"
     success "App icon copied"
 fi
+
+# Bundle the portable vault decryptor so "Export Portable Vault..." has a
+# canonical copy to ship alongside .vault files. Getting signed into the
+# bundle means Fix #6's startup signature check will detect tampering.
+if [ -f "$SCRIPT_DIR/Sources/AISecurity/Resources/vault-decrypt.py" ]; then
+    cp "$SCRIPT_DIR/Sources/AISecurity/Resources/vault-decrypt.py" "$APP_BUNDLE/Contents/Resources/vault-decrypt.py"
+    chmod 0644 "$APP_BUNDLE/Contents/Resources/vault-decrypt.py"
+    success "Portable vault decryptor bundled"
+fi
+
 xattr -cr "$APP_BUNDLE"
 
 # Code-sign the bundle with entitlements so macOS recognises it for FDA
