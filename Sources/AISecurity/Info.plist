@@ -51,6 +51,17 @@
             </dict>
             <key>NSMessage</key>
             <string>protectFilesService</string>
+            <key>NSRequiredContext</key>
+            <dict>
+                <key>NSTextContent</key>
+                <string>FilePath</string>
+            </dict>
+            <key>NSSendFileTypes</key>
+            <array>
+                <string>public.data</string>
+                <string>public.directory</string>
+                <string>public.item</string>
+            </array>
             <key>NSSendTypes</key>
             <array>
                 <string>NSFilenamesPboardType</string>
@@ -68,6 +79,16 @@
             </dict>
             <key>NSMessage</key>
             <string>hashModelService</string>
+            <key>NSRequiredContext</key>
+            <dict>
+                <key>NSTextContent</key>
+                <string>FilePath</string>
+            </dict>
+            <key>NSSendFileTypes</key>
+            <array>
+                <string>public.data</string>
+                <string>public.item</string>
+            </array>
             <key>NSSendTypes</key>
             <array>
                 <string>NSFilenamesPboardType</string>
