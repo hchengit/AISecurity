@@ -34,6 +34,15 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         let diagPath = (NSHomeDirectory() as NSString).appendingPathComponent(".mac-security/logs/menubar-debug.log")
         var diag = "[\(Date())] applicationDidFinishLaunching reached. Creating status item...\n"
 
+        // Integrity check: before we touch any data or load any modules, verify
+        // the bundle we're running from matches its code signature. In a dev
+        // build this is a no-op; in a production install (running from
+        // /Applications/) a mismatch terminates the process with a visible
+        // alert, preventing a tampered copy from starting the daemon.
+        guard CodeSignatureGuard.verifyOrRefuseStartup() else {
+            return   // verifyOrRefuseStartup already called NSApp.terminate
+        }
+
         // Create status item in applicationDidFinishLaunching (run loop is active)
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         if let button = statusItem.button {
@@ -48,6 +57,31 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
         // Warm up Rust security-core lazy statics
         SecurityCoreBridge.initialize()
+
+        // Install Keychain-backed master key into the Rust crypto core BEFORE
+        // anything that reads encrypted app data (whitelist, manifest, etc.).
+        // Fail closed: if we can't unlock the key store, we must NOT start the
+        // daemon — that would silently downgrade to the old default-passphrase
+        // path or write plaintext fallbacks.
+        switch MasterKey.install() {
+        case .installedExisting:
+            diag += "[\(Date())] Master key loaded from Keychain\n"
+        case .installedGenerated:
+            diag += "[\(Date())] Master key generated and stored in Keychain (first run)\n"
+        case .failed(let msg):
+            diag += "[\(Date())] FATAL: master key install failed: \(msg)\n"
+            try? diag.write(toFile: diagPath, atomically: true, encoding: .utf8)
+            // Show a blocking alert and exit — do not proceed without a key.
+            let alert = NSAlert()
+            alert.messageText = "AISecurity cannot start"
+            alert.informativeText = "The encryption master key could not be accessed in the login Keychain.\n\n\(msg)\n\nUnlock your Keychain and relaunch the app."
+            alert.alertStyle = .critical
+            alert.addButton(withTitle: "Quit")
+            alert.runModal()
+            NSApp.terminate(nil)
+            return
+        }
+        try? diag.write(toFile: diagPath, atomically: true, encoding: .utf8)
 
         // Start daemon
         daemon = SecurityDaemon()
@@ -221,7 +255,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
         // Stats
         addStat(menu, "Email: \(daemon.emailScannerStatus)")
-        addStat(menu, "Emails scanned: \(daemon.emailsScanned)")
+        addStat(menu, "Emails scanned today: \(daemon.emailsScanned)")
         addStat(menu, "Email threats: \(daemon.emailThreats)")
         addStat(menu, "Texts scanned: \(daemon.messagesScanned)")
         addStat(menu, "Text threats: \(daemon.messageThreats)")
@@ -637,13 +671,13 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         ]
 
         // Filter to model files only
-        let modelPaths = urls.filter { url in
+        let rawModelPaths = urls.filter { url in
             let ext = url.pathExtension.lowercased()
             return modelExtensions.contains(ext) ||
                    url.lastPathComponent.hasPrefix("sha256-") // Ollama blobs
         }.map { $0.path }
 
-        guard !modelPaths.isEmpty else {
+        guard !rawModelPaths.isEmpty else {
             let alert = NSAlert()
             alert.messageText = "No Model Files Found"
             alert.informativeText = "Selected files are not recognized model formats.\nSupported: .gguf, .safetensors, .bin, .pth, .onnx, .mlmodel, .npz"
@@ -651,6 +685,21 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             alert.runModal()
             return
         }
+
+        // Validate paths: reject symlinks and sensitive-root targets before
+        // passing anything to the hasher. A user-invoked right-click Service
+        // is exactly the surface where a dropped symlink attack would land.
+        let (modelPaths, rejected) = PathGuard.validateBatch(rawModelPaths)
+        if !rejected.isEmpty {
+            let list = rejected.map { "• \($0.0)\n   \($0.1)" }.joined(separator: "\n")
+            let alert = NSAlert()
+            alert.messageText = "\(rejected.count) file(s) refused"
+            alert.informativeText = "AISecurity won't hash these — they're symlinks or point into protected locations:\n\n\(list)"
+            alert.alertStyle = .warning
+            alert.runModal()
+            // Proceed with whatever survived validation.
+        }
+        guard !modelPaths.isEmpty else { return }
 
         // Hash them via Rust model verifier
         if let json = SecurityCoreBridge.modelVerify(securityDir: SecurityConfig.shared.securityDir),
@@ -718,7 +767,25 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             return
         }
 
-        let paths = urls.map { $0.path }
+        let rawPaths = urls.map { $0.path }
+
+        // Protect operation is destructive (it rewrites the file as a .vault),
+        // so a symlink attack here is worse than on hashing — it could encrypt
+        // and irreversibly corrupt the target. Validate and bail out loudly on
+        // any rejection so the user knows why their file wasn't encrypted.
+        let (paths, rejected) = PathGuard.validateBatch(rawPaths)
+        if !rejected.isEmpty {
+            let list = rejected.map { "• \($0.0)\n   \($0.1)" }.joined(separator: "\n")
+            let alert = NSAlert()
+            alert.messageText = "\(rejected.count) file(s) refused"
+            alert.informativeText = "AISecurity won't encrypt these — they're symlinks or point into protected locations (SSH keys, Keychain, system files):\n\n\(list)"
+            alert.alertStyle = .warning
+            alert.runModal()
+        }
+        guard !paths.isEmpty else {
+            error.pointee = "All selected files were refused by path policy" as NSString
+            return
+        }
 
         // Pick protection level
         guard let protection = VaultDialogs.pickProtectionLevel() else { return }
@@ -922,22 +989,31 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         daemon?.stop()
         VaultManager.shared.clearPassphrase()
 
-        // Spawn a detached shell that waits for us to fully exit, then relaunches.
-        // This ensures macOS sees the process as quit (required for FDA to take effect).
-        let appPath = Bundle.main.bundlePath
-        let pid = ProcessInfo.processInfo.processIdentifier
-        let script = """
-        while kill -0 \(pid) 2>/dev/null; do sleep 0.5; done
-        sleep 1
-        open -a "\(appPath)"
-        """
+        // Delegate the stop+restart dance to launchd directly. `launchctl
+        // kickstart -k <service-target>` terminates the running instance and
+        // launchd's KeepAlive=true then relaunches it. This replaces the
+        // previous approach of invoking `/bin/zsh -c "...open -a \(appPath)..."`
+        // where `appPath` was interpolated into a shell string — a shell
+        // injection surface if the bundle path ever contained quotes or
+        // command substitution metacharacters.
+        //
+        // Arguments are passed as a fixed array to Process, never parsed by
+        // a shell, so there is no interpolation risk.
+        let uid = getuid()
+        let serviceTarget = "gui/\(uid)/com.aisecurity.shield"
+
         let task = Process()
-        task.executableURL = URL(fileURLWithPath: "/bin/zsh")
-        task.arguments = ["-c", script]
+        task.executableURL = URL(fileURLWithPath: "/bin/launchctl")
+        task.arguments = ["kickstart", "-k", serviceTarget]
+        task.standardOutput = Pipe()
+        task.standardError = Pipe()
         try? task.run()
 
-        // Now actually quit
-        NSApplication.shared.terminate(nil)
+        // launchd will send SIGTERM to us; terminate explicitly as a fallback
+        // in case kickstart fails (e.g. not managed by launchd in some dev flows).
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
+            NSApplication.shared.terminate(nil)
+        }
     }
 
     @objc private func quitApp() {

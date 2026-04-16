@@ -811,15 +811,46 @@ pub extern "C" fn sec_free_vault_entries(ptr: *mut VaultEntryArrayFFI) {
 // Encryption helpers (for Swift-side encrypted storage)
 // ---------------------------------------------------------------------------
 
+/// Install the process-global master key. `hex` must be the hex encoding of
+/// exactly 32 random bytes sourced from the macOS Keychain.
+/// Returns true on success. Once set, subsequent calls are no-ops (idempotent).
+#[no_mangle]
+pub extern "C" fn sec_set_master_key(hex: *const c_char) -> bool {
+    let hex = match unsafe { from_c_str(hex) } {
+        Some(h) => h,
+        None => return false,
+    };
+    // Decode hex to bytes.
+    if !hex.len().is_multiple_of(2) || hex.len() != 64 {
+        return false;
+    }
+    let mut bytes = Vec::with_capacity(32);
+    for i in (0..hex.len()).step_by(2) {
+        match u8::from_str_radix(&hex[i..i + 2], 16) {
+            Ok(b) => bytes.push(b),
+            Err(_) => return false,
+        }
+    }
+    security_core::encryption::set_master_key(&bytes)
+}
+
+/// True iff the master key has already been installed.
+#[no_mangle]
+pub extern "C" fn sec_has_master_key() -> bool {
+    security_core::encryption::has_master_key()
+}
+
 /// Encrypt a JSON string with the WHITELIST AAD tag. Returns hex string.
 /// Caller must free with sec_free_string.
+/// Returns null if the master key has not been installed — callers must NOT
+/// fall back to plaintext storage.
 #[no_mangle]
 pub extern "C" fn sec_encrypt_whitelist(json: *const c_char) -> *mut c_char {
     let json = match unsafe { from_c_str(json) } {
         Some(j) => j,
         None => return ptr::null_mut(),
     };
-    let enc = match security_core::encryption::Encryptor::from_env(false) {
+    let enc = match security_core::encryption::Encryptor::from_master_key() {
         Ok(e) => e,
         Err(_) => return ptr::null_mut(),
     };
@@ -837,10 +868,27 @@ pub extern "C" fn sec_decrypt_whitelist(hex: *const c_char) -> *mut c_char {
         Some(h) => h,
         None => return ptr::null_mut(),
     };
-    let enc = match security_core::encryption::Encryptor::from_env(false) {
+    let enc = match security_core::encryption::Encryptor::from_master_key() {
         Ok(e) => e,
         Err(_) => return ptr::null_mut(),
     };
+    match enc.decrypt_string(&hex, security_core::encryption::aad::WHITELIST) {
+        Ok(json) => to_c_string(&json),
+        Err(_) => ptr::null_mut(),
+    }
+}
+
+/// ONE-SHOT MIGRATION ONLY: decrypt a whitelist blob that was encrypted with
+/// the legacy default-passphrase key (pre-master-key versions of the app).
+/// Swift calls this when normal decryption fails, then re-encrypts with the
+/// new master key. Will be removed in a future version.
+#[no_mangle]
+pub extern "C" fn sec_decrypt_whitelist_legacy(hex: *const c_char) -> *mut c_char {
+    let hex = match unsafe { from_c_str(hex) } {
+        Some(h) => h,
+        None => return ptr::null_mut(),
+    };
+    let enc = security_core::encryption::Encryptor::legacy_default();
     match enc.decrypt_string(&hex, security_core::encryption::aad::WHITELIST) {
         Ok(json) => to_c_string(&json),
         Err(_) => ptr::null_mut(),

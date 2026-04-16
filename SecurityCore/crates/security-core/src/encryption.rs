@@ -10,6 +10,32 @@ use hmac::Hmac;
 use pbkdf2::pbkdf2;
 use rand::RngCore;
 use sha2::Sha256;
+use std::sync::OnceLock;
+
+/// Process-global master key, set once at startup by the Swift host from the
+/// macOS Keychain. All at-rest encryption of app-internal data (whitelist,
+/// model manifest, etc.) goes through this key — NOT through a passphrase.
+/// If the key is never set, `Encryptor::from_master_key()` returns an error
+/// and callers must fail closed (never silently fall back to a default).
+static MASTER_KEY: OnceLock<[u8; 32]> = OnceLock::new();
+
+/// Install the process-global master key. Returns false if already set
+/// (idempotent) or if the input is not exactly 32 bytes.
+pub fn set_master_key(bytes: &[u8]) -> bool {
+    if bytes.len() != 32 {
+        return false;
+    }
+    let mut key = [0u8; 32];
+    key.copy_from_slice(bytes);
+    // set() returns Err if already set — treat as success (idempotent).
+    let _ = MASTER_KEY.set(key);
+    true
+}
+
+/// True if a master key has been installed for this process.
+pub fn has_master_key() -> bool {
+    MASTER_KEY.get().is_some()
+}
 
 /// AAD tags for different encryption contexts — prevents ciphertext reuse across contexts.
 pub mod aad {
@@ -82,6 +108,7 @@ pub enum EncryptionError {
     EncryptionFailed(String),
     DecryptionFailed(String),
     DefaultPassphrase,
+    MasterKeyUnset,
 }
 
 impl std::fmt::Display for EncryptionError {
@@ -93,6 +120,10 @@ impl std::fmt::Display for EncryptionError {
             Self::DefaultPassphrase => write!(
                 f,
                 "Default passphrase in production — set SECURITYCORE_PASSPHRASE"
+            ),
+            Self::MasterKeyUnset => write!(
+                f,
+                "Master key not installed — host must call set_master_key() at startup"
             ),
         }
     }
@@ -123,6 +154,9 @@ impl Encryptor {
 
     /// Create from environment variable, falling back to default.
     /// In production mode, returns Err if using the default passphrase.
+    ///
+    /// DEPRECATED for app-internal data — use `from_master_key()` instead.
+    /// Kept only for tests and CLI tooling.
     pub fn from_env(enforce_production: bool) -> Result<Self, EncryptionError> {
         let passphrase = std::env::var("SECURITYCORE_PASSPHRASE")
             .unwrap_or_else(|_| DEFAULT_PASSPHRASE.to_string());
@@ -132,6 +166,37 @@ impl Encryptor {
         }
 
         Ok(Self::new(&passphrase))
+    }
+
+    /// Create from raw 32-byte key (no KDF). Used when the caller already
+    /// has cryptographically random key material (e.g. from the macOS Keychain).
+    pub fn from_key_bytes(key: &[u8]) -> Result<Self, EncryptionError> {
+        if key.len() != 32 {
+            return Err(EncryptionError::InvalidData(format!(
+                "Key must be 32 bytes, got {}",
+                key.len()
+            )));
+        }
+        let cipher = Aes256Gcm::new_from_slice(key)
+            .map_err(|e| EncryptionError::EncryptionFailed(format!("AES init: {}", e)))?;
+        Ok(Self { cipher })
+    }
+
+    /// Create from the process-global master key installed by the Swift host.
+    /// Returns `MasterKeyUnset` if the host never called `set_master_key()`.
+    /// This is the ONLY path production callers should use for app-internal data.
+    pub fn from_master_key() -> Result<Self, EncryptionError> {
+        match MASTER_KEY.get() {
+            Some(key) => Self::from_key_bytes(key),
+            None => Err(EncryptionError::MasterKeyUnset),
+        }
+    }
+
+    /// Create an encryptor that uses the legacy default passphrase. This is
+    /// ONLY for one-shot migration of data encrypted before the master-key
+    /// system existed. Never use for new encryption.
+    pub fn legacy_default() -> Self {
+        Self::new(DEFAULT_PASSPHRASE)
     }
 
     /// Encrypt plaintext with AAD context binding.
@@ -402,5 +467,43 @@ mod tests {
         let decrypted = enc.decrypt(&encrypted, aad::GENERAL).unwrap();
         assert_eq!(decrypted, b"works");
         std::env::remove_var("SECURITYCORE_PASSPHRASE");
+    }
+
+    #[test]
+    fn from_key_bytes_rejects_wrong_length() {
+        assert!(Encryptor::from_key_bytes(&[0u8; 16]).is_err());
+        assert!(Encryptor::from_key_bytes(&[0u8; 31]).is_err());
+        assert!(Encryptor::from_key_bytes(&[0u8; 33]).is_err());
+        assert!(Encryptor::from_key_bytes(&[0u8; 32]).is_ok());
+    }
+
+    #[test]
+    fn raw_key_roundtrip_is_deterministic() {
+        let key = [0x42u8; 32];
+        let enc1 = Encryptor::from_key_bytes(&key).unwrap();
+        let ct = enc1.encrypt(b"secret", aad::WHITELIST).unwrap();
+        let enc2 = Encryptor::from_key_bytes(&key).unwrap();
+        let pt = enc2.decrypt(&ct, aad::WHITELIST).unwrap();
+        assert_eq!(pt, b"secret");
+    }
+
+    #[test]
+    fn different_raw_keys_produce_incompatible_ciphertext() {
+        let enc_a = Encryptor::from_key_bytes(&[0x01; 32]).unwrap();
+        let enc_b = Encryptor::from_key_bytes(&[0x02; 32]).unwrap();
+        let ct = enc_a.encrypt(b"hi", aad::WHITELIST).unwrap();
+        assert!(enc_b.decrypt(&ct, aad::WHITELIST).is_err());
+    }
+
+    #[test]
+    fn set_master_key_validates_length() {
+        // Must be exactly 32 bytes.
+        assert!(!set_master_key(&[0u8; 16]));
+        assert!(!set_master_key(&[0u8; 64]));
+        // 32-byte input is accepted (first-set; subsequent sets are no-ops but
+        // still return true from this API path since the function succeeded in
+        // attempting to install). Note: OnceLock is process-global, so we
+        // can't assert exact state across tests — this just checks the
+        // length-gate logic.
     }
 }

@@ -25,15 +25,23 @@ final class SenderWhitelist: @unchecked Sendable {
     struct ScanPolicy: Sendable {
         let isWhitelisted: Bool
 
-        /// Categories that should ALWAYS fire regardless of whitelist
+        /// Categories that should ALWAYS fire regardless of whitelist.
+        /// `authority_impersonation` lives here because BEC / CEO-fraud attacks
+        /// specifically target mailboxes inside trusted domains — if anything,
+        /// a trusted sender asking for a wire transfer is MORE suspicious, not
+        /// less. We never silence these alerts.
         static let alwaysScanCategories: Set<String> = [
             "malicious_url", "dangerous_attachment", "malware_dropper",
-            "prompt_injection", "crypto_scam"
+            "prompt_injection", "crypto_scam",
+            "authority_impersonation"
         ]
 
-        /// Categories suppressed for whitelisted senders
+        /// Categories suppressed for whitelisted senders. Limited to generic
+        /// tone/urgency signals (social_engineering) which are noisy on real
+        /// business mail from known contacts. Never suppress anything that
+        /// represents actionable financial or credential risk.
         static let suppressedCategories: Set<String> = [
-            "social_engineering", "authority_impersonation"
+            "social_engineering"
         ]
 
         /// Categories with raised threshold for whitelisted senders
@@ -49,7 +57,7 @@ final class SenderWhitelist: @unchecked Sendable {
             // Unknown senders — everything fires
             if !isWhitelisted { return true }
 
-            // Whitelisted: suppress social engineering / authority impersonation
+            // Whitelisted: suppress generic social-engineering noise only.
             if Self.suppressedCategories.contains(category) { return false }
 
             // Whitelisted: raise threshold for reduced categories (need 5+ layers)
@@ -163,23 +171,47 @@ final class SenderWhitelist: @unchecked Sendable {
     // MARK: - Encrypted Persistence
 
     private func load() {
-        // Try encrypted file first (whitelist.enc)
+        // Try encrypted file first (whitelist.enc), using the current master key.
         if FileManager.default.fileExists(atPath: encryptedFilePath),
            let hexData = FileManager.default.contents(atPath: encryptedFilePath),
            let hex = String(data: hexData, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines),
-           !hex.isEmpty,
-           let json = SecurityCoreBridge.decryptWhitelist(hex),
-           let jsonData = json.data(using: .utf8),
-           let arr = try? JSONDecoder().decode([Entry].self, from: jsonData) {
-            lock.lock()
-            for entry in arr {
-                entries[entry.address.lowercased()] = entry
+           !hex.isEmpty {
+
+            // Path A: decrypt with the current master key.
+            if let json = SecurityCoreBridge.decryptWhitelist(hex),
+               let jsonData = json.data(using: .utf8),
+               let arr = try? JSONDecoder().decode([Entry].self, from: jsonData) {
+                lock.lock()
+                for entry in arr {
+                    entries[entry.address.lowercased()] = entry
+                }
+                lock.unlock()
+                return
             }
-            lock.unlock()
+
+            // Path B: master key failed — try the legacy default passphrase
+            // (data written by pre-master-key versions of the app). If this
+            // succeeds, re-encrypt immediately with the master key so the
+            // legacy-decryption path is never used again on this install.
+            if let json = SecurityCoreBridge.decryptWhitelistLegacy(hex),
+               let jsonData = json.data(using: .utf8),
+               let arr = try? JSONDecoder().decode([Entry].self, from: jsonData) {
+                lock.lock()
+                for entry in arr {
+                    entries[entry.address.lowercased()] = entry
+                }
+                lock.unlock()
+                save()   // re-encrypt under the master key
+                return
+            }
+
+            // Both paths failed — whitelist is unreadable. Do NOT silently
+            // clobber it; leave the file in place so an operator can inspect.
+            // Start with an empty in-memory whitelist this run.
             return
         }
 
-        // Fall back to legacy plain JSON (whitelist.json) for migration
+        // Fall back to legacy plain JSON (whitelist.json) for first-ever migration
         if FileManager.default.fileExists(atPath: legacyFilePath),
            let data = FileManager.default.contents(atPath: legacyFilePath),
            let arr = try? JSONDecoder().decode([Entry].self, from: data) {
@@ -200,13 +232,21 @@ final class SenderWhitelist: @unchecked Sendable {
         let arr = Array(entries.values)
         lock.unlock()
 
-        // Encrypt and save
+        // Encrypt and save. Fail CLOSED — never write plaintext to disk.
+        // If encryption fails (master key missing / crypto core broken), log
+        // to the diagnostic file and leave the existing encrypted file alone
+        // rather than silently downgrading security.
         guard let jsonData = try? JSONEncoder().encode(arr),
               let json = String(data: jsonData, encoding: .utf8),
               let hex = SecurityCoreBridge.encryptWhitelist(json) else {
-            // Fallback: save as plain JSON if encryption fails (shouldn't happen)
-            if let data = try? JSONEncoder().encode(arr) {
-                try? data.write(to: URL(fileURLWithPath: legacyFilePath))
+            let diagPath = (NSHomeDirectory() as NSString).appendingPathComponent(".mac-security/logs/whitelist-errors.log")
+            let msg = "[\(Date())] ERROR: whitelist encryption failed — changes NOT persisted. Master key likely unset.\n"
+            if let handle = FileHandle(forWritingAtPath: diagPath) {
+                handle.seekToEndOfFile()
+                handle.write(msg.data(using: .utf8) ?? Data())
+                handle.closeFile()
+            } else {
+                try? msg.write(toFile: diagPath, atomically: true, encoding: .utf8)
             }
             return
         }

@@ -314,8 +314,22 @@ void sec_free_vault_result(struct VaultResultFFI *ptr);
 void sec_free_vault_entries(struct VaultEntryArrayFFI *ptr);
 
 /**
+ * Install the process-global master key. `hex` must be the hex encoding of
+ * exactly 32 random bytes sourced from the macOS Keychain.
+ * Returns true on success. Once set, subsequent calls are no-ops (idempotent).
+ */
+bool sec_set_master_key(const char *hex);
+
+/**
+ * True iff the master key has already been installed.
+ */
+bool sec_has_master_key(void);
+
+/**
  * Encrypt a JSON string with the WHITELIST AAD tag. Returns hex string.
  * Caller must free with sec_free_string.
+ * Returns null if the master key has not been installed — callers must NOT
+ * fall back to plaintext storage.
  */
 char *sec_encrypt_whitelist(const char *json);
 
@@ -324,6 +338,14 @@ char *sec_encrypt_whitelist(const char *json);
  * Caller must free with sec_free_string.
  */
 char *sec_decrypt_whitelist(const char *hex);
+
+/**
+ * ONE-SHOT MIGRATION ONLY: decrypt a whitelist blob that was encrypted with
+ * the legacy default-passphrase key (pre-master-key versions of the app).
+ * Swift calls this when normal decryption fails, then re-encrypts with the
+ * new master key. Will be removed in a future version.
+ */
+char *sec_decrypt_whitelist_legacy(const char *hex);
 
 /**
  * Check a command against the policy. Caller must free with sec_free_command_check.

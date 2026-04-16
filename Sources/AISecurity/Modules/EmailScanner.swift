@@ -92,8 +92,10 @@ final class EmailScanner: @unchecked Sendable {
                 logger.info("\u{1F4E7} Pruned \(beforeMailboxPrune - dict.count) entries from skipped mailboxes (Deleted/Junk/Sent)")
             }
             self.scannedFiles = dict
-            // Unique emails = number of paths in the state dict
-            self.emailsScanned = dict.count
+            // emailsScanned starts at 0 on every launch — counts today's scans only.
+            // The scannedFiles dict still tracks all files so we don't rescan them,
+            // but the visible counter ("Emails scanned today") resets fresh.
+            self.emailsScanned = 0
         }
 
         self.dangerousExtensions = [

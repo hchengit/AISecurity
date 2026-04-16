@@ -746,6 +746,163 @@ lacks a systematic defense against agent-initiated tool abuse.
 
 ---
 
+### Phase 15: Security Hardening Audit — Self-Protection & Tamper Resistance
+
+**Completed: 2026-04-16** — an end-to-end security audit of the app itself,
+followed by targeted fixes for every finding. Goal: make AISecurity safe
+to run and trustworthy as a security tool rather than a security surface.
+
+**Audit findings (prioritized, all addressed):**
+
+| # | Finding | Severity | Status |
+|---|---------|----------|--------|
+| 1 | Master encryption key was a hardcoded constant — `DEFAULT_PASSPHRASE` baked into the binary; FFI callers silently accepted it | CRITICAL | ✅ Fixed |
+| 2 | No self-protection against LaunchAgent / bundle removal — any user process could disable the agent in one command | CRITICAL | ✅ Fixed |
+| 3 | Whitelist silently fell back to plaintext JSON if encryption failed | HIGH | ✅ Fixed |
+| 4 | Shell injection surface in relaunch flow (`\(appPath)` interpolated into `zsh -c` script) | HIGH | ✅ Fixed |
+| 5 | Finder Services handlers followed symlinks and had no sensitive-path deny-list | HIGH | ✅ Fixed |
+| 6 | No code signature verification at runtime — tampered bundle could start | HIGH | ✅ Fixed |
+| 7 | Whitelist suppressed `authority_impersonation` alerts for known senders — exactly the category BEC / CEO-fraud exploits | HIGH | ✅ Fixed |
+
+#### Fix details
+
+**#1 — Keychain-backed master key (`SecurityCore/crates/security-core/src/encryption.rs`, `security-core-ffi/src/lib.rs`, `Sources/AISecurity/Core/MasterKey.swift`)**
+- 32 random bytes generated via `SecRandomCopyBytes` on first run, stored in macOS login Keychain with `kSecAttrAccessibleWhenUnlockedThisDeviceOnly`, not iCloud-synced
+- New Rust `Encryptor::from_master_key()` reads from a process-global `OnceLock<[u8; 32]>` installed once at startup via `sec_set_master_key()` FFI
+- New `Encryptor::from_key_bytes()` skips KDF when the caller already has random key material (Keychain = no need for PBKDF2)
+- App refuses to start if the Keychain can't be read or written — no silent downgrade
+- One-shot migration path (`sec_decrypt_whitelist_legacy`) transparently re-encrypts existing `whitelist.enc` blobs that were written under the old default-passphrase key
+- 4 new unit tests cover length validation, roundtrip determinism, and cross-key isolation
+
+**#2 — Self-protection watchdog (`Sources/AISecurity/Modules/SelfProtection.swift`)**
+- DispatchSource watches `~/Library/LaunchAgents/com.aisecurity.shield.plist` for `.write | .delete | .rename | .attrib`
+- On tamper: re-writes the canonical plist (built via `PropertyListSerialization` from the running bundle path), restricts to mode `0600`, and re-registers with `launchctl bootstrap gui/$UID`
+- Semantic plist comparison (parses both sides) avoids false-positive restores on benign format differences
+- 30-second periodic re-check catches events missed during the 15-second cooldown
+- Bundle watch fires CRITICAL alert if `/Applications/AISecurity.app` itself is deleted (can't self-restore a binary)
+- Alert routing: `onTamperDetected` closure pushes events through `SecurityLogger.alert()` so the menu bar + notification center see them
+- **Tested live**: `rm` of plist → restored in <1s; `echo "GARBAGE" > plist` → detected via permissions-change event and restored
+
+**#3 — Fail-closed whitelist (`Sources/AISecurity/Core/SenderWhitelist.swift`)**
+- `save()` no longer writes plaintext JSON as a fallback when encryption fails
+- Encryption failure now logs to `~/.mac-security/logs/whitelist-errors.log` and leaves the existing encrypted file untouched
+- `load()` tries current master key first, then legacy default (one-shot migration), then bails rather than clobbering an unreadable file
+
+**#4 — Shell-free relaunch (`Sources/AISecurity/AISecurityApp.swift`, `relaunchApp`)**
+- Replaced `Process("/bin/zsh", ["-c", "... open -a \(appPath) ..."])` with `Process("/bin/launchctl", ["kickstart", "-k", "gui/\(uid)/com.aisecurity.shield"])`
+- Array arguments, never interpreted by a shell — no interpolation surface regardless of bundle path contents
+- launchd's `KeepAlive=true` handles the restart, which also exercises the self-protection watchdog in normal operation
+
+**#5 — Services path guard (`Sources/AISecurity/Core/PathGuard.swift`)**
+- Applied to `hashModelService` and `protectFilesService`
+- Rejects symlinks outright (detected via `.typeSymbolicLink` attribute — not follow-then-check)
+- Canonicalizes via `standardizingPath` + `resolvingSymlinksInPath`
+- Hard-coded sensitive-root deny-list: `/System`, `/usr`, `/bin`, `/sbin`, `/etc`, `/private/etc`, `/private/var/db`, `/Library/Keychains`, `~/Library/Keychains`, `~/.ssh`, `~/.gnupg`, `~/.aws`, `~/.config/gcloud`, `~/.kube`, `~/.mac-security`
+- Rejected paths surface in an NSAlert listing each path + reason; accepted paths proceed normally
+- **Tested live**: symlink → `/etc/hosts` rejected; `~/.ssh` rejected; `~/.mac-security` rejected; normal `/tmp/*.txt` allowed
+
+**#6 — Runtime code signature verification (`Sources/AISecurity/Core/CodeSignatureGuard.swift`)**
+- Invoked first in `applicationDidFinishLaunching`, before any module is loaded
+- Calls `SecStaticCodeCheckValidityWithErrors` on `Bundle.main.bundlePath`
+- Production path (bundle under `/Applications/`): invalid signature → blocking NSAlert → `NSApp.terminate(nil)`
+- Dev path (any other location): logs result, continues — keeps `swift run` workflows alive
+- Unsigned case (`errSecCSUnsigned` = -67062) treated as dev build
+- **Tested live**: `echo "TAMPERED" >> /Applications/AISecurity.app/Contents/Info.plist` → OSStatus -67030 (`errSecCSResourceDirectoryFailed`) → alert + terminate; `KeepAlive` relaunches, guard catches again — loud fail loop until reinstall
+- Becomes authoritatively tamper-proof after Developer ID signing (see "Post-signing follow-ups" below)
+
+**#7 — Whitelist never silences BEC-class alerts (`Sources/AISecurity/Core/SenderWhitelist.swift`)**
+- Moved `authority_impersonation` from `suppressedCategories` → `alwaysScanCategories`
+- Rationale: a wire-transfer request from a trusted-domain mailbox is MORE suspicious than one from an unknown sender (that's the BEC attack pattern)
+- `suppressedCategories` now limited to `social_engineering` only — generic tone/urgency noise on legitimate business mail
+
+#### New files
+
+| File | Purpose |
+|------|---------|
+| `Sources/AISecurity/Core/MasterKey.swift` | Keychain-backed 32-byte master key install |
+| `Sources/AISecurity/Core/PathGuard.swift` | Symlink + sensitive-path validation for Services handlers |
+| `Sources/AISecurity/Core/CodeSignatureGuard.swift` | Startup bundle signature verification |
+| `Sources/AISecurity/Modules/SelfProtection.swift` | Active LaunchAgent watchdog + bundle integrity monitor |
+
+#### Modified files
+
+| File | Change |
+|------|--------|
+| `SecurityCore/crates/security-core/src/encryption.rs` | Master-key OnceLock, `from_master_key()`, `from_key_bytes()`, `legacy_default()`, 4 new tests |
+| `SecurityCore/crates/security-core-ffi/src/lib.rs` | `sec_set_master_key`, `sec_has_master_key`, `sec_decrypt_whitelist_legacy`; whitelist FFI switched to master-key path |
+| `Sources/AISecurity/RustBridge/SecurityCoreBridge.swift` | Wrappers for new FFI |
+| `Sources/AISecurity/AISecurityApp.swift` | Signature check first, then master key install, then daemon; shell-free relaunch; PathGuard in both Services handlers |
+| `Sources/AISecurity/Core/SecurityDaemon.swift` | Wires `SelfProtection` into start/stop + tamper alert routing |
+| `Sources/AISecurity/Core/SenderWhitelist.swift` | Fail-closed save(); migration-aware load(); `authority_impersonation` moved to always-scan |
+| `Sources/AISecurity/Modules/EmailScanner.swift` | Emails-scanned counter resets on every startup (daily counter) |
+
+#### Residual gaps (intentional, documented)
+
+| Gap | Why not closed | Mitigation path |
+|-----|----------------|-----------------|
+| Attacker with `sudo` can replace Keychain, disable LaunchAgents globally | Needs Endpoint Security framework access | See "Post-signing follow-ups" below |
+| Vault passphrase cached in memory during a session | UX / re-prompt trade-off | Future `mlock()` + timeout prompt |
+| Threat feeds downloaded over HTTPS but not signed by publisher | OpenPhish / Spamhaus don't publish signatures yet | Pin cert + size cap later |
+| No enforcement on signer identity (ad-hoc signature = anyone can re-sign) | Needs Apple Developer ID cert | See "Post-signing follow-ups" below |
+
+---
+
+### Post-signing follow-ups (business developer enrollment)
+
+After enrolling in the Apple Developer Program as an Organization (requires
+LLC + DUNS number — process documented in session notes), the following
+items open up. None of them require code changes to the fixes above; they
+strengthen what's already there.
+
+#### Immediate wins from Developer ID certificate ($99/yr)
+
+- [ ] **Sign the app bundle with Developer ID Application cert** — replaces ad-hoc signature; Fix #6's runtime check now proves signer identity, not just file integrity
+- [ ] **Enable Hardened Runtime** — adds library-validation, stack protection, and blocks `task_for_pid()` from other user processes (closes the "attach lldb and read the passphrase" class of attack)
+- [ ] **Set `com.apple.security.get-task-allow = NO` entitlement** — refuses debugger attach even by processes the user owns
+- [ ] **Notarize the app** — Apple staples a ticket; Gatekeeper approves it on other machines without right-click → Open
+- [ ] **Distribute a `.dmg`** — users can install by drag-and-drop rather than via `bash install.sh`; sets up the Gatekeeper-clean path
+
+Benefits: closes Audit Finding #6's ad-hoc bypass, meaningfully hardens memory against process-to-process attacks, and unblocks distribution beyond your own machine.
+
+#### After notarization — advanced entitlements
+
+Apple guards these behind a separate request process (weeks to months for
+approval; individuals often rejected; organizations with a product page +
+privacy policy + clear use case have a realistic shot):
+
+- [ ] **Apply for Endpoint Security Client entitlement** (`com.apple.developer.endpoint-security.client`)
+    - Unlocks: kernel-adjacent event subscription (every `fork`, `exec`, `open`, `mount`, `auth_event`)
+    - Enables: *preventing* malicious events before they happen, not just alerting after
+    - Replaces current polling `ProcessMonitor` with authoritative real-time feed
+    - Closes residual gap: "attacker with sudo can disable the agent" becomes enforceable at the OS level
+- [ ] **Apply for Network Extension entitlement** (`com.apple.developer.networking.networkextension`)
+    - Unlocks: inline network filter (Little Snitch-class firewall)
+    - Enables: block data exfiltration attempts from AI agents or compromised apps before packets leave the machine
+- [ ] **Apply for System Extension install entitlement** (`com.apple.developer.system-extension.install`)
+    - Unlocks: running security logic in the System Extension sandbox, out of the user process
+    - Enables: self-protection that survives process kill + user-level tamper
+- [ ] **Pursue MDM/Configuration-Profile-based binding** — for multi-machine deployment, profiles can lock in the LaunchAgent at a privileged level
+
+#### Infrastructure / distribution polish (lower priority)
+
+- [ ] **Sparkle auto-update integration** — signed, ed25519-authenticated update channel
+- [ ] **Crash reporting pipeline** — sentry or self-hosted; signed-only uploads
+- [ ] **Public signing policy document** — which build artifacts are signed, with which cert, which revocation process
+- [ ] **Reproducible-build pipeline** — Rust `--locked` + pinned toolchain + archived `Cargo.lock` + hash-verified static lib
+- [ ] **Independent third-party pentest** once ES entitlement is granted and code paths are stable
+
+#### Signing prerequisites (do these first)
+
+- [ ] Register LLC in home state (done)
+- [ ] Obtain DUNS number via Apple's free lookup portal — https://developer.apple.com/enroll/duns-lookup/
+- [ ] Create a new Apple ID owned by the LLC (separate from personal Apple ID; Individual-enrolled accounts can't convert to Organization)
+- [ ] Set up a minimal product/company website (any one-pager works; Apple verifies domain ↔ legal entity association)
+- [ ] Enroll in Apple Developer Program → Organization type ($99/yr)
+- [ ] Generate Developer ID Application certificate from Xcode / Apple Developer portal
+- [ ] Integrate signing into `install.sh` and/or CI
+
+---
+
 ## 0b. Codebase Audit Results
 
 ### AISecurity (Swift) — 13 source files

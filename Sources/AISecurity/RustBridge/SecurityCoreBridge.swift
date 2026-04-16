@@ -454,7 +454,20 @@ enum SecurityCoreBridge {
 
     // MARK: - Encryption Helpers
 
+    /// Install the process-global master key (32 bytes, hex-encoded = 64 chars)
+    /// into the Rust crypto core. Called once at startup by MasterKey.install().
+    static func setMasterKey(_ hex: String) -> Bool {
+        return hex.withCString { sec_set_master_key($0) }
+    }
+
+    /// True iff the Rust core has a master key installed.
+    static func hasMasterKey() -> Bool {
+        return sec_has_master_key()
+    }
+
     /// Encrypt a JSON string for whitelist storage (AES-256-GCM with WHITELIST AAD).
+    /// Returns nil if the master key is not installed — callers MUST NOT fall
+    /// back to plaintext storage.
     static func encryptWhitelist(_ json: String) -> String? {
         let ptr = json.withCString { sec_encrypt_whitelist($0) }
         guard ptr != nil else { return nil }
@@ -465,6 +478,16 @@ enum SecurityCoreBridge {
     /// Decrypt a hex string from whitelist storage.
     static func decryptWhitelist(_ hex: String) -> String? {
         let ptr = hex.withCString { sec_decrypt_whitelist($0) }
+        guard ptr != nil else { return nil }
+        defer { sec_free_string(ptr) }
+        return String(cString: ptr!)
+    }
+
+    /// MIGRATION ONLY: try decrypting a whitelist blob that was encrypted with
+    /// the pre-master-key legacy default passphrase. Returns the plaintext JSON
+    /// on success so the caller can re-encrypt with the current master key.
+    static func decryptWhitelistLegacy(_ hex: String) -> String? {
+        let ptr = hex.withCString { sec_decrypt_whitelist_legacy($0) }
         guard ptr != nil else { return nil }
         defer { sec_free_string(ptr) }
         return String(cString: ptr!)

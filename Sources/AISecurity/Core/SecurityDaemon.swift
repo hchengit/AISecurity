@@ -39,6 +39,7 @@ final class SecurityDaemon: ObservableObject {
     private var processMonitor: ProcessMonitor!
     private var tccMonitor: TCCMonitor!
     private var modelWatcher: ModelDirectoryWatcher!
+    private var selfProtection: SelfProtection!
     private var modulesReady = false
 
     // MARK: - Timers
@@ -78,6 +79,7 @@ final class SecurityDaemon: ObservableObject {
         processMonitor = ProcessMonitor(logger: logger)
         tccMonitor = TCCMonitor(logger: logger)
         modelWatcher = ModelDirectoryWatcher(logger: logger)
+        selfProtection = SelfProtection(securityDir: config.securityDir)
         messagesScanner = MessagesScanner(
             logger: logger,
             whitelist: whitelist,
@@ -222,6 +224,23 @@ final class SecurityDaemon: ObservableObject {
         // 7. Self-protection monitor (watch own binary, config, logs)
         startSelfProtectionMonitor()
 
+        // 7b. Active self-protection: restore LaunchAgent plist if deleted / tampered.
+        selfProtection.onTamperDetected = { [weak self] kind, detail in
+            guard let self = self else { return }
+            let severity: SeverityLevel = (kind == "APP_BUNDLE_TAMPER") ? .critical : .high
+            let alert = SecurityAlert(
+                type: kind,
+                severity: severity,
+                message: "\u{1F6E1} Self-protection: \(detail)",
+                filePath: nil
+            )
+            self.logger.alert(alert)
+            Task { @MainActor in
+                self.threatCount += 1
+            }
+        }
+        selfProtection.start()
+
         // 8. Process monitor + TCC monitor (Phase 13: AI Agent Threat Defense)
         processMonitor.start()
         tccMonitor.start()
@@ -284,6 +303,7 @@ final class SecurityDaemon: ObservableObject {
         statusWriterTimer = nil
         selfProtectionSources.forEach { $0.cancel() }
         selfProtectionSources.removeAll()
+        selfProtection?.stop()
         isRunning = false
         logger.info("\u{1F4F4} Mac Security Agent stopped")
         onStateChange?()
