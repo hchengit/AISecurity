@@ -156,17 +156,69 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                 if result.success {
                     let originalPaths = vaultFiles.map { String($0.dropLast(".vault".count)) }
                     if isTemporary {
-                        // Hide .vault files and open originals — re-encrypt when closed
-                        for vf in vaultFiles {
-                            let url = URL(fileURLWithPath: vf)
-                            try? (url as NSURL).setResourceValue(true, forKey: .isHiddenKey)
-                        }
-                        for orig in originalPaths {
+                        // "Open Temporarily" must work regardless of where the
+                        // .vault file lives (vault manifest, portable export
+                        // folder, USB drive, iCloud, etc.). The original bug:
+                        // this path hid the .vault but never registered with
+                        // TemporaryDecryptMonitor, so re-encrypt + unhide
+                        // never ran. Files outside the tracking manifest
+                        // would get permanently-hidden .vault files.
+                        //
+                        // Fix sequence:
+                        //   1. Verify plaintext actually materialized on disk.
+                        //      If Rust unlock claimed success but wrote nothing
+                        //      (iCloud placeholder, permission issue, etc.),
+                        //      surface that clearly instead of hiding the .vault.
+                        //   2. Hide only the .vault files whose plaintext
+                        //      really exists.
+                        //   3. Register ALL successfully-decrypted plaintext
+                        //      paths with TemporaryDecryptMonitor so the
+                        //      re-encrypt + unhide cleanup is scheduled.
+                        //   4. Open the plaintext in its default app.
+
+                        var materialized: [(vault: String, plaintext: String)] = []
+                        var missing: [String] = []
+                        for (vf, orig) in zip(vaultFiles, originalPaths) {
                             if FileManager.default.fileExists(atPath: orig) {
-                                NSWorkspace.shared.open(URL(fileURLWithPath: orig))
+                                materialized.append((vf, orig))
+                            } else {
+                                missing.append(orig)
                             }
                         }
-                        VaultDialogs.showSuccess("\(result.entriesAffected) file(s) opened temporarily.\nThey will re-encrypt when you close them.")
+
+                        if !missing.isEmpty && materialized.isEmpty {
+                            VaultDialogs.showError("Decryption reported success but no plaintext files were written. The .vault file(s) remain intact — try 'Decrypt Permanently' or decrypt via the Vault window.")
+                            sender.reply(toOpenOrPrint: .failure)
+                            return
+                        }
+
+                        // Hide only the .vaults whose plaintext actually landed.
+                        for pair in materialized {
+                            let url = URL(fileURLWithPath: pair.vault)
+                            try? (url as NSURL).setResourceValue(true, forKey: .isHiddenKey)
+                        }
+
+                        // Schedule re-encryption so closing the plaintext
+                        // re-seals the .vault and unhides it. Works for
+                        // files outside the vault manifest — vaultLock is
+                        // generic and doesn't require a manifest entry.
+                        let plaintextPaths = materialized.map(\.plaintext)
+                        TemporaryDecryptMonitor.shared.watch(
+                            paths: plaintextPaths,
+                            passphrase: passphrase,
+                            securityDir: SecurityConfig.shared.securityDir
+                        )
+
+                        // Open each plaintext in its default app.
+                        for pair in materialized {
+                            NSWorkspace.shared.open(URL(fileURLWithPath: pair.plaintext))
+                        }
+
+                        if missing.isEmpty {
+                            VaultDialogs.showSuccess("\(materialized.count) file(s) opened temporarily.\nThey will re-encrypt automatically when you close them.")
+                        } else {
+                            VaultDialogs.showSuccess("\(materialized.count) file(s) opened temporarily; \(missing.count) could not be decrypted (check Activity Log).")
+                        }
                     } else {
                         // Permanent: remove from vault
                         let removeResult = VaultManager.shared.removeFiles(originalPaths, passphrase: passphrase)

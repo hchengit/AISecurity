@@ -350,8 +350,85 @@ enum PortableVaultExport {
         panel.canCreateDirectories = true
         panel.prompt = "Choose"
         panel.message = "Pick the folder or USB drive where the portable vault bundle should be written."
-        guard panel.runModal() == .OK else { return nil }
-        return panel.url
+        guard panel.runModal() == .OK, let chosen = panel.url else { return nil }
+
+        // Warn if the destination lives inside iCloud Drive (or any other
+        // cloud-synced location we can detect). Two classes of problem:
+        //   1. "Open Temporarily" on the exported .vault can race with iCloud
+        //      sync — plaintext may briefly reach Apple's servers before
+        //      the local re-encrypt completes.
+        //   2. iCloud's "Optimize Mac Storage" can evict files and leave
+        //      .icloud placeholders. The decryptor will fail on placeholders.
+        // The user gets a clear choice: continue anyway, or pick a different
+        // folder. Not a hard block — they may intentionally want iCloud
+        // backup of the ciphertext, which is fine as long as they don't
+        // "Open Temporarily" from the iCloud copy.
+        if let reason = cloudSyncedReason(for: chosen) {
+            let warn = NSAlert()
+            warn.messageText = "This folder is synced by \(reason)"
+            warn.informativeText = """
+            AISecurity recommends exporting portable vault bundles to a local drive or a USB drive — not to a cloud-synced location.
+
+            Why: "Open Temporarily" on the exported .vault can race with cloud sync, and cloud storage may evict files and leave placeholders the decryptor can't read.
+
+            Storing only the encrypted ciphertext in iCloud is fine if you only ever decrypt on a local copy. If you'd like to change your selection, click "Choose Different Folder".
+            """
+            warn.alertStyle = .warning
+            warn.addButton(withTitle: "Choose Different Folder")
+            warn.addButton(withTitle: "Continue Anyway")
+            if warn.runModal() == .alertFirstButtonReturn {
+                return pickDestinationFolder()   // re-pick
+            }
+        }
+
+        return chosen
+    }
+
+    /// Returns a human-readable reason string if the URL is inside a known
+    /// cloud-synced location, or nil if it's local-only (to the best of our
+    /// ability to detect).
+    private static func cloudSyncedReason(for url: URL) -> String? {
+        let path = url.path
+        let home = NSHomeDirectory()
+
+        // iCloud Drive root (Desktop & Documents sync + standard iCloud Drive)
+        let iCloudRoots = [
+            "\(home)/Library/Mobile Documents/",
+            "\(home)/iCloud Drive/",
+        ]
+        for root in iCloudRoots {
+            if path.hasPrefix(root) { return "iCloud Drive" }
+        }
+
+        // When "Desktop & Documents" sync is ON, ~/Documents and ~/Desktop
+        // are symlinks/bind-mounts into Mobile Documents. Detect by checking
+        // if either dir's realpath lands under Mobile Documents.
+        let syncCandidates = ["\(home)/Documents", "\(home)/Desktop"]
+        for candidate in syncCandidates {
+            if path == candidate || path.hasPrefix(candidate + "/") {
+                let resolved = URL(fileURLWithPath: candidate).resolvingSymlinksInPath().path
+                if resolved.contains("Mobile Documents") {
+                    return "iCloud Drive (Desktop & Documents sync)"
+                }
+            }
+        }
+
+        // Common third-party cloud folders
+        let thirdParty: [(prefix: String, name: String)] = [
+            ("\(home)/Dropbox",                            "Dropbox"),
+            ("\(home)/Google Drive",                       "Google Drive"),
+            ("\(home)/CloudStorage/GoogleDrive",           "Google Drive"),
+            ("\(home)/Library/CloudStorage/GoogleDrive",   "Google Drive"),
+            ("\(home)/Library/CloudStorage/OneDrive",      "OneDrive"),
+            ("\(home)/OneDrive",                           "OneDrive"),
+            ("\(home)/Box",                                "Box"),
+            ("\(home)/Library/CloudStorage/Box",           "Box"),
+        ]
+        for (prefix, name) in thirdParty {
+            if path == prefix || path.hasPrefix(prefix + "/") { return name }
+        }
+
+        return nil
     }
 
     @MainActor
