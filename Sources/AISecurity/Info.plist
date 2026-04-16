@@ -39,9 +39,10 @@
     <key>NSHumanReadableCopyright</key>
     <string>AI Security Agent</string>
 
-    <!-- Finder right-click > Services > "Protect with AISecurity Vault" -->
+    <!-- Finder right-click > Services -->
     <key>NSServices</key>
     <array>
+        <!-- Protect files with AISecurity Vault (encrypt/decrypt, read-only, local-only) -->
         <dict>
             <key>NSMenuItem</key>
             <dict>
@@ -53,6 +54,24 @@
             <key>NSSendTypes</key>
             <array>
                 <string>NSFilenamesPboardType</string>
+                <string>public.file-url</string>
+            </array>
+            <key>NSReturnTypes</key>
+            <array/>
+        </dict>
+        <!-- Hash AI model file for integrity verification -->
+        <dict>
+            <key>NSMenuItem</key>
+            <dict>
+                <key>default</key>
+                <string>Hash Model with AISecurity</string>
+            </dict>
+            <key>NSMessage</key>
+            <string>hashModelService</string>
+            <key>NSSendTypes</key>
+            <array>
+                <string>NSFilenamesPboardType</string>
+                <string>public.file-url</string>
             </array>
             <key>NSReturnTypes</key>
             <array/>

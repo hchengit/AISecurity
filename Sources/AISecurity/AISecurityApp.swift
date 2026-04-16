@@ -62,9 +62,10 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             DispatchQueue.main.async { self?.rebuildMenu() }
         }
 
-        // Register for Finder Services (right-click > Services > "Protect with AISecurity Vault")
+        // Register for Finder Services (right-click > Services)
+        // "Protect with AISecurity Vault" + "Hash Model with AISecurity"
         NSApp.servicesProvider = self
-        NSApp.registerServicesMenuSendTypes([.fileURL, .string], returnTypes: [])
+        NSApp.registerServicesMenuSendTypes([.fileURL, .string, NSPasteboard.PasteboardType("NSFilenamesPboardType")], returnTypes: [])
         NSUpdateDynamicServices()
     }
 
@@ -246,6 +247,45 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
         menu.addItem(.separator())
 
+        // AI Models
+        let modelsSubmenu = NSMenu()
+        if let manifest = loadModelManifest() {
+            if manifest.isEmpty {
+                let empty = NSMenuItem(title: "    No models tracked", action: nil, keyEquivalent: "")
+                empty.isEnabled = false
+                modelsSubmenu.addItem(empty)
+            } else {
+                // Sort by size descending, show name + size + status
+                let sorted = manifest.sorted { $0.value.sizeBytes > $1.value.sizeBytes }
+                for (path, info) in sorted.prefix(20) {
+                    let name = (path as NSString).lastPathComponent
+                    let size = formatModelSize(info.sizeBytes)
+                    let item = NSMenuItem(title: "    \u{2705} \(name) (\(size))", action: #selector(noOp), keyEquivalent: "")
+                    item.target = self
+                    item.toolTip = path
+                    modelsSubmenu.addItem(item)
+                }
+                if manifest.count > 20 {
+                    let more = NSMenuItem(title: "    ... and \(manifest.count - 20) more", action: nil, keyEquivalent: "")
+                    more.isEnabled = false
+                    modelsSubmenu.addItem(more)
+                }
+            }
+            modelsSubmenu.addItem(.separator())
+            let countItem = NSMenuItem(title: "\(manifest.count) models hashed", action: nil, keyEquivalent: "")
+            countItem.isEnabled = false
+            modelsSubmenu.addItem(countItem)
+        } else {
+            let noData = NSMenuItem(title: "    Model verifier not active", action: nil, keyEquivalent: "")
+            noData.isEnabled = false
+            modelsSubmenu.addItem(noData)
+        }
+        let modelsParent = NSMenuItem(title: "\u{1F9E0} AI Models (\(loadModelManifest()?.count ?? 0) tracked)", action: nil, keyEquivalent: "")
+        modelsParent.submenu = modelsSubmenu
+        menu.addItem(modelsParent)
+
+        menu.addItem(.separator())
+
         let notifHeader = NSMenuItem(title: "\u{1F514} Notifications", action: nil, keyEquivalent: "")
         notifHeader.isEnabled = false
         menu.addItem(notifHeader)
@@ -333,6 +373,35 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     @objc func noOp() { /* dummy action so stat items appear enabled in menu */ }
+
+    // MARK: - Model Manifest Helpers
+
+    private struct ModelManifestEntry: Decodable {
+        let hash: String
+        let size_bytes: UInt64
+        let first_seen: String
+        let last_verified: String
+
+        var sizeBytes: UInt64 { size_bytes }
+    }
+
+    private func loadModelManifest() -> [String: ModelManifestEntry]? {
+        let path = (SecurityConfig.shared.securityDir as NSString)
+            .appendingPathComponent("model-manifest.json")
+        guard let data = FileManager.default.contents(atPath: path),
+              let manifest = try? JSONDecoder().decode([String: ModelManifestEntry].self, from: data) else {
+            return nil
+        }
+        return manifest
+    }
+
+    private func formatModelSize(_ bytes: UInt64) -> String {
+        let gb = Double(bytes) / (1024 * 1024 * 1024)
+        let mb = Double(bytes) / (1024 * 1024)
+        if gb >= 1.0 { return String(format: "%.1f GB", gb) }
+        if mb >= 1.0 { return String(format: "%.0f MB", mb) }
+        return "\(bytes) B"
+    }
 
     private func makeItem(_ title: String, action: Selector) -> NSMenuItem {
         let item = NSMenuItem(title: title, action: action, keyEquivalent: "")
@@ -468,6 +537,69 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
     @objc private func pauseAgent() {
         daemon?.stop()
+        rebuildMenu()
+    }
+
+    // MARK: - Hash Model Service Handler (right-click > Services > "Hash Model with AISecurity")
+
+    @objc func hashModelService(_ pboard: NSPasteboard, userData: String, error: AutoreleasingUnsafeMutablePointer<NSString>) {
+        NSApplication.shared.activate(ignoringOtherApps: true)
+
+        // Extract file paths from pasteboard
+        guard let urls = pboard.readObjects(forClasses: [NSURL.self], options: [
+            .urlReadingFileURLsOnly: true
+        ]) as? [URL], !urls.isEmpty else {
+            error.pointee = "No files selected" as NSString
+            return
+        }
+
+        let modelExtensions: Set<String> = [
+            "gguf", "ggml", "safetensors", "bin", "pth", "pt",
+            "onnx", "mlmodel", "mlpackage", "npz", "npy"
+        ]
+
+        // Filter to model files only
+        let modelPaths = urls.filter { url in
+            let ext = url.pathExtension.lowercased()
+            return modelExtensions.contains(ext) ||
+                   url.lastPathComponent.hasPrefix("sha256-") // Ollama blobs
+        }.map { $0.path }
+
+        guard !modelPaths.isEmpty else {
+            let alert = NSAlert()
+            alert.messageText = "No Model Files Found"
+            alert.informativeText = "Selected files are not recognized model formats.\nSupported: .gguf, .safetensors, .bin, .pth, .onnx, .mlmodel, .npz"
+            alert.alertStyle = .warning
+            alert.runModal()
+            return
+        }
+
+        // Hash them via Rust model verifier
+        if let json = SecurityCoreBridge.modelVerify(securityDir: SecurityConfig.shared.securityDir),
+           let data = json.data(using: .utf8),
+           let results = try? JSONDecoder().decode([[String: String]].self, from: data) {
+            let newCount = results.filter { $0["status"] == "NewModel" }.count
+            let verifiedCount = results.filter { $0["status"] == "Verified" }.count
+
+            let alert = NSAlert()
+            alert.messageText = "Model Hashing Complete"
+            if newCount > 0 {
+                alert.informativeText = "\(newCount) new model(s) hashed and added to manifest.\n\(verifiedCount) model(s) already tracked and verified."
+            } else if verifiedCount > 0 {
+                alert.informativeText = "\(verifiedCount) model(s) already tracked — hashes verified ✓"
+            } else {
+                alert.informativeText = "Models processed. Check Activity Log for details."
+            }
+            alert.alertStyle = .informational
+            alert.runModal()
+        } else {
+            let alert = NSAlert()
+            alert.messageText = "Hash Model"
+            alert.informativeText = "Model verification triggered for \(modelPaths.count) file(s).\nCheck the Activity Log for results."
+            alert.alertStyle = .informational
+            alert.runModal()
+        }
+
         rebuildMenu()
     }
 
