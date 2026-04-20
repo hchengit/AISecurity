@@ -167,3 +167,73 @@ enabled = true
 # deny_patterns = ["docker run --privileged"]
 # Commands that require user confirmation
 # ask_prefixes = ["brew install", "pip install"]
+
+# ── Phase 15: NemoClaw-inspired interpositional controls ────────
+
+[privacy_router]
+# Scan outbound LLM API requests for secrets / PII / credentials.
+# The intercepting layer (explicit proxy, Claude-Code hook, or MITM) uses
+# these decisions. See sdk/privacy-router/README.md for proxy setup.
+enabled = true
+# default_action: allow | warn | redact | block
+default_action = "warn"
+audit_enabled = true
+
+# Per-category overrides. Categories come from sensitive_data findings:
+# crypto, financial, credential, pii, api_key, app_data
+[[privacy_router.categories]]
+category = "credential"
+action = "block"
+[[privacy_router.categories]]
+category = "crypto"
+action = "block"
+[[privacy_router.categories]]
+category = "financial"
+action = "block"
+[[privacy_router.categories]]
+category = "api_key"
+action = "block"
+[[privacy_router.categories]]
+category = "pii"
+action = "redact"
+[[privacy_router.categories]]
+category = "app_data"
+action = "warn"
+
+[intent_verifier]
+# Pre-action gate for AI agents. An agent calls in with (task, action);
+# this returns allow/deny/ask. Uses the command_policy engine plus a
+# lightweight task-coherence heuristic.
+enabled = true
+require_task_coherence = true
+default_decision = "ask"
+
+[model_vetting]
+# Vet installed models against a known-bad SHA-256 feed and a user
+# allow-list. Trusted hashes short-circuit known-bad matches.
+enabled = true
+# Hashes the user has explicitly vouched for. Must be lowercase hex, 64 chars.
+# allow_list = [
+#   "3e8b...<full sha256>...",
+# ]
+# Optional URL to refresh known-bad-models.txt from. Leave blank for offline.
+known_bad_feed_url = ""
+refresh_interval_hours = 24
+
+# ── Per-agent policy-as-code (used by ai-exec sandbox wrapper) ──
+# Each [agents.<name>] defines what the named agent may read, write, and
+# reach on the network. `ai-exec --agent <name> -- <cmd>` wraps the
+# command in sandbox-exec with these rules.
+#
+# [agents.claude-code]
+# allowed_paths_read  = ["~/work", "~/Documents"]
+# allowed_paths_write = ["~/work"]
+# allowed_network     = ["api.anthropic.com", "github.com"]
+# command_policy      = "restrictive"   # default | restrictive | permissive
+# description         = "Claude Code — work folders only, Anthropic/GitHub only"
+#
+# [agents.ollama]
+# allowed_paths_read  = ["~/.ollama"]
+# allowed_paths_write = ["~/.ollama"]
+# allowed_network     = []              # offline-only
+# command_policy      = "restrictive"

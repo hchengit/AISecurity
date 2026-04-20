@@ -192,6 +192,175 @@ else
     warn "Process not detected — try: open -a AISecurity"
 fi
 
+# ─────────────────────────────────────────────────────────────────────────────
+#  Phase 15: AI-agent integration (MCP server + Claude Code PreToolUse hook)
+#
+#  Installs two release binaries under $SECURITY_DIR/bin/:
+#    - aisec-mcp       : MCP server relaying tool calls to the daemon on :7459
+#    - intent-hook     : Claude Code PreToolUse hook
+#
+#  Then, if the `claude` CLI is available, registers the MCP server at user
+#  scope and merges a PreToolUse hook into ~/.claude/settings.json. Both
+#  steps are idempotent — re-running install.sh will not duplicate them.
+# ─────────────────────────────────────────────────────────────────────────────
+log "Phase 15: Building AI-agent binaries (aisec-mcp, intent-hook)..."
+cd "$SCRIPT_DIR/SecurityCore"
+if ~/.cargo/bin/cargo build --release -p aisec-mcp -p intent-hook 2>&1 | tail -3; then
+    AGENT_BINDIR="$SECURITY_DIR/bin"
+    mkdir -p "$AGENT_BINDIR"
+    cp "$SCRIPT_DIR/SecurityCore/target/release/aisec-mcp"   "$AGENT_BINDIR/"
+    cp "$SCRIPT_DIR/SecurityCore/target/release/intent-hook" "$AGENT_BINDIR/"
+    chmod +x "$AGENT_BINDIR/aisec-mcp" "$AGENT_BINDIR/intent-hook"
+    # User-facing CLI (bypass on/off/status, daemon status, audit log tail)
+    cp "$SCRIPT_DIR/SecurityCore/crates/aisec-mcp/aisec" "$AGENT_BINDIR/aisec"
+    chmod +x "$AGENT_BINDIR/aisec"
+    success "Installed AI-agent binaries: $AGENT_BINDIR/"
+    cd "$SCRIPT_DIR"
+else
+    warn "AI-agent binary build failed — MCP server + PreToolUse hook not installed."
+    warn "AISecurity.app will still protect outbound API calls via 127.0.0.1:7459."
+    AGENT_BINDIR=""
+fi
+
+# ── MCP server registration (Claude Code) ──
+if [ -n "$AGENT_BINDIR" ] && command -v claude >/dev/null 2>&1; then
+    MCP_BIN="$AGENT_BINDIR/aisec-mcp"
+    # Remove any stale entry (e.g. pointing at target/debug/) before adding fresh.
+    claude mcp remove aisec --scope user >/dev/null 2>&1 || true
+    if claude mcp add --scope user aisec "$MCP_BIN" >/dev/null 2>&1; then
+        success "MCP server registered: aisec → $MCP_BIN"
+    else
+        warn "MCP registration failed — run manually: claude mcp add --scope user aisec $MCP_BIN"
+    fi
+else
+    if [ -n "$AGENT_BINDIR" ]; then
+        warn "claude CLI not found — skipping MCP registration."
+        warn "After installing Claude Code, run: claude mcp add --scope user aisec $AGENT_BINDIR/aisec-mcp"
+    fi
+fi
+
+# ── MCP registration for other agents that read JSON config files ──
+# Cursor, Windsurf, Continue.dev, and Cline all follow a similar pattern:
+# a JSON file with an "mcpServers" key. We write/merge an "aisec" entry
+# into each one we find. Missing files are left alone — no creation if
+# the product isn't installed, so we don't pollute the user's home.
+if [ -n "$AGENT_BINDIR" ] && command -v python3 >/dev/null 2>&1; then
+    MCP_BIN="$AGENT_BINDIR/aisec-mcp"
+    python3 - "$MCP_BIN" <<'PY' 2>&1 | sed 's/^/    /'
+import json, os, sys
+from pathlib import Path
+mcp_bin = sys.argv[1]
+home = Path(os.path.expanduser("~"))
+
+# (label, path, mcpServers-containing-shape).
+# `shape` is "top" → root object has mcpServers at the top
+#          "nested" → config under "mcp" → "servers" (Continue.dev)
+targets = [
+    ("Cursor",      home / ".cursor" / "mcp.json",                          "top"),
+    ("Windsurf",    home / ".codeium" / "windsurf" / "mcp_config.json",     "top"),
+    ("Continue",    home / ".continue" / "config.json",                     "nested"),
+]
+
+entry = {"command": mcp_bin}
+
+def merge_top(cfg, entry):
+    ms = cfg.setdefault("mcpServers", {})
+    existing = ms.get("aisec")
+    if existing == entry:
+        return False  # unchanged
+    ms["aisec"] = entry
+    return True
+
+def merge_nested(cfg, entry):
+    mcp = cfg.setdefault("mcp", {})
+    servers = mcp.setdefault("servers", {})
+    if servers.get("aisec") == entry:
+        return False
+    servers["aisec"] = entry
+    return True
+
+any_registered = False
+for label, path, shape in targets:
+    if not path.exists():
+        # Don't create config files for products that aren't installed.
+        continue
+    try:
+        with open(path) as f:
+            cfg = json.load(f)
+    except json.JSONDecodeError:
+        print(f"[!] {label}: {path} is not valid JSON — skipping")
+        continue
+    except Exception as e:
+        print(f"[!] {label}: cannot read {path}: {e}")
+        continue
+    try:
+        changed = (merge_top if shape == "top" else merge_nested)(cfg, entry)
+    except Exception as e:
+        print(f"[!] {label}: merge failed ({e})")
+        continue
+    if not changed:
+        print(f"[=] {label}: aisec already registered")
+    else:
+        tmp = str(path) + ".tmp"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with open(tmp, "w") as f:
+            json.dump(cfg, f, indent=2)
+            f.write("\n")
+        os.replace(tmp, path)
+        print(f"[+] {label}: registered aisec → {mcp_bin}")
+    any_registered = True
+
+if not any_registered:
+    print("[ ] No other MCP clients detected (Cursor, Windsurf, Continue.dev).")
+    print("    Install the product, then re-run this installer to auto-register.")
+PY
+fi
+
+# ── PreToolUse hook (Claude Code) ──
+# Merges the hook into ~/.claude/settings.json using a tiny Python helper.
+# Idempotent: if a PreToolUse entry with matcher="Bash|Write|Edit" already
+# points at the intent-hook binary, we skip.
+if [ -n "$AGENT_BINDIR" ] && command -v python3 >/dev/null 2>&1; then
+    HOOK_BIN="$AGENT_BINDIR/intent-hook"
+    SETTINGS_JSON="$HOME/.claude/settings.json"
+    mkdir -p "$HOME/.claude"
+    [ -f "$SETTINGS_JSON" ] || echo '{}' > "$SETTINGS_JSON"
+    python3 - "$SETTINGS_JSON" "$HOOK_BIN" <<'PY' && success "PreToolUse hook: $HOOK_BIN" || warn "PreToolUse hook merge failed — $SETTINGS_JSON not modified"
+import json, os, sys
+path, hook_bin = sys.argv[1], sys.argv[2]
+try:
+    with open(path) as f:
+        cfg = json.load(f)
+except json.JSONDecodeError:
+    print(f"[!] {path} is not valid JSON — refusing to modify")
+    sys.exit(1)
+hooks = cfg.setdefault("hooks", {})
+pre = hooks.setdefault("PreToolUse", [])
+# Look for an existing block that already points at this binary.
+for block in pre:
+    for h in block.get("hooks", []):
+        if h.get("type") == "command" and h.get("command") == hook_bin:
+            print(f"[=] PreToolUse hook already registered ({hook_bin})")
+            sys.exit(0)
+pre.append({
+    "matcher": "Bash|Write|Edit",
+    "hooks": [{"type": "command", "command": hook_bin}],
+})
+# Atomic write.
+tmp = path + ".tmp"
+with open(tmp, "w") as f:
+    json.dump(cfg, f, indent=2)
+    f.write("\n")
+os.replace(tmp, path)
+print(f"[+] Added PreToolUse hook → {hook_bin}")
+PY
+else
+    if [ -n "$AGENT_BINDIR" ]; then
+        warn "python3 not found — skipping PreToolUse hook merge."
+        warn "See $AGENT_BINDIR/intent-hook for manual ~/.claude/settings.json setup."
+    fi
+fi
+
 echo ""
 echo "╔══════════════════════════════════════════════════════════╗"
 echo "║  Installation complete!                                  ║"
@@ -201,10 +370,27 @@ echo "║  AISecurity will auto-start on login.                    ║"
 echo "║                                                          ║"
 echo "║  Config:  $SECURITY_DIR/config.toml"
 echo "║  Logs:    $SECURITY_DIR/logs/"
+echo "║  AI CLI:  $SECURITY_DIR/bin/{aisec-mcp, intent-hook}"
 echo "║                                                          ║"
 echo "║  Commands:                                               ║"
 echo "║    Start:  launchctl start $AGENT_LABEL"
 echo "║    Stop:   launchctl stop $AGENT_LABEL"
+echo "║                                                          ║"
+echo "║  AI-agent protection (auto-registered per installed app):║"
+echo "║    - Claude Code: MCP tools + PreToolUse hook            ║"
+echo "║    - Cursor / Windsurf / Continue.dev: MCP tools         ║"
+echo "║    Restart the AI app to pick up new tools.              ║"
+echo "║                                                          ║"
+echo "║  Kill switch (user control):                             ║"
+echo "║    aisec bypass on       disable all agent checks        ║"
+echo "║    aisec bypass off      re-enable                       ║"
+echo "║    aisec status          daemon + bypass state           ║"
+echo "║  (add $SECURITY_DIR/bin to PATH for short form)"
+echo "║                                                          ║"
+echo "║  For agents without MCP/hook support (Aider, Codex CLI,  ║"
+echo "║  raw Ollama, etc.), use these universal fallbacks:       ║"
+echo "║    HTTPS_PROXY=http://127.0.0.1:7459  (outbound filter)  ║"
+echo "║    ai-exec --agent <name> -- <cmd>    (sandbox wrapper)  ║"
 echo "║                                                          ║"
 echo "║  IMPORTANT: Grant Full Disk Access to AISecurity.app in  ║"
 echo "║  System Settings > Privacy & Security > Full Disk Access ║"

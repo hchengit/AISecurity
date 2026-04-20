@@ -1,0 +1,12 @@
+[package]
+name = "ai-exec"
+version = "0.1.0"
+edition = "2021"
+description = "Sandboxed AI-agent runner — wraps a command in sandbox-exec using the [agents.*] policy from config.toml"
+
+[[bin]]
+name = "ai-exec"
+path = "src/main.rs"
+
+[dependencies]
+security-core = { path = "../security-core" }

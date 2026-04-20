@@ -4,4 +4,8 @@ members = [
     "crates/security-core",
     "crates/security-core-ffi",
     "crates/security-linux",
+    "crates/ai-exec",
+    "crates/privacy-router",
+    "crates/intent-hook",
+    "crates/aisec-mcp",
 ]

@@ -1,0 +1,12 @@
+[package]
+name = "privacy-router"
+version = "0.1.0"
+edition = "2021"
+description = "Local HTTP forward-proxy for outbound LLM API calls. Scans request bodies with security-core privacy_router and applies allow/redact/warn/block decisions."
+
+[[bin]]
+name = "privacy-router"
+path = "src/main.rs"
+
+[dependencies]
+security-core = { path = "../security-core" }

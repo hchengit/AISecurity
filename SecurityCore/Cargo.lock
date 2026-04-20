@@ -74,6 +74,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "ai-exec"
+version = "0.1.0"
+dependencies = [
+ "security-core",
+]
+
+[[package]]
+name = "aisec-mcp"
+version = "0.1.0"
+dependencies = [
+ "security-core",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "allocator-api2"
 version = "0.2.21"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1946,6 +1962,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "intent-hook"
+version = "0.1.0"
+dependencies = [
+ "security-core",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "ipnet"
 version = "2.12.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2742,6 +2767,13 @@ checksum = "479ca8adacdd7ce8f1fb39ce9ecccbfe93a3f1344b3d0d97f20bc0196208f62b"
 dependencies = [
  "proc-macro2",
  "syn 2.0.117",
+]
+
+[[package]]
+name = "privacy-router"
+version = "0.1.0"
+dependencies = [
+ "security-core",
 ]
 
 [[package]]

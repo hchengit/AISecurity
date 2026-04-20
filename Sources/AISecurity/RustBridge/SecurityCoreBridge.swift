@@ -192,6 +192,19 @@ enum SecurityCoreBridge {
         return String(cString: ptr)
     }
 
+    /// Run a closure with a C-string view of an optional Swift String.
+    /// A nil input is forwarded to the closure as a null `const char *`.
+    private static func withOptionalCString<R>(
+        _ s: String?,
+        _ body: (UnsafePointer<CChar>?) -> R
+    ) -> R {
+        if let s = s {
+            return s.withCString { body($0) }
+        } else {
+            return body(nil)
+        }
+    }
+
     /// Safe C string conversion for mutable pointers.
     private static func safeString(_ ptr: UnsafeMutablePointer<CChar>?) -> String {
         guard let ptr = ptr else { return "" }
@@ -613,6 +626,48 @@ enum SecurityCoreBridge {
     /// Get total entries across all feeds.
     static func feedTotalEntries() -> UInt32 {
         sec_feed_total_entries()
+    }
+
+    // MARK: - Local HTTP Services (privacy_router + intent_verifier)
+
+    struct LocalServicesStart: Sendable {
+        let ok: Bool
+        let boundAddr: String?
+    }
+
+    /// Start the in-process HTTP listener serving POST /privacy/evaluate,
+    /// POST /intent/verify, and GET /health on a detached thread. Idempotent
+    /// — calling more than once returns the prior bound address.
+    ///
+    /// - Parameters:
+    ///   - bindAddr: e.g. "127.0.0.1:7459". Use "127.0.0.1:0" to let the OS
+    ///     pick a free port (mainly for tests).
+    ///   - configPath: optional; nil uses the default config location.
+    ///   - auditLogPath: optional; nil disables audit logging.
+    @discardableResult
+    static func localServicesStart(
+        bindAddr: String = "127.0.0.1:7459",
+        configPath: String? = nil,
+        auditLogPath: String? = nil
+    ) -> LocalServicesStart {
+        let ptr: UnsafeMutablePointer<LocalServicesStartResult>? = bindAddr.withCString { ba in
+            withOptionalCString(configPath) { cp in
+                withOptionalCString(auditLogPath) { al in
+                    sec_local_services_start(ba, cp, al)
+                }
+            }
+        }
+        guard let r = ptr else {
+            return LocalServicesStart(ok: false, boundAddr: nil)
+        }
+        defer { sec_free_local_services_start_result(ptr) }
+        let p = r.pointee
+        return LocalServicesStart(ok: p.ok, boundAddr: optionalString(p.bound_addr))
+    }
+
+    /// True iff the listener is running in this process.
+    static func localServicesIsRunning() -> Bool {
+        sec_local_services_is_running()
     }
 
     // MARK: - Policy Audit Log

@@ -151,6 +151,22 @@ typedef struct FeedCheckResultFFI {
 } FeedCheckResultFFI;
 
 /**
+ * FFI-safe start result.
+ */
+typedef struct LocalServicesStartResult {
+    /**
+     * True if the listener is now running (including the case where it was
+     * already running from a prior call).
+     */
+    bool ok;
+    /**
+     * The bound address as returned by the OS. Useful when the caller
+     * passed port 0. Null on failure. Caller must free with `sec_free_string`.
+     */
+    char *bound_addr;
+} LocalServicesStartResult;
+
+/**
  * Initialize with an optional config path. Returns true on success.
  */
 bool sec_init(const char *configPath);
@@ -440,5 +456,34 @@ char *sec_get_effective_config(const char *configPath);
  * Free a string returned by sec_get_effective_config.
  */
 void sec_free_string(char *ptr);
+
+/**
+ * Start the in-process HTTP listener that serves:
+ *   - POST /privacy/evaluate
+ *   - POST /intent/verify
+ *   - GET  /health
+ *
+ * Parameters:
+ *   - `bind_addr`       : e.g. "127.0.0.1:7459". `127.0.0.1:0` picks a free port.
+ *   - `config_path`     : optional; null uses defaults.
+ *   - `audit_log_path`  : optional; null disables audit logging.
+ *
+ * Returns a heap-allocated `LocalServicesStartResult`. Caller must free via
+ * `sec_free_local_services_start_result`. The listener runs on a detached
+ * thread — it lives for the life of the process.
+ */
+struct LocalServicesStartResult *sec_local_services_start(const char *bindAddr,
+                                                          const char *configPath,
+                                                          const char *auditLogPath);
+
+/**
+ * True iff the listener is currently running in this process.
+ */
+bool sec_local_services_is_running(void);
+
+/**
+ * Free the result struct returned by `sec_local_services_start`.
+ */
+void sec_free_local_services_start_result(struct LocalServicesStartResult *ptr);
 
 #endif  /* SECURITY_CORE_H */

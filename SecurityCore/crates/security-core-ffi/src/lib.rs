@@ -11,6 +11,7 @@ use security_core::command_policy;
 use security_core::config::{self, ProtectionTier, SecurityConfig};
 use security_core::threat_feeds;
 use security_core::email_patterns;
+use security_core::local_services::{self, ServiceOptions};
 use security_core::model_verifier;
 use security_core::policy_audit::PolicyAuditLog;
 use security_core::vault;
@@ -20,6 +21,8 @@ use security_core::prompt_injection;
 use security_core::sensitive_data;
 use security_core::severity::SeverityLevel;
 use security_core::threat_intent_parser::{self, Channel};
+
+use std::sync::OnceLock;
 
 // ---------------------------------------------------------------------------
 // FFI result types
@@ -1181,6 +1184,96 @@ pub extern "C" fn sec_get_effective_config(config_path: *const c_char) -> *mut c
 pub extern "C" fn sec_free_string(ptr: *mut c_char) {
     if !ptr.is_null() {
         unsafe { drop(CString::from_raw(ptr)); }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Local Services — in-process HTTP endpoints for privacy_router + intent_verifier
+// ---------------------------------------------------------------------------
+
+/// Tracks whether the listener has already been started in this process.
+/// Idempotent: calling `sec_local_services_start` more than once is a no-op
+/// and returns true.
+static LOCAL_SERVICES_BOUND: OnceLock<String> = OnceLock::new();
+
+/// FFI-safe start result.
+#[repr(C)]
+pub struct LocalServicesStartResult {
+    /// True if the listener is now running (including the case where it was
+    /// already running from a prior call).
+    pub ok: bool,
+    /// The bound address as returned by the OS. Useful when the caller
+    /// passed port 0. Null on failure. Caller must free with `sec_free_string`.
+    pub bound_addr: *mut c_char,
+}
+
+/// Start the in-process HTTP listener that serves:
+///   - POST /privacy/evaluate
+///   - POST /intent/verify
+///   - GET  /health
+///
+/// Parameters:
+///   - `bind_addr`       : e.g. "127.0.0.1:7459". `127.0.0.1:0` picks a free port.
+///   - `config_path`     : optional; null uses defaults.
+///   - `audit_log_path`  : optional; null disables audit logging.
+///
+/// Returns a heap-allocated `LocalServicesStartResult`. Caller must free via
+/// `sec_free_local_services_start_result`. The listener runs on a detached
+/// thread — it lives for the life of the process.
+#[no_mangle]
+pub extern "C" fn sec_local_services_start(
+    bind_addr: *const c_char,
+    config_path: *const c_char,
+    audit_log_path: *const c_char,
+) -> *mut LocalServicesStartResult {
+    // Idempotency: if already bound, return the prior address.
+    if let Some(addr) = LOCAL_SERVICES_BOUND.get() {
+        return Box::into_raw(Box::new(LocalServicesStartResult {
+            ok: true,
+            bound_addr: to_c_string(addr),
+        }));
+    }
+
+    let bind = unsafe { from_c_str(bind_addr) }
+        .unwrap_or_else(|| "127.0.0.1:7459".to_string());
+    let cfg  = unsafe { from_c_str(config_path) };
+    let alog = unsafe { from_c_str(audit_log_path) };
+
+    let opts = ServiceOptions {
+        bind_addr: bind,
+        config_path: cfg,
+        audit_log_path: alog,
+    };
+
+    match local_services::start_in_background(opts) {
+        Some(handle) => {
+            // First-writer wins; subsequent calls short-circuit above.
+            let _ = LOCAL_SERVICES_BOUND.set(handle.bound_addr.clone());
+            Box::into_raw(Box::new(LocalServicesStartResult {
+                ok: true,
+                bound_addr: to_c_string(&handle.bound_addr),
+            }))
+        }
+        None => Box::into_raw(Box::new(LocalServicesStartResult {
+            ok: false,
+            bound_addr: ptr::null_mut(),
+        })),
+    }
+}
+
+/// True iff the listener is currently running in this process.
+#[no_mangle]
+pub extern "C" fn sec_local_services_is_running() -> bool {
+    LOCAL_SERVICES_BOUND.get().is_some()
+}
+
+/// Free the result struct returned by `sec_local_services_start`.
+#[no_mangle]
+pub extern "C" fn sec_free_local_services_start_result(ptr: *mut LocalServicesStartResult) {
+    if ptr.is_null() { return; }
+    unsafe {
+        let r = Box::from_raw(ptr);
+        free_c_string(r.bound_addr);
     }
 }
 

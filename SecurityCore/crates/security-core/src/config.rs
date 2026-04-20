@@ -388,6 +388,14 @@ pub struct SecurityConfig {
     pub overrides: OverridesConfig,
     pub model_verification: ModelVerificationConfig,
     pub command_policy: crate::command_policy::CommandPolicyConfig,
+
+    // ── Phase 15: NemoClaw-inspired interpositional controls ──
+    pub privacy_router: crate::privacy_router::PrivacyRouterConfig,
+    pub intent_verifier: crate::intent_verifier::IntentVerifierConfig,
+    pub model_vetting: crate::model_vetting::ModelVettingConfig,
+    /// Map of agent name → per-agent policy. Serialized under `[agents.*]`.
+    #[serde(default)]
+    pub agents: std::collections::HashMap<String, crate::agent_policy::AgentPolicy>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -487,6 +495,10 @@ impl Default for SecurityConfig {
             overrides: OverridesConfig::default(),
             model_verification: ModelVerificationConfig::default(),
             command_policy: crate::command_policy::CommandPolicyConfig::default(),
+            privacy_router: crate::privacy_router::PrivacyRouterConfig::default(),
+            intent_verifier: crate::intent_verifier::IntentVerifierConfig::default(),
+            model_vetting: crate::model_vetting::ModelVettingConfig::default(),
+            agents: std::collections::HashMap::new(),
         }
     }
 }

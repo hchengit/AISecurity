@@ -268,6 +268,24 @@ final class SecurityDaemon: ObservableObject {
             logger.warn("\u{1F310} Threat feeds: failed to initialize database")
         }
 
+        // 8c. AI-agent local services (Phase 15): in-process HTTP listener
+        //     exposing POST /privacy/evaluate + POST /intent/verify + GET /health
+        //     on 127.0.0.1:7459. Callers include the Claude Code intent-hook,
+        //     Aider/Cursor shell wrappers, and any agent that can call curl.
+        //     Runs on a detached thread owned by security-core.
+        let aiServicesAudit = (config.securityDir as NSString)
+            .appendingPathComponent("logs/ai-services-audit.jsonl")
+        let aiServicesResult = SecurityCoreBridge.localServicesStart(
+            bindAddr: "127.0.0.1:7459",
+            configPath: nil,
+            auditLogPath: aiServicesAudit
+        )
+        if aiServicesResult.ok {
+            logger.info("\u{1F512} AI-agent local services listening on \(aiServicesResult.boundAddr ?? "127.0.0.1:7459")")
+        } else {
+            logger.warn("\u{1F512} AI-agent local services: failed to bind 127.0.0.1:7459 (port may be in use)")
+        }
+
         // 9. Model directory watcher (discovers + watches + verifies in real-time)
         modelWatcher.processMonitor = processMonitor
         modelWatcher.start()

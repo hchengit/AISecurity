@@ -1,0 +1,14 @@
+[package]
+name = "intent-hook"
+version = "0.1.0"
+edition = "2021"
+description = "Claude Code PreToolUse hook — consults security-core intent_verifier and returns allow/deny/ask."
+
+[[bin]]
+name = "intent-hook"
+path = "src/main.rs"
+
+[dependencies]
+security-core = { path = "../security-core" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"

@@ -1,0 +1,109 @@
+#!/usr/bin/env bash
+# ──────────────────────────────────────────────────────────────────────────
+#  aisec — user-facing CLI for AISecurity agent protection.
+#
+#  Subcommands:
+#
+#    aisec bypass on        Disable agent protection (until turned back on).
+#    aisec bypass off       Re-enable agent protection.
+#    aisec bypass status    Show current state + audit pointer.
+#    aisec status           One-line summary (daemon + bypass).
+#    aisec logs             Tail the AI-services audit log.
+#    aisec help             Show this message.
+#
+#  Implementation notes:
+#    - "bypass on" writes $MACSEC_SECURITY_DIR/bypass (defaults to
+#      ~/.mac-security/bypass). All three enforcement layers (PreToolUse
+#      hook, MCP server, and the in-daemon HTTP listener) check for this
+#      file and short-circuit to Allow while it exists — with audit lines
+#      recording that a bypass was in effect.
+#    - You can also set AISEC_BYPASS=1 in your shell for a per-process
+#      bypass (handy for a single command without touching global state).
+# ──────────────────────────────────────────────────────────────────────────
+set -euo pipefail
+
+SEC_DIR="${MACSEC_SECURITY_DIR:-$HOME/.mac-security}"
+BYPASS_FILE="$SEC_DIR/bypass"
+AUDIT_LOG="$SEC_DIR/logs/ai-services-audit.jsonl"
+DAEMON_URL="http://127.0.0.1:7459"
+
+usage() {
+    sed -n '3,22p' "$0" | sed 's/^# //;s/^#//'
+    exit "${1:-0}"
+}
+
+cmd_bypass_on() {
+    mkdir -p "$SEC_DIR"
+    printf 'bypass enabled at %s by %s\n' "$(date -u +%FT%TZ)" "$USER" > "$BYPASS_FILE"
+    echo "✓ Agent protection DISABLED (bypass file: $BYPASS_FILE)"
+    echo "  All verify_intent/evaluate_privacy calls will return 'allow'."
+    echo "  Re-enable with: aisec bypass off"
+}
+
+cmd_bypass_off() {
+    if [ -f "$BYPASS_FILE" ]; then
+        rm -f "$BYPASS_FILE"
+        echo "✓ Agent protection ENABLED (bypass file removed)"
+    else
+        echo "✓ Agent protection ENABLED (bypass was already off)"
+    fi
+}
+
+cmd_bypass_status() {
+    if [ -f "$BYPASS_FILE" ]; then
+        echo "Agent protection: DISABLED (bypass)"
+        echo "  File:       $BYPASS_FILE"
+        echo "  Contents:   $(head -1 "$BYPASS_FILE" 2>/dev/null || echo '(empty)')"
+        echo "  Re-enable:  aisec bypass off"
+    else
+        echo "Agent protection: ENABLED"
+        echo "  Bypass file not present: $BYPASS_FILE"
+    fi
+    if [ "${AISEC_BYPASS:-}" ] && [ "${AISEC_BYPASS}" != "0" ] && [ "${AISEC_BYPASS}" != "false" ]; then
+        echo
+        echo "  Note: AISEC_BYPASS=${AISEC_BYPASS} is set in this shell (per-process bypass)."
+    fi
+}
+
+cmd_status() {
+    # Daemon reachability
+    if /usr/bin/curl -sS --max-time 2 "$DAEMON_URL/health" >/dev/null 2>&1; then
+        daemon="up"
+    else
+        daemon="DOWN"
+    fi
+    # Bypass state
+    if [ -f "$BYPASS_FILE" ]; then bypass="DISABLED"; else bypass="enabled"; fi
+    echo "daemon=$daemon  protection=$bypass  url=$DAEMON_URL"
+}
+
+cmd_logs() {
+    if [ -f "$AUDIT_LOG" ]; then
+        if command -v jq >/dev/null 2>&1; then
+            tail -n "${1:-20}" "$AUDIT_LOG" | jq -c .
+        else
+            tail -n "${1:-20}" "$AUDIT_LOG"
+        fi
+    else
+        echo "(no audit log yet — $AUDIT_LOG does not exist)"
+    fi
+}
+
+main() {
+    case "${1:-}" in
+        bypass)
+            case "${2:-status}" in
+                on|enable)     cmd_bypass_on ;;
+                off|disable)   cmd_bypass_off ;;
+                status|"")     cmd_bypass_status ;;
+                *)             echo "unknown bypass subcommand: ${2}" >&2; exit 2 ;;
+            esac
+            ;;
+        status)  cmd_status ;;
+        logs)    shift; cmd_logs "${1:-20}" ;;
+        help|-h|--help|"") usage ;;
+        *)       echo "unknown subcommand: $1" >&2; usage 2 ;;
+    esac
+}
+
+main "$@"

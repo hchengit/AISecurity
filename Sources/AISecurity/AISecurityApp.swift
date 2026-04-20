@@ -303,6 +303,36 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         tierParent.submenu = tierSubmenu
         menu.addItem(tierParent)
 
+        // -- Agent Intent Protection toggle (approval-check kill switch) --
+        //
+        // Flips ~/.mac-security/bypass. While the file exists, these three
+        // approval paths short-circuit to Allow (and still log to the
+        // audit file as a bypass):
+        //
+        //   • PreToolUse hook (intent-hook) — Claude Code Bash/Write/Edit
+        //   • MCP server (aisec-mcp) — verify_intent / evaluate_privacy
+        //   • HTTP listener (:7459) — /intent/verify, /privacy/evaluate
+        //
+        // Toggling this does NOT disable email scanning, file watcher,
+        // prompt-injection guard, vault, sensitive-data detection, model
+        // verifier, or any other AISecurity protection — only the
+        // agent-action approval gates.
+        let bypassActive = isAgentBypassActive()
+        let aiProtTitle = bypassActive
+            ? "\u{1F916} Agent Intent Protection: OFF — approval bypassed"
+            : "\u{1F916} Agent Intent Protection: ON"
+        let aiProtItem = NSMenuItem(title: aiProtTitle, action: #selector(toggleAgentBypass), keyEquivalent: "")
+        aiProtItem.target = self
+        aiProtItem.state = bypassActive ? .off : .on
+        menu.addItem(aiProtItem)
+
+        // Dimmed subtitle so users know exactly what this controls.
+        let aiProtSub = NSMenuItem(
+            title: "    Approves agent shell/file/net actions before they run",
+            action: nil, keyEquivalent: "")
+        aiProtSub.isEnabled = false
+        menu.addItem(aiProtSub)
+
         menu.addItem(.separator())
 
         // Stats
@@ -656,6 +686,101 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                 self?.rebuildMenu()
             }
         }
+    }
+
+    // MARK: - AI Agent Protection (bypass kill switch)
+
+    /// Path to the bypass sentinel file. Honored by intent-hook, aisec-mcp,
+    /// and the in-daemon HTTP listener via security_core::bypass::active().
+    private var agentBypassPath: String {
+        (SecurityConfig.shared.securityDir as NSString).appendingPathComponent("bypass")
+    }
+
+    private func isAgentBypassActive() -> Bool {
+        FileManager.default.fileExists(atPath: agentBypassPath)
+    }
+
+    @objc func toggleAgentBypass() {
+        if isAgentBypassActive() {
+            // Currently bypassed → re-enabling protection.
+            // No friction — going back to a safer state is always one click.
+            enableAgentProtection()
+        } else {
+            // Currently protected → disabling = risky. Match the tier-
+            // downgrade flow: require the vault passphrase, show an
+            // explicit warning, and only proceed on confirmation.
+            requireAuthToDisableAgentProtection()
+        }
+    }
+
+    /// Enable protection: remove the bypass file. One click, no auth.
+    private func enableAgentProtection() {
+        try? FileManager.default.removeItem(atPath: agentBypassPath)
+        rebuildMenu()
+    }
+
+    /// Disable protection: passphrase gate + explicit warning + log who did it.
+    private func requireAuthToDisableAgentProtection() {
+        NSApplication.shared.activate(ignoringOtherApps: true)
+        guard ensureVaultSetup() else { return }
+
+        VaultManager.shared.withAuth(
+            reason: "Authenticate to disable Agent Intent Protection",
+            passphrasePrompt: "Enter Vault Passphrase to Disable Protection",
+            onPassphrase: { [weak self] _ in
+                guard let self = self else { return }
+
+                let alert = NSAlert()
+                alert.messageText = "Disable Agent Intent Protection?"
+                alert.informativeText = """
+                This toggle affects ONLY the routine approval gates for AI agents. Other AISecurity protections are not changed.
+
+                WHAT TURNS OFF (routine approval):
+                  • Shell / file / network actions — Claude Code and other MCP-aware agents can run commands (rm, curl, git push, etc.) and write files without being asked. Normal developer workflow stops stalling on approval prompts.
+
+                WHAT STAYS ON — always, regardless of this toggle (critical-secret floor):
+                  • SSH private keys, API keys (OpenAI sk-, Anthropic sk-ant-, GitHub ghp_, AWS AKIA), PEM private-key blocks, .env secrets, passwords
+                  • Crypto wallet keys and BIP39 seed phrases (xprv, zprv, WIF, eth privkey)
+                  • Credit-card numbers, bank routing / account numbers, CVVs
+                  These are still blocked from leaving the machine in any LLM prompt. An explicit config.toml edit is required to allow them — not this menu.
+
+                ALSO UNCHANGED:
+                  • File watcher on ~/Downloads, ~/Desktop, ~/Documents
+                  • Clipboard monitor, email + Messages phishing detection
+                  • Prompt-injection guard, Vault, model verifier, threat feeds, process monitor, self-protection
+
+                AUDIT TRAIL:
+                  Every bypassed request and every floor block is appended to ~/.mac-security/logs/ai-services-audit.jsonl.
+
+                Re-enable anytime from this menu — no passphrase needed to turn protection back on.
+                """
+                alert.alertStyle = .critical
+                alert.addButton(withTitle: "Disable Protection")
+                alert.addButton(withTitle: "Cancel")
+                let response = alert.runModal()
+                guard response == .alertFirstButtonReturn else { return }
+
+                // Write the bypass sentinel.
+                let path = self.agentBypassPath
+                let parent = (path as NSString).deletingLastPathComponent
+                try? FileManager.default.createDirectory(
+                    atPath: parent, withIntermediateDirectories: true, attributes: nil)
+                let iso = ISO8601DateFormatter().string(from: Date())
+                let user = NSUserName()
+                let payload = "bypass enabled \(iso) via menu bar by \(user)\n"
+                try? payload.write(toFile: path, atomically: true, encoding: .utf8)
+
+                self.rebuildMenu()
+            },
+            onCancel: { },
+            onError: { msg in
+                let alert = NSAlert()
+                alert.messageText = "Authentication Failed"
+                alert.informativeText = msg
+                alert.alertStyle = .warning
+                alert.runModal()
+            }
+        )
     }
 
     private func debugLog(_ msg: String) {
