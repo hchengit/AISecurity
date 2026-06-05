@@ -16,9 +16,20 @@ hmac = "0.12"
 chrono = { version = "0.4", features = ["serde"] }
 aes-gcm = "0.10"
 rand = "0.8"
-wasmtime = "18"
+# Optional: only pulled in when the `wasm-plugins` feature is enabled. The WASM
+# rule sandbox embeds a JIT engine; consumers that never load .wasm plugins
+# (e.g. the bitcoin-node-stack control-plane) disable it via
+# `default-features = false` to keep that engine — and its advisory surface —
+# out of their binary entirely. Pinned 27 to stay rustc-1.92 compatible.
+wasmtime = { version = "27", optional = true }
 rustls = "0.23"
 webpki-roots = "0.26"
 reqwest = { version = "0.12", features = ["blocking", "rustls-tls"], default-features = false }
 rusqlite = { version = "0.32", features = ["bundled"] }
 url = "2"
+
+[features]
+# On by default so standalone security-core and existing consumers keep the
+# WASM rule sandbox. Disable with `default-features = false` to drop wasmtime.
+default = ["wasm-plugins"]
+wasm-plugins = ["dep:wasmtime"]
