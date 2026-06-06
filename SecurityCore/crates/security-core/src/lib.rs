@@ -11,6 +11,7 @@ pub mod config;
 pub mod path_resolver;
 pub mod encryption;
 pub mod key_filter;
+#[cfg(feature = "wasm-plugins")]
 pub mod wasm_sandbox;
 pub mod tls_transport;
 pub mod process_manager;
