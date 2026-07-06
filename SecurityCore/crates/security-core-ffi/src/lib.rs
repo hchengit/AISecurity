@@ -10,6 +10,7 @@ use std::ptr;
 use security_core::command_policy;
 use security_core::config::{self, ProtectionTier, SecurityConfig};
 use security_core::threat_feeds;
+use security_core::package_vulns;
 use security_core::email_patterns;
 use security_core::local_services::{self, ServiceOptions};
 use security_core::model_verifier;
@@ -1122,6 +1123,105 @@ pub extern "C" fn sec_free_feed_check(ptr: *mut FeedCheckResultFFI) {
         let r = Box::from_raw(ptr);
         free_c_string(r.feed_name);
         free_c_string(r.indicator);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Package Vulnerability Feed (OSV) — Phase 16
+// ---------------------------------------------------------------------------
+
+/// FFI-safe package check result.
+#[repr(C)]
+pub struct PackageCheckResultFFI {
+    pub vulnerable: bool,
+    pub severity: i8,          // -1 = clean, 1..4 = Low..Critical
+    pub cve: *mut c_char,      // null if clean
+    pub source: *mut c_char,   // "osv", "cache:osv", "error:..."
+}
+
+/// Initialize the package-vulns SQLite cache. Call once at startup.
+#[no_mangle]
+pub extern "C" fn sec_package_vulns_init(security_dir: *const c_char) -> bool {
+    let dir = match unsafe { from_c_str(security_dir) } {
+        Some(d) => d,
+        None => return false,
+    };
+    package_vulns::init(&dir).is_ok()
+}
+
+/// Check a single package against OSV (cache-first). BLOCKING — on cache
+/// miss makes an HTTP call up to 30 s. Call from a background thread.
+#[no_mangle]
+pub extern "C" fn sec_check_package(
+    ecosystem: *const c_char,
+    name: *const c_char,
+    version: *const c_char,
+) -> *mut PackageCheckResultFFI {
+    let eco = match unsafe { from_c_str(ecosystem) } {
+        Some(e) => e,
+        None => return ptr::null_mut(),
+    };
+    let name = match unsafe { from_c_str(name) } {
+        Some(n) => n,
+        None => return ptr::null_mut(),
+    };
+    let version = match unsafe { from_c_str(version) } {
+        Some(v) => v,
+        None => return ptr::null_mut(),
+    };
+
+    let r = package_vulns::check_package(&eco, &name, &version);
+    Box::into_raw(Box::new(PackageCheckResultFFI {
+        vulnerable: r.vulnerable,
+        severity: r.severity,
+        cve: r.cve.as_deref().map(to_c_string).unwrap_or(ptr::null_mut()),
+        source: to_c_string(&r.source),
+    }))
+}
+
+/// Batch-check N packages. `queries_json` is a JSON array:
+/// `[{"ecosystem":"PyPI","name":"litellm","version":"1.82.8"}, ...]`
+/// Returns JSON array of results. Caller frees with `sec_free_string`.
+/// BLOCKING — makes one OSV /querybatch call on cache miss.
+#[no_mangle]
+pub extern "C" fn sec_check_package_batch(queries_json: *const c_char) -> *mut c_char {
+    let json = match unsafe { from_c_str(queries_json) } {
+        Some(j) => j,
+        None => return ptr::null_mut(),
+    };
+
+    let value: serde_json::Value = match serde_json::from_str(&json) {
+        Ok(v) => v,
+        Err(_) => return ptr::null_mut(),
+    };
+    let arr = match value.as_array() {
+        Some(a) => a,
+        None => return ptr::null_mut(),
+    };
+
+    let tuples: Vec<(String, String, String)> = arr.iter()
+        .filter_map(|v| {
+            let eco = v.get("ecosystem")?.as_str()?.to_string();
+            let name = v.get("name")?.as_str()?.to_string();
+            let ver = v.get("version")?.as_str()?.to_string();
+            Some((eco, name, ver))
+        })
+        .collect();
+    let results = package_vulns::check_package_batch(&tuples);
+
+    serde_json::to_string(&results)
+        .map(|s| to_c_string(&s))
+        .unwrap_or(ptr::null_mut())
+}
+
+/// Free a `PackageCheckResultFFI`.
+#[no_mangle]
+pub extern "C" fn sec_free_package_check(ptr: *mut PackageCheckResultFFI) {
+    if ptr.is_null() { return; }
+    unsafe {
+        let r = Box::from_raw(ptr);
+        free_c_string(r.cve);
+        free_c_string(r.source);
     }
 }
 

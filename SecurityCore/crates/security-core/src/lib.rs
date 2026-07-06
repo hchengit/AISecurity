@@ -20,6 +20,7 @@ pub mod policy_audit;
 pub mod model_verifier;
 pub mod command_policy;
 pub mod threat_feeds;
+pub mod package_vulns;
 pub mod privacy_router;
 pub mod intent_verifier;
 pub mod agent_policy;

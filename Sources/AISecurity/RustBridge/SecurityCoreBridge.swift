@@ -628,6 +628,75 @@ enum SecurityCoreBridge {
         sec_feed_total_entries()
     }
 
+    // MARK: - Package Vulnerability Feed (Phase 16)
+
+    struct PackageCheckResult: Sendable {
+        let vulnerable: Bool
+        let severity: Int8      // -1 clean, 1..4 Low..Critical
+        let cve: String?
+        let source: String      // "osv", "cache:osv", "error:..."
+    }
+
+    struct PackageQuery: Codable, Sendable {
+        let ecosystem: String
+        let name: String
+        let version: String
+    }
+
+    /// Initialize the OSV cache (SQLite). Call once at startup.
+    @discardableResult
+    static func packageVulnsInit(securityDir: String? = nil) -> Bool {
+        let dir = securityDir ?? SecurityConfig.shared.securityDir
+        return dir.withCString { sec_package_vulns_init($0) }
+    }
+
+    /// Check one package against OSV (cache-first). BLOCKING — call off the main thread.
+    static func checkPackage(ecosystem: String, name: String, version: String) -> PackageCheckResult {
+        let ptr = ecosystem.withCString { eco in
+            name.withCString { n in
+                version.withCString { v in
+                    sec_check_package(eco, n, v)
+                }
+            }
+        }
+        guard let r = ptr else {
+            return PackageCheckResult(vulnerable: false, severity: -1, cve: nil, source: "error:ffi_null")
+        }
+        defer { sec_free_package_check(ptr) }
+        let p = r.pointee
+        return PackageCheckResult(
+            vulnerable: p.vulnerable,
+            severity: p.severity,
+            cve: optionalString(p.cve),
+            source: safeString(p.source)
+        )
+    }
+
+    /// Batch check — one OSV /querybatch roundtrip for N packages. BLOCKING.
+    static func checkPackageBatch(_ queries: [PackageQuery]) -> [PackageCheckResult] {
+        guard !queries.isEmpty,
+              let payload = try? JSONEncoder().encode(queries),
+              let json = String(data: payload, encoding: .utf8) else {
+            return []
+        }
+        let ptr = json.withCString { sec_check_package_batch($0) }
+        guard ptr != nil else { return [] }
+        defer { sec_free_string(ptr) }
+        let resultsJson = String(cString: ptr!)
+
+        struct Raw: Decodable {
+            let vulnerable: Bool
+            let severity: Int8
+            let cve: String?
+            let source: String
+        }
+        guard let data = resultsJson.data(using: .utf8),
+              let raws = try? JSONDecoder().decode([Raw].self, from: data) else {
+            return []
+        }
+        return raws.map { PackageCheckResult(vulnerable: $0.vulnerable, severity: $0.severity, cve: $0.cve, source: $0.source) }
+    }
+
     // MARK: - Local HTTP Services (privacy_router + intent_verifier)
 
     struct LocalServicesStart: Sendable {

@@ -220,6 +220,32 @@ enabled = true
 known_bad_feed_url = ""
 refresh_interval_hours = 24
 
+# ── Phase 16: Supply-chain attack defense ───────────────────────
+
+[python_pth_watcher]
+# Watch every Python site-packages directory for new or modified `.pth`
+# files. Python auto-executes `import`/`exec` lines from `.pth` on every
+# interpreter start, regardless of whether the package is imported — this
+# is the LiteLLM 1.82.8 (2026) attack vector.
+enabled = true
+
+[dependency_drift]
+# Watch manifest + lockfile pairs in your project roots. Alerts on added
+# dependencies (cross-checked against OSV for known CVEs) and on lockfile
+# hash drift when the lockfile is one we don't fully parse.
+#
+# project_roots also feeds `.git/hooks/` discovery for persistence_paths.
+enabled = true
+project_roots = ["~/code", "~/projects"]
+max_depth = 3
+
+[persistence_paths]
+# Watch user-level persistence paths — shell rc files, ~/Library/LaunchAgents,
+# editor extensions, .gitconfig, and .git/hooks in each project_root above.
+# Detect-only: alerts you, does not auto-restore. Use SelfProtection for
+# our own plist (which *is* auto-restored).
+enabled = true
+
 # ── Per-agent policy-as-code (used by ai-exec sandbox wrapper) ──
 # Each [agents.<name>] defines what the named agent may read, write, and
 # reach on the network. `ai-exec --agent <name> -- <cmd>` wraps the

@@ -40,6 +40,9 @@ final class SecurityDaemon: ObservableObject {
     private var tccMonitor: TCCMonitor!
     private var modelWatcher: ModelDirectoryWatcher!
     private var selfProtection: SelfProtection!
+    private var pthWatcher: PythonPthWatcher!
+    private var dependencyDriftWatcher: DependencyDriftWatcher!
+    private var persistenceWatcher: PersistencePathWatcher!
     private var modulesReady = false
 
     // MARK: - Timers
@@ -80,6 +83,24 @@ final class SecurityDaemon: ObservableObject {
         tccMonitor = TCCMonitor(logger: logger)
         modelWatcher = ModelDirectoryWatcher(logger: logger)
         selfProtection = SelfProtection(securityDir: config.securityDir)
+        pthWatcher = PythonPthWatcher(logger: logger, securityDir: config.securityDir)
+        dependencyDriftWatcher = DependencyDriftWatcher(
+            logger: logger,
+            securityDir: config.securityDir,
+            cfg: .init(
+                enabled: config.dependencyDrift.enabled,
+                projectRoots: config.dependencyDrift.projectRoots,
+                maxDepth: config.dependencyDrift.maxDepth
+            )
+        )
+        persistenceWatcher = PersistencePathWatcher(
+            logger: logger,
+            securityDir: config.securityDir,
+            cfg: .init(
+                enabled: config.persistencePaths.enabled,
+                projectRoots: config.dependencyDrift.projectRoots
+            )
+        )
         messagesScanner = MessagesScanner(
             logger: logger,
             whitelist: whitelist,
@@ -286,6 +307,27 @@ final class SecurityDaemon: ObservableObject {
             logger.warn("\u{1F512} AI-agent local services: failed to bind 127.0.0.1:7459 (port may be in use)")
         }
 
+        // 8d. Package vulnerability cache (Phase 16 C) — SQLite, lives in
+        //     ~/.mac-security/package-vulns.db, TTL 24h per entry.
+        _ = SecurityCoreBridge.packageVulnsInit(securityDir: config.securityDir)
+
+        // 8e. Phase 16 supply-chain watchers. Each maintains its own baseline;
+        //     failure in one does not affect the others.
+        if config.pythonPthWatcher.enabled {
+            pthWatcher.onAlert = { [weak self] _ in
+                Task { @MainActor in self?.threatCount += 1 }
+            }
+            pthWatcher.start()
+        }
+        dependencyDriftWatcher.onAlert = { [weak self] _ in
+            Task { @MainActor in self?.threatCount += 1 }
+        }
+        dependencyDriftWatcher.start()
+        persistenceWatcher.onAlert = { [weak self] _ in
+            Task { @MainActor in self?.threatCount += 1 }
+        }
+        persistenceWatcher.start()
+
         // 9. Model directory watcher (discovers + watches + verifies in real-time)
         modelWatcher.processMonitor = processMonitor
         modelWatcher.start()
@@ -311,6 +353,9 @@ final class SecurityDaemon: ObservableObject {
         processMonitor.stop()
         tccMonitor.stop()
         modelWatcher.stop()
+        pthWatcher?.stop()
+        dependencyDriftWatcher?.stop()
+        persistenceWatcher?.stop()
         feedRefreshTimer?.cancel()
         feedRefreshTimer = nil
         clipboardTimer?.invalidate()

@@ -8,7 +8,8 @@
 //!
 //!   * `initialize`       — handshake, returns protocol version + tools capability.
 //!   * `initialized`      — one-shot notification after initialize, accepted & ignored.
-//!   * `tools/list`       — enumerates `verify_intent` and `evaluate_privacy`.
+//!   * `tools/list`       — enumerates `verify_intent`, `evaluate_privacy`,
+//!     and `evaluate_install`.
 //!   * `tools/call`       — dispatches to the configured AISecurity daemon.
 //!   * `ping`             — returns `{}` (used by some clients as a health check).
 //!
@@ -131,6 +132,30 @@ fn tool_descriptors() -> Value {
                 },
                 "required": ["host", "body"]
             }
+        },
+        {
+            "name": "evaluate_install",
+            "description": "Ask AISecurity whether a proposed package install \
+                            should proceed. Parses the manifest, cross-checks every \
+                            pinned dependency against the OSV advisory database, and \
+                            returns allow / ask / deny plus a list of flagged \
+                            packages. Use before running `pip install`, `npm install`, \
+                            `cargo install`, or any equivalent.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "manifest_content": {
+                        "type": "string",
+                        "description": "The text of a requirements.txt, package.json, or Cargo.toml (or similar)."
+                    },
+                    "ecosystem": {
+                        "type": "string",
+                        "enum": ["pypi", "npm", "cargo", "auto"],
+                        "description": "Ecosystem hint. 'auto' detects from manifest shape. Defaults to 'auto'."
+                    }
+                },
+                "required": ["manifest_content"]
+            }
         }
     ])
 }
@@ -241,6 +266,7 @@ fn handle_tools_call(req_id: Value, params: &Value, client: &DaemonClient) -> Va
     let (path, forwarded_body) = match name {
         "verify_intent" => ("/intent/verify", args),
         "evaluate_privacy" => ("/privacy/evaluate", args),
+        "evaluate_install" => ("/install/evaluate", args),
         _ => return error_response(req_id, -32602, &format!("unknown tool: {}", name), None),
     };
 
@@ -415,7 +441,7 @@ mod tests {
     }
 
     #[test]
-    fn tools_list_advertises_both_tools() {
+    fn tools_list_advertises_all_tools() {
         let resp = route(&req("tools/list", Some(2), json!({})), &dead_client()).unwrap();
         let tools = &resp["result"]["tools"];
         assert!(tools.is_array());
@@ -423,6 +449,7 @@ mod tests {
             .map(|t| t["name"].as_str().unwrap()).collect();
         assert!(names.contains(&"verify_intent"));
         assert!(names.contains(&"evaluate_privacy"));
+        assert!(names.contains(&"evaluate_install"));
     }
 
     #[test]

@@ -254,6 +254,26 @@ struct SecurityConfig: Sendable {
     }
     let messagesScanner: MessagesScannerConfig
 
+    // ── Python .pth Watcher (Phase 16 A) ────────────────────────────
+    struct PythonPthWatcherConfig: Sendable {
+        let enabled: Bool
+    }
+    let pythonPthWatcher: PythonPthWatcherConfig
+
+    // ── Dependency Drift Watcher (Phase 16 B) ───────────────────────
+    struct DependencyDriftConfig: Sendable {
+        let enabled: Bool
+        let projectRoots: [String]
+        let maxDepth: Int
+    }
+    let dependencyDrift: DependencyDriftConfig
+
+    // ── Persistence Path Watcher (Phase 16 D) ───────────────────────
+    struct PersistencePathsConfig: Sendable {
+        let enabled: Bool
+    }
+    let persistencePaths: PersistencePathsConfig
+
     // ── Helpers ─────────────────────────────────────────────────────
     var isProduction: Bool  { mode == .production }
     var isTesting: Bool     { mode == .testing }
@@ -490,6 +510,25 @@ struct SecurityConfig: Sendable {
             enabled: Self.tomlBool(toml, "scheduled_scan", "enabled") ?? true,
             intervalHours: Self.tomlInt(toml, "scheduled_scan", "interval_hours") ?? 6,
             scanDirectories: resolver.scheduledScanDirectories
+        )
+
+        // ── Phase 16 sections ───────────────────────────────────────
+
+        self.pythonPthWatcher = PythonPthWatcherConfig(
+            enabled: Self.tomlBool(toml, "python_pth_watcher", "enabled") ?? true
+        )
+
+        // dependency_drift.project_roots is also reused by persistence_paths
+        // for `.git/hooks` discovery — one list to maintain.
+        let projectRoots = Self.tomlStringArray(toml, "dependency_drift", "project_roots") ?? []
+        self.dependencyDrift = DependencyDriftConfig(
+            enabled: Self.tomlBool(toml, "dependency_drift", "enabled") ?? true,
+            projectRoots: projectRoots,
+            maxDepth: Self.tomlInt(toml, "dependency_drift", "max_depth") ?? 3
+        )
+
+        self.persistencePaths = PersistencePathsConfig(
+            enabled: Self.tomlBool(toml, "persistence_paths", "enabled") ?? true
         )
     }
 }
