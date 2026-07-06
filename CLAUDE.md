@@ -68,3 +68,41 @@ Runtime config: `~/.mac-security/config.toml` (template: `config.toml.example`).
 - **Fail closed.** Startup and the relays deliberately refuse to proceed when a security precondition can't be met (code-signature mismatch in a production install, missing Keychain master key, daemon unreachable) rather than degrading silently. Preserve this — don't add fallbacks that quietly downgrade to plaintext or unguarded paths.
 - **Rust is the single source of truth** for detection. The `cross_validation` test enforces Rust/Swift parity; if you change scoring or patterns, keep that test green.
 - **Custom rules are WASM.** User plugins go in `~/.mac-security/rules/` and run sandboxed in wasmtime (no fs/network), exporting `name`, `analyze`, and `alloc`. Extend `wasm_sandbox.rs` rather than adding ad-hoc rule-loading paths.
+
+## Security practices (this is a security-enforcement product)
+
+The hard gates are in CI (`.github/workflows/ci.yml`) — they fail the build, so they
+can't quietly rot. This section is the judgment CI can't automate.
+
+**Before a change is done, all of these pass (CI enforces them):**
+- `cargo clippy --workspace -- -D warnings` — zero warnings. No new `#[allow(...)]`
+  without a one-line justification comment.
+- `cargo deny check advisories bans sources` — no un-accepted dependency advisories.
+  Accepted ones live in `SecurityCore/deny.toml` with a reason; **prune that list as
+  fixes land, and never add a new ignore without a reason and a tracking note.**
+- `cargo test --workspace` passes **and is deterministic.** Never let a test depend on
+  a process-global (env var, `static` DB/connection, a shared file like the real
+  `~/.mac-security/bypass`) without a serial guard or explicit isolation — flaky tests
+  hide real bugs (see the `bypass` and `threat_feeds` test guards for the pattern).
+- Rust↔Swift parity: if you touch scoring/patterns, keep `cross_validation` green, and
+  remember `./build-rust.sh` must run for Swift to see `.rs` changes.
+
+**Crown-jewel code — changes here get a threat-model review, not just a unit test:**
+the bypass/critical-secret floors (`bypass.rs`, `privacy_router.rs`), intent & command
+policy (`intent_verifier.rs`, `command_policy.rs`), the MCP/PreToolUse trust boundary
+(`aisec-mcp`, `intent-hook`, `local_services.rs`), and the Rust↔Swift FFI
+(`security-core-ffi`). For these, ask **"how would a compromised or prompt-injected
+agent evade or disable this?"** and prefer fail-closed. Enforcement inputs an agent can
+control — env vars, config it can write, transcript contents — are IN scope. Many of the
+worst historical findings were cross-module interaction bugs (floor asymmetry between the
+daemon and the hook; the MCP relay trusting a redirectable daemon URL), so review the
+trust boundary, not just the diffed lines.
+
+**Deeper passes (not per-commit):** run the `security-audit-pipeline` skill per milestone
+or before releases, and fuzz the hand-rolled parsers (`local_services.rs` HTTP,
+`email_scanner`, the PyPI/manifest parser). A model finds the interesting logic bugs;
+fuzzers and `cargo deny` find the complete boring set — use both.
+
+**Known accepted debt:** `wasmtime` is pinned at 27 and carries advisories (incl. aarch64
+sandbox-escape) whose fix needs a major 27→43 migration — tracked separately; do not add
+new wasm-plugin surface assuming the sandbox is current until that lands.

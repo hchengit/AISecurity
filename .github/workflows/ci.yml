@@ -69,3 +69,23 @@ jobs:
 
       - name: Clippy
         run: cargo clippy --workspace -- -D warnings
+
+  supply-chain:
+    name: Supply-chain audit
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: SecurityCore
+    steps:
+      - uses: actions/checkout@v4
+
+      # cargo-deny's `advisories` check is the RustSec/cargo-audit engine;
+      # `bans` surfaces duplicate deps and `sources` pins crates to crates.io.
+      # Accepted advisories with no in-semver fix are documented in deny.toml.
+      - name: Install cargo-deny
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-deny
+
+      - name: cargo deny (advisories, bans, sources)
+        run: cargo deny check advisories bans sources
