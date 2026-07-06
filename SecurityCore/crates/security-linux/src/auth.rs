@@ -102,6 +102,7 @@ impl AuthGate {
     }
 
     /// Number of failed attempts so far.
+    #[allow(dead_code)] // public API; not yet wired into the TUI/daemon
     pub fn failed_attempts(&self) -> u32 {
         self.state.lock().unwrap().failed_attempts
     }
@@ -155,6 +156,7 @@ impl AuthGate {
     }
 
     /// Invalidate the current session (e.g., after passphrase change).
+    #[allow(dead_code)] // public API; not yet wired into the TUI/daemon
     pub fn invalidate_session(&self) {
         let mut state = self.state.lock().unwrap();
         state.last_auth = None;

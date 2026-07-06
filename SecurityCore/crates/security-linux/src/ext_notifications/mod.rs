@@ -50,6 +50,7 @@ impl NotificationManager {
     }
 
     /// Reload config from disk.
+    #[allow(dead_code)] // public API; not yet wired into the daemon
     pub fn reload_config(&mut self, config_dir: &str) {
         self.config = NotificationConfig::load(config_dir);
     }

@@ -31,6 +31,7 @@ pub fn send(alert: &SecurityAlert, config: &DiscordConfig) -> Result<(), String>
 }
 
 /// Send a test message.
+#[allow(dead_code)] // public API; not yet wired into a test-notification command
 pub fn send_test(config: &DiscordConfig) -> Result<(), String> {
     validate_webhook_url(&config.webhook_url)?;
 

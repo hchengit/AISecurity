@@ -26,6 +26,7 @@ pub fn send(alert: &SecurityAlert, config: &EmailConfig) -> Result<(), String> {
 }
 
 /// Send a test email.
+#[allow(dead_code)] // public API; not yet wired into a test-notification command
 pub fn send_test(config: &EmailConfig) -> Result<(), String> {
     send_mail(
         &config.user_email,

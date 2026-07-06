@@ -294,7 +294,7 @@ fn redact_body(body: &str, findings: &[Finding]) -> String {
         }
     }
     // Sort by start descending so splicing doesn't invalidate earlier offsets.
-    ranges.sort_by(|a, b| b.0.cmp(&a.0));
+    ranges.sort_by_key(|r| std::cmp::Reverse(r.0));
 
     let mut out = body.to_string();
     for (start, end, kind) in ranges {
