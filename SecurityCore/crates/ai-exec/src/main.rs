@@ -133,7 +133,7 @@ fn exec_sandboxed(_profile_path: &str, argv: &[String]) -> std::io::Error {
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;
-        return cmd.exec();
+        cmd.exec()
     }
     #[cfg(not(unix))]
     {

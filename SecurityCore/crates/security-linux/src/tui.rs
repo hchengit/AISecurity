@@ -696,7 +696,7 @@ fn render_protection_picker(frame: &mut Frame, app: &App) {
     frame.render_widget(Clear, area);
     frame.render_widget(block, area);
 
-    let options = vec![
+    let options = [
         (
             app.picker_locked,
             "Locked (Encrypt)",
