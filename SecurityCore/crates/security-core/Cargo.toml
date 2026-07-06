@@ -20,8 +20,9 @@ rand = "0.8"
 # rule sandbox embeds a JIT engine; consumers that never load .wasm plugins
 # (e.g. the bitcoin-node-stack control-plane) disable it via
 # `default-features = false` to keep that engine — and its advisory surface —
-# out of their binary entirely. Pinned 27 to stay rustc-1.92 compatible.
-wasmtime = { version = "27", optional = true }
+# out of their binary entirely. Bumped 27 -> 43 to fix RUSTSEC sandbox-escape
+# advisories (incl. the aarch64 Cranelift critical); raises MSRV accordingly.
+wasmtime = { version = "43", optional = true }
 rustls = "0.23"
 webpki-roots = "0.26"
 reqwest = { version = "0.12", features = ["blocking", "rustls-tls"], default-features = false }
