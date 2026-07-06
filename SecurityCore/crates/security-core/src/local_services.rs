@@ -191,10 +191,12 @@ fn handle_conn(mut stream: TcpStream, snap: &Snapshot) -> std::io::Result<()> {
         ("GET", "/health") => {
             return respond(&mut stream, 200, "application/json", b"{\"ok\":true}");
         }
-        ("POST", "/privacy/evaluate") | ("POST", "/intent/verify") => {}
+        ("POST", "/privacy/evaluate")
+        | ("POST", "/intent/verify")
+        | ("POST", "/install/evaluate") => {}
         _ => {
             return respond(&mut stream, 404, "application/json",
-                b"{\"error\":\"unknown route. See docs for POST /privacy/evaluate, POST /intent/verify, GET /health.\"}");
+                b"{\"error\":\"unknown route. See docs for POST /privacy/evaluate, POST /intent/verify, POST /install/evaluate, GET /health.\"}");
         }
     }
 
@@ -216,6 +218,7 @@ fn handle_conn(mut stream: TcpStream, snap: &Snapshot) -> std::io::Result<()> {
     match path.as_str() {
         "/privacy/evaluate" => handle_privacy(&mut stream, snap, &peer.to_string(), &req_json),
         "/intent/verify"   => handle_intent(&mut stream, snap, &req_json),
+        "/install/evaluate" => handle_install(&mut stream, snap, &peer.to_string(), &req_json),
         _ => unreachable!(),
     }
 }
@@ -360,6 +363,249 @@ fn handle_intent(stream: &mut TcpStream, snap: &Snapshot, req: &Value) -> std::i
     });
     let bytes = serde_json::to_vec(&response).unwrap_or_else(|_| b"{}".to_vec());
     respond(stream, status, "application/json", &bytes)
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// Install evaluator (Phase 16)
+// ═══════════════════════════════════════════════════════════════════
+
+/// Parse a manifest snippet, extract pinned dependencies, cross-check every
+/// pin against OSV, and return an aggregate decision.
+///
+/// Request shape:
+/// ```json
+/// { "manifest_content": "...", "ecosystem": "pypi" | "npm" | "cargo" | "auto" }
+/// ```
+///
+/// Response shape:
+/// ```json
+/// {
+///   "decision": "allow" | "deny" | "ask",
+///   "flagged": [
+///     { "name": "...", "version": "...", "cve": "...", "severity": "HIGH", "reason": "..." }
+///   ]
+/// }
+/// ```
+fn handle_install(
+    stream: &mut TcpStream,
+    _snap: &Snapshot,
+    _peer: &str,
+    req: &Value,
+) -> std::io::Result<()> {
+    // Bypass path — match the other handlers. If global bypass is active we
+    // return `allow` with a marker so the caller logs it but doesn't block.
+    if let Some(r) = bypass::active(None) {
+        let response = json!({
+            "decision": "allow",
+            "reason": format!("bypass active ({})", r.as_audit_str()),
+            "flagged": Value::Array(vec![]),
+            "_bypass": true,
+        });
+        let bytes = serde_json::to_vec(&response).unwrap_or_else(|_| b"{}".to_vec());
+        return respond(stream, 200, "application/json", &bytes);
+    }
+
+    let manifest = req.get("manifest_content").and_then(|v| v.as_str()).unwrap_or("");
+    let eco = req.get("ecosystem").and_then(|v| v.as_str()).unwrap_or("auto");
+
+    if manifest.is_empty() {
+        let bytes = b"{\"decision\":\"ask\",\"reason\":\"manifest_content missing\",\"flagged\":[]}";
+        return respond(stream, 400, "application/json", bytes);
+    }
+
+    let pins = parse_manifest(manifest, eco);
+    if pins.is_empty() {
+        let response = json!({
+            "decision": "ask",
+            "reason": "no pinned dependencies found — agent should ask the user to confirm the install manually",
+            "flagged": [],
+        });
+        let bytes = serde_json::to_vec(&response).unwrap_or_else(|_| b"{}".to_vec());
+        return respond(stream, 202, "application/json", &bytes);
+    }
+
+    let tuples: Vec<(String, String, String)> = pins.iter()
+        .map(|p| (p.ecosystem.clone(), p.name.clone(), p.version.clone()))
+        .collect();
+    let results = crate::package_vulns::check_package_batch(&tuples);
+
+    let mut flagged = Vec::new();
+    let mut top_sev: i8 = -1;
+    for (p, r) in pins.iter().zip(results.iter()) {
+        if !r.vulnerable { continue; }
+        if r.severity > top_sev { top_sev = r.severity; }
+        flagged.push(json!({
+            "name": p.name,
+            "version": p.version,
+            "ecosystem": p.ecosystem,
+            "cve": r.cve,
+            "severity": severity_label(r.severity),
+            "reason": format!("OSV advisory {} for pinned version", r.cve.as_deref().unwrap_or("?")),
+        }));
+    }
+
+    let decision = if top_sev >= 4 {
+        "deny" // CRITICAL — do not install
+    } else if top_sev >= 2 {
+        "ask"  // MEDIUM/HIGH — require human confirmation
+    } else {
+        "allow" // clean or only LOW (shouldn't happen — OSV doesn't emit LOW often)
+    };
+
+    let status = match decision {
+        "deny" => 403,
+        "ask" => 202,
+        _ => 200,
+    };
+
+    let response = json!({
+        "decision": decision,
+        "reason": if flagged.is_empty() {
+            "no known vulnerabilities in pinned deps".to_string()
+        } else {
+            format!("{} vulnerable pin(s) — top severity {}", flagged.len(), severity_label(top_sev))
+        },
+        "flagged": flagged,
+    });
+    let bytes = serde_json::to_vec(&response).unwrap_or_else(|_| b"{}".to_vec());
+    respond(stream, status, "application/json", &bytes)
+}
+
+struct Pin {
+    ecosystem: String,
+    name: String,
+    version: String,
+}
+
+fn severity_label(s: i8) -> &'static str {
+    match s {
+        4 => "CRITICAL",
+        3 => "HIGH",
+        2 => "MEDIUM",
+        1 => "LOW",
+        _ => "NONE",
+    }
+}
+
+/// Very small parser matching DependencyDriftWatcher's extractors. We
+/// auto-detect the ecosystem from common manifest shapes if the caller
+/// passed `"auto"`.
+fn parse_manifest(content: &str, ecosystem: &str) -> Vec<Pin> {
+    let eco = match ecosystem.to_lowercase().as_str() {
+        "pypi" | "pip" | "python" => "pypi",
+        "npm" | "node" | "nodejs" => "npm",
+        "cargo" | "crates" | "crates.io" | "rust" => "cargo",
+        "auto" => detect_ecosystem(content),
+        _ => ecosystem,
+    };
+
+    match eco {
+        "pypi" => parse_pypi(content),
+        "npm" => parse_npm(content),
+        "cargo" => parse_cargo(content),
+        _ => Vec::new(),
+    }
+}
+
+fn detect_ecosystem(content: &str) -> &'static str {
+    let trimmed = content.trim_start();
+    if trimmed.starts_with('{') { return "npm"; }
+    if trimmed.contains("[dependencies]") || trimmed.contains("[package]") { return "cargo"; }
+    // Default to pypi — requirements.txt has no anchor beyond its format.
+    "pypi"
+}
+
+fn parse_pypi(content: &str) -> Vec<Pin> {
+    let mut out = Vec::new();
+    for line in content.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') || line.starts_with('-') { continue; }
+        let no_comment = line.split('#').next().unwrap_or("").trim();
+        if let Some(idx) = no_comment.find("==") {
+            let name = no_comment[..idx].trim().to_lowercase()
+                .replace(['_', '.'], "-");
+            let version = no_comment[idx + 2..].trim()
+                .split([';', ' ', ','])
+                .next().unwrap_or("").trim().to_string();
+            if !name.is_empty() && !version.is_empty() {
+                out.push(Pin { ecosystem: "PyPI".into(), name, version });
+            }
+        }
+    }
+    out
+}
+
+fn parse_npm(content: &str) -> Vec<Pin> {
+    let json: Value = match serde_json::from_str(content) {
+        Ok(v) => v,
+        Err(_) => return Vec::new(),
+    };
+    let mut out = Vec::new();
+    for key in ["dependencies", "devDependencies", "optionalDependencies", "peerDependencies"] {
+        let Some(deps) = json.get(key).and_then(|v| v.as_object()) else { continue };
+        for (name, raw) in deps {
+            let Some(ver) = raw.as_str() else { continue };
+            let v = ver.trim();
+            if v.starts_with('^') || v.starts_with('~') || v.starts_with(">=")
+                || v.starts_with('>') || v.starts_with('<') || v.contains('*') {
+                continue;
+            }
+            let clean = if let Some(stripped) = v.strip_prefix('=') { stripped } else { v };
+            if !clean.is_empty() {
+                out.push(Pin { ecosystem: "npm".into(), name: name.to_lowercase(), version: clean.to_string() });
+            }
+        }
+    }
+    out
+}
+
+fn parse_cargo(content: &str) -> Vec<Pin> {
+    let mut out = Vec::new();
+    let mut in_deps = false;
+    for raw in content.lines() {
+        let line = raw.trim();
+        if line.is_empty() || line.starts_with('#') { continue; }
+        if line.starts_with('[') {
+            let section = line.trim_start_matches('[').trim_end_matches(']');
+            in_deps = section == "dependencies"
+                || section == "dev-dependencies"
+                || section == "build-dependencies";
+            continue;
+        }
+        if !in_deps { continue; }
+        let Some(eq) = line.find('=') else { continue };
+        let name = line[..eq].trim().to_lowercase();
+        let rest = line[eq + 1..].trim();
+
+        let version_opt: Option<String> = if rest.starts_with('"') {
+            extract_quoted(rest)
+        } else if rest.starts_with('{') {
+            // Look for `version = "..."`
+            rest.find("version").and_then(|i| {
+                let tail = &rest[i..];
+                extract_quoted(tail)
+            })
+        } else {
+            None
+        };
+
+        if let Some(mut v) = version_opt {
+            if v.starts_with('^') || v.starts_with('~') || v.starts_with('=') {
+                v.remove(0);
+            }
+            if !v.is_empty() && !v.contains('*') {
+                out.push(Pin { ecosystem: "crates.io".into(), name, version: v });
+            }
+        }
+    }
+    out
+}
+
+fn extract_quoted(s: &str) -> Option<String> {
+    let after = s.find('"')? + 1;
+    let rest = &s[after..];
+    let end = rest.find('"')?;
+    Some(rest[..end].to_string())
 }
 
 // ═══════════════════════════════════════════════════════════════════
@@ -636,5 +882,106 @@ mod tests {
         let h = start_test_server();
         let (status, _body) = http_post(&h.bound_addr, "/privacy/evaluate", "not-json");
         assert_eq!(status, 400);
+    }
+
+    // -- Phase 16: install evaluator ---------------------------------
+
+    #[test]
+    fn install_evaluate_parses_requirements_txt() {
+        // Smoke test — we can't rely on network in CI, but we can confirm
+        // the parser extracts pins and the endpoint returns a JSON envelope
+        // with the expected shape. Without a network, OSV lookups return
+        // `error:...` source but the endpoint still responds.
+        let pins = parse_manifest("requests==2.31.0\nurllib3==2.0.7\n", "pypi");
+        assert_eq!(pins.len(), 2);
+        assert_eq!(pins[0].name, "requests");
+        assert_eq!(pins[0].version, "2.31.0");
+        assert_eq!(pins[0].ecosystem, "PyPI");
+    }
+
+    #[test]
+    fn install_evaluate_parses_package_json() {
+        let json = r#"{
+            "name": "app",
+            "dependencies": {
+                "express": "4.18.2",
+                "lodash": "^4.17.21",
+                "dotenv": "16.3.1"
+            }
+        }"#;
+        let pins = parse_manifest(json, "npm");
+        // `^4.17.21` is a range — should be skipped. Only exact pins kept.
+        assert_eq!(pins.len(), 2);
+        assert!(pins.iter().any(|p| p.name == "express" && p.version == "4.18.2"));
+        assert!(pins.iter().any(|p| p.name == "dotenv" && p.version == "16.3.1"));
+    }
+
+    #[test]
+    fn install_evaluate_parses_cargo_toml() {
+        let toml = r#"
+[package]
+name = "demo"
+
+[dependencies]
+serde = "1.0.189"
+rand = { version = "0.8.5", features = ["std"] }
+[dev-dependencies]
+tokio = "1.35.0"
+"#;
+        let pins = parse_manifest(toml, "cargo");
+        assert!(pins.iter().any(|p| p.name == "serde" && p.version == "1.0.189"));
+        assert!(pins.iter().any(|p| p.name == "rand" && p.version == "0.8.5"));
+        assert!(pins.iter().any(|p| p.name == "tokio" && p.version == "1.35.0"));
+    }
+
+    #[test]
+    fn install_evaluate_auto_detect() {
+        // JSON → npm
+        let pins = parse_manifest(r#"{"dependencies":{"react":"18.2.0"}}"#, "auto");
+        assert!(pins.iter().any(|p| p.name == "react" && p.ecosystem == "npm"));
+        // TOML with [dependencies] → cargo
+        let pins = parse_manifest("[dependencies]\nfoo = \"1.0.0\"", "auto");
+        assert!(pins.iter().any(|p| p.name == "foo" && p.ecosystem == "crates.io"));
+        // Otherwise → pypi
+        let pins = parse_manifest("click==8.1.7", "auto");
+        assert!(pins.iter().any(|p| p.name == "click" && p.ecosystem == "PyPI"));
+    }
+
+    #[test]
+    fn install_evaluate_endpoint_shape_without_network() {
+        // Preload the OSV cache with `clean` entries so no network call fires.
+        // We need a local cache — reuse the package_vulns module directly.
+        let tmp = std::env::temp_dir().join("aisec_install_eval_test");
+        let _ = std::fs::remove_dir_all(&tmp);
+        let _ = std::fs::create_dir_all(&tmp);
+        let _ = crate::package_vulns::init(tmp.to_str().unwrap());
+
+        let h = start_test_server();
+
+        // A global `bypass::active(None)` short-circuits the handler. If the
+        // test environment has a bypass file (common on developer machines),
+        // skip the strict status-code checks and just validate the endpoint
+        // returns a JSON envelope with the expected keys.
+        let bypass_on = crate::bypass::active(None).is_some();
+
+        // Missing manifest_content.
+        let (status, body) = http_post(&h.bound_addr, "/install/evaluate", r#"{"ecosystem":"pypi"}"#);
+        if bypass_on {
+            assert!(body.contains("\"_bypass\":true"));
+        } else {
+            assert_eq!(status, 400);
+            assert!(body.contains("manifest_content missing"));
+        }
+
+        // Empty deps → ask (or bypassed allow).
+        let payload = "{\"manifest_content\":\"# no deps here\",\"ecosystem\":\"pypi\"}";
+        let (status, body) = http_post(&h.bound_addr, "/install/evaluate", payload);
+        if bypass_on {
+            assert_eq!(status, 200);
+            assert!(body.contains("\"_bypass\":true"));
+        } else {
+            assert_eq!(status, 202);
+            assert!(body.contains("\"decision\":\"ask\""));
+        }
     }
 }

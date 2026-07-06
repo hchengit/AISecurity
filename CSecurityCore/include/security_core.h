@@ -151,6 +151,16 @@ typedef struct FeedCheckResultFFI {
 } FeedCheckResultFFI;
 
 /**
+ * FFI-safe package check result.
+ */
+typedef struct PackageCheckResultFFI {
+    bool vulnerable;
+    int8_t severity;
+    char *cve;
+    char *source;
+} PackageCheckResultFFI;
+
+/**
  * FFI-safe start result.
  */
 typedef struct LocalServicesStartResult {
@@ -433,6 +443,32 @@ uint32_t sec_feed_total_entries(void);
  * Free a FeedCheckResultFFI.
  */
 void sec_free_feed_check(struct FeedCheckResultFFI *ptr);
+
+/**
+ * Initialize the package-vulns SQLite cache. Call once at startup.
+ */
+bool sec_package_vulns_init(const char *securityDir);
+
+/**
+ * Check a single package against OSV (cache-first). BLOCKING — on cache
+ * miss makes an HTTP call up to 30 s. Call from a background thread.
+ */
+struct PackageCheckResultFFI *sec_check_package(const char *ecosystem,
+                                                const char *name,
+                                                const char *version);
+
+/**
+ * Batch-check N packages. `queries_json` is a JSON array:
+ * `[{"ecosystem":"PyPI","name":"litellm","version":"1.82.8"}, ...]`
+ * Returns JSON array of results. Caller frees with `sec_free_string`.
+ * BLOCKING — makes one OSV /querybatch call on cache miss.
+ */
+char *sec_check_package_batch(const char *queriesJson);
+
+/**
+ * Free a `PackageCheckResultFFI`.
+ */
+void sec_free_package_check(struct PackageCheckResultFFI *ptr);
 
 /**
  * Get the current protection tier from config. Returns 0=relaxed, 1=balanced, 2=strict.
