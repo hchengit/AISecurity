@@ -163,7 +163,13 @@ fn main() -> ExitCode {
         }
     };
 
-    let profile = generate_sandbox_profile(&policy);
+    let profile = match generate_sandbox_profile(&policy) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("ai-exec: {}", e);
+            return ExitCode::from(3);
+        }
+    };
 
     if args.dry_run {
         print!("{}", profile);

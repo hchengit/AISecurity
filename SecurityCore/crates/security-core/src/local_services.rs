@@ -45,6 +45,13 @@ pub struct ServiceOptions {
     pub bind_addr: String,
     pub config_path: Option<String>,
     pub audit_log_path: Option<String>,
+    /// AISecurity directory used for the bypass-file check. `None` (the
+    /// production default) means "use the security dir from loaded config
+    /// (`paths.security_dir`)" — so bypass shares a single source of truth
+    /// with config/vault/audit. Setting it pins the check to an explicit
+    /// directory, which tests use to stay independent of the developer's
+    /// real `~/.mac-security/bypass`.
+    pub security_dir: Option<String>,
 }
 
 impl Default for ServiceOptions {
@@ -53,6 +60,7 @@ impl Default for ServiceOptions {
             bind_addr: "127.0.0.1:7459".into(),
             config_path: None,
             audit_log_path: None,
+            security_dir: None,
         }
     }
 }
@@ -71,6 +79,7 @@ struct Snapshot {
     intent: IntentVerifierConfig,
     command: CommandPolicyConfig,
     audit_log_path: Option<String>,
+    security_dir: Option<String>,
 }
 
 fn snapshot(opts: &ServiceOptions) -> Snapshot {
@@ -83,6 +92,12 @@ fn snapshot(opts: &ServiceOptions) -> Snapshot {
         intent: cfg.intent_verifier.clone(),
         command: cfg.command_policy.clone(),
         audit_log_path: opts.audit_log_path.clone(),
+        // Single source of truth: bypass reads from the same security dir as
+        // config/vault/audit. An explicit opts.security_dir (tests) wins.
+        security_dir: opts
+            .security_dir
+            .clone()
+            .or_else(|| Some(cfg.paths.security_dir.clone())),
     }
 }
 
@@ -215,7 +230,7 @@ fn handle_privacy(stream: &mut TcpStream, snap: &Snapshot, peer: &str, req: &Val
 
     // Global bypass: user opted out of ROUTINE approval. Critical secrets
     // still never leave the machine — see privacy_router::evaluate_floor_only.
-    if let Some(r) = bypass::active(None) {
+    if let Some(r) = bypass::active(snap.security_dir.as_deref()) {
         let floor = privacy_router::evaluate_floor_only(&host, &body, &snap.privacy);
         if floor.action == PrivacyAction::Block {
             // Floor violation under bypass — log both the bypass and the block.
@@ -295,7 +310,7 @@ fn handle_intent(stream: &mut TcpStream, snap: &Snapshot, req: &Value) -> std::i
     };
 
     // Global bypass.
-    if let Some(r) = bypass::active(None) {
+    if let Some(r) = bypass::active(snap.security_dir.as_deref()) {
         if let Some(path) = &snap.audit_log_path {
             let agent = body.agent.as_deref().unwrap_or("");
             let _ = write_audit_bypass(path, "intent", agent, "", &r);
@@ -485,10 +500,18 @@ mod tests {
     use std::io::Read as _;
 
     fn start_test_server() -> ServiceHandle {
+        // Pin the bypass check to an empty temp dir so these tests are
+        // deterministic regardless of the developer's real
+        // `~/.mac-security/bypass` file (which is a legitimate on/off
+        // switch, not a test failure).
+        let dir = std::env::temp_dir().join("aisec_local_services_test_secdir");
+        let _ = std::fs::create_dir_all(&dir);
+        let _ = std::fs::remove_file(dir.join("bypass"));
         let opts = ServiceOptions {
             bind_addr: "127.0.0.1:0".into(),
             config_path: None,
             audit_log_path: None,
+            security_dir: Some(dir.to_string_lossy().into_owned()),
         };
         start_in_background(opts).expect("bind failed")
     }
@@ -516,6 +539,34 @@ mod tests {
         let status = out.split_whitespace().nth(1).unwrap_or("0").parse().unwrap_or(0);
         let body_start = out.find("\r\n\r\n").map(|i| i + 4).unwrap_or(out.len());
         (status, out[body_start..].to_string())
+    }
+
+    #[test]
+    fn snapshot_defaults_bypass_dir_to_config_security_dir() {
+        // Production path: security_dir=None must fall back to the config's
+        // security dir, so bypass shares one source of truth with everything
+        // else — not a second, independently-resolved location.
+        let opts = ServiceOptions {
+            bind_addr: "127.0.0.1:0".into(),
+            config_path: None,
+            audit_log_path: None,
+            security_dir: None,
+        };
+        let snap = snapshot(&opts);
+        let expected = SecurityConfig::default().paths.security_dir;
+        assert_eq!(snap.security_dir.as_deref(), Some(expected.as_str()));
+    }
+
+    #[test]
+    fn snapshot_explicit_security_dir_overrides_config() {
+        let opts = ServiceOptions {
+            bind_addr: "127.0.0.1:0".into(),
+            config_path: None,
+            audit_log_path: None,
+            security_dir: Some("/custom/secdir".into()),
+        };
+        let snap = snapshot(&opts);
+        assert_eq!(snap.security_dir.as_deref(), Some("/custom/secdir"));
     }
 
     #[test]

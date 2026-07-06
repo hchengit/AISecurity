@@ -1243,6 +1243,7 @@ pub extern "C" fn sec_local_services_start(
         bind_addr: bind,
         config_path: cfg,
         audit_log_path: alog,
+        security_dir: None,
     };
 
     match local_services::start_in_background(opts) {

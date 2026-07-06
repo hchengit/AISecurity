@@ -150,7 +150,7 @@ fn expand_home(path: &str) -> String {
 ///
 /// Caller is responsible for writing the string to a `.sb` file and
 /// invoking `sandbox-exec -f <file> -- <cmd>`.
-pub fn generate_sandbox_profile(policy: &AgentPolicy) -> String {
+pub fn generate_sandbox_profile(policy: &AgentPolicy) -> Result<String, String> {
     let mut out = String::new();
     out.push_str(";; AISecurity-generated sandbox profile\n");
     out.push_str(";; DO NOT EDIT — regenerated on every run.\n");
@@ -214,6 +214,7 @@ pub fn generate_sandbox_profile(policy: &AgentPolicy) -> String {
             if !reads.contains(&r) { reads.push(r); }
         }
         for p in reads {
+            reject_control_chars(&p)?;
             out.push_str(&format!("  (subpath \"{}\")\n", scheme_escape(&p)));
         }
         out.push_str(")\n\n");
@@ -223,7 +224,9 @@ pub fn generate_sandbox_profile(policy: &AgentPolicy) -> String {
         out.push_str(";; Agent write access\n");
         out.push_str("(allow file-write*\n");
         for p in &policy.allowed_paths_write {
-            out.push_str(&format!("  (subpath \"{}\")\n", scheme_escape(&expand_home(p))));
+            let p = expand_home(p);
+            reject_control_chars(&p)?;
+            out.push_str(&format!("  (subpath \"{}\")\n", scheme_escape(&p)));
         }
         out.push_str(")\n\n");
     }
@@ -246,17 +249,40 @@ pub fn generate_sandbox_profile(policy: &AgentPolicy) -> String {
         out.push_str(")\n");
         out.push_str(";; Allowed hosts (for audit, enforced at proxy layer):\n");
         for h in &policy.allowed_network {
-            out.push_str(&format!(";;   - {}\n", h));
+            // These land on a comment line. A raw newline/CR would end the
+            // comment and let the remainder be parsed as a live Scheme form,
+            // so strip all control chars. (Purely informational — not a
+            // security control, hence sanitize rather than reject.)
+            let sanitized: String = h.chars().filter(|c| !c.is_control()).collect();
+            out.push_str(&format!(";;   - {}\n", sanitized));
         }
         out.push_str("\n");
     }
 
-    out
+    Ok(out)
 }
 
 /// Minimal escape for embedding a path in a TinyScheme string literal.
 fn scheme_escape(s: &str) -> String {
     s.replace('\\', "\\\\").replace('"', "\\\"")
+}
+
+/// Reject any value carrying a control character before it is embedded
+/// into the Seatbelt profile. A newline/CR would let a config value break
+/// out of the `(subpath "…")` string literal and inject an extra rule;
+/// other control chars have no legitimate place in a filesystem path.
+///
+/// We refuse to emit a profile rather than silently stripping, because a
+/// mangled path (`/foo\n/bar` → `/foo/bar`) would grant access to a
+/// *different* location than intended — failing closed is the only safe
+/// choice for a sandbox boundary.
+fn reject_control_chars(s: &str) -> Result<(), String> {
+    if s.chars().any(|c| c.is_control()) {
+        return Err(format!(
+            "refusing to generate sandbox profile: agent path contains a control character: {s:?}"
+        ));
+    }
+    Ok(())
 }
 
 // ═══════════════════════════════════════════════════════════════════
@@ -323,14 +349,14 @@ mod tests {
     #[test]
     fn sandbox_profile_denies_by_default() {
         let p = demo_policy();
-        let sb = generate_sandbox_profile(&p);
+        let sb = generate_sandbox_profile(&p).unwrap();
         assert!(sb.contains("(deny default)"));
     }
 
     #[test]
     fn sandbox_profile_encodes_read_paths() {
         let p = demo_policy();
-        let sb = generate_sandbox_profile(&p);
+        let sb = generate_sandbox_profile(&p).unwrap();
         let r = PathResolver::new();
         let home = r.home();
         assert!(sb.contains(&format!("(subpath \"{}/work\")", home)));
@@ -341,9 +367,53 @@ mod tests {
     fn sandbox_profile_offline_has_no_outbound_rule() {
         let mut p = demo_policy();
         p.allowed_network = vec![];
-        let sb = generate_sandbox_profile(&p);
+        let sb = generate_sandbox_profile(&p).unwrap();
         assert!(!sb.contains("(allow network-outbound"));
         assert!(sb.contains(";; Offline"));
+    }
+
+    #[test]
+    fn sandbox_profile_rejects_newline_in_read_path() {
+        let mut p = demo_policy();
+        // A path that tries to break out of the (subpath "…") literal and
+        // inject a rule granting write access to the whole filesystem.
+        p.allowed_paths_read
+            .push("/tmp/x\")\n(allow file-write* (subpath \"/".into());
+        let err = generate_sandbox_profile(&p).unwrap_err();
+        assert!(err.contains("control character"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn sandbox_profile_rejects_newline_in_write_path() {
+        let mut p = demo_policy();
+        p.allowed_paths_write.push("/tmp/y\r/etc".into());
+        assert!(generate_sandbox_profile(&p).is_err());
+    }
+
+    #[test]
+    fn sandbox_profile_allows_parens_in_path() {
+        // Parentheses are legal inside a quoted Scheme string literal, so a
+        // path like "~/Library/Application Support (old)" must NOT be
+        // rejected — only the enclosing quotes/backslashes are structural.
+        let mut p = demo_policy();
+        p.allowed_paths_read.push("/tmp/weird (dir)".into());
+        let sb = generate_sandbox_profile(&p).unwrap();
+        assert!(sb.contains("(subpath \"/tmp/weird (dir)\")"));
+    }
+
+    #[test]
+    fn sandbox_profile_strips_control_chars_from_host_comment() {
+        let mut p = demo_policy();
+        // A host value smuggling a live Scheme form after a newline must
+        // not produce a non-comment line in the output.
+        p.allowed_network
+            .push("evil.example\n(allow file-write* (subpath \"/\"))".into());
+        let sb = generate_sandbox_profile(&p).unwrap();
+        // The injected form must not appear at the start of any line.
+        assert!(
+            !sb.lines().any(|l| l.trim_start().starts_with("(allow file-write* (subpath \"/\"))")),
+            "host newline injected a live rule:\n{sb}"
+        );
     }
 
     #[test]
