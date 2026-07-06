@@ -133,7 +133,7 @@ fn exec_sandboxed(_profile_path: &str, argv: &[String]) -> std::io::Error {
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;
-        return cmd.exec();
+        cmd.exec()
     }
     #[cfg(not(unix))]
     {
@@ -163,7 +163,13 @@ fn main() -> ExitCode {
         }
     };
 
-    let profile = generate_sandbox_profile(&policy);
+    let profile = match generate_sandbox_profile(&policy) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("ai-exec: {}", e);
+            return ExitCode::from(3);
+        }
+    };
 
     if args.dry_run {
         print!("{}", profile);

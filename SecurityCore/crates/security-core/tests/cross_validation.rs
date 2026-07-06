@@ -289,11 +289,11 @@ fn encryption_roundtrip_tests() {
 
             let encrypted = enc
                 .encrypt_string(&case.input, encryption::aad::GENERAL)
-                .expect(&format!("[{}] encryption failed", case.test_name));
+                .unwrap_or_else(|_| panic!("[{}] encryption failed", case.test_name));
 
             let decrypted = enc
                 .decrypt_string(&encrypted, encryption::aad::GENERAL)
-                .expect(&format!("[{}] decryption failed", case.test_name));
+                .unwrap_or_else(|_| panic!("[{}] decryption failed", case.test_name));
 
             assert_eq!(
                 decrypted, case.input,

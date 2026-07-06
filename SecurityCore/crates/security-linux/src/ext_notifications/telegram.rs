@@ -34,6 +34,7 @@ pub fn send(alert: &SecurityAlert, config: &TelegramConfig) -> Result<(), String
 }
 
 /// Send a test message.
+#[allow(dead_code)] // public API; not yet wired into a test-notification command
 pub fn send_test(config: &TelegramConfig) -> Result<(), String> {
     let text = esc("\u{1F6E1} AISecurity Test\n\nThis is a test from the Linux daemon.\nTelegram is configured correctly!");
     let url = format!(

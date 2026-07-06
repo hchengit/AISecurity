@@ -187,7 +187,7 @@ fn check_signatures(text: &str) -> Option<SignatureMatch> {
     let has_gov = any_match(text, &TRAIT_GOV_AGENCY);
     let has_fin = any_match(text, &TRAIT_FINANCIAL);
     let has_tech = any_match(text, &TRAIT_TECH_COMPANY);
-    let has_crypto_ctx = any_match(text, &TRAIT_CRYPTO);
+    let _has_crypto_ctx = any_match(text, &TRAIT_CRYPTO);
     let has_creds = any_match(text, &TRAIT_ASK_CREDENTIALS);
     let has_ssn = any_match(text, &TRAIT_ASK_SSN);
     let has_fin_data = any_match(text, &TRAIT_ASK_FINANCIAL);

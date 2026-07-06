@@ -15,17 +15,14 @@ use crate::severity::SeverityLevel;
 /// - `Strict`: Maximum enforcement. Everything monitored, tight thresholds.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
+#[derive(Default)]
 pub enum ProtectionTier {
     Relaxed,
+    #[default]
     Balanced,
     Strict,
 }
 
-impl Default for ProtectionTier {
-    fn default() -> Self {
-        ProtectionTier::Balanced
-    }
-}
 
 impl ProtectionTier {
     /// Parse from string (case-insensitive). Returns None for unknown values.

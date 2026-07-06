@@ -300,8 +300,7 @@ mod tests {
 
     #[test]
     fn shell_coherence_can_be_turned_off() {
-        let mut vc = IntentVerifierConfig::default();
-        vc.require_task_coherence = false;
+        let vc = IntentVerifierConfig { require_task_coherence: false, ..Default::default() };
         let v = verify(
             &req("anything", "ls -la", ActionKind::Shell),
             &CommandPolicyConfig::default(),
@@ -324,8 +323,7 @@ mod tests {
 
     #[test]
     fn disabled_verifier_always_allows() {
-        let mut vc = IntentVerifierConfig::default();
-        vc.enabled = false;
+        let vc = IntentVerifierConfig { enabled: false, ..Default::default() };
         let v = verify(
             &req("x", "rm -rf /", ActionKind::Shell),
             &CommandPolicyConfig::default(),

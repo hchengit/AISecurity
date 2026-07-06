@@ -42,6 +42,7 @@ use security_core::config::SecurityConfig;
 use security_core::intent_verifier::{
     verify, ActionKind, IntentDecision, IntentRequest,
 };
+use security_core::path_resolver::PathResolver;
 
 // ═══════════════════════════════════════════════════════════════════
 // Claude Code hook input shape
@@ -218,8 +219,18 @@ fn main() -> ExitCode {
         }
     };
 
-    // Global bypass: user opted out of agent protection.
-    if let Some(r) = bypass::active(None) {
+    // Global bypass: user opted out of agent protection. This hook runs
+    // inside the monitored agent's environment, so it is hardened against an
+    // agent flipping enforcement off:
+    //   1. The security dir is resolved from HOME only (PathResolver),
+    //      ignoring MACSEC_SECURITY_DIR — an agent must not redirect the
+    //      bypass check to a directory it controls.
+    //   2. Only the on-disk bypass file counts (active_file_only), not the
+    //      AISEC_BYPASS env var — writing the file requires access to the
+    //      security dir, a higher bar than setting a child-process env var.
+    // The trusted daemon still honors both sources via bypass::active.
+    let security_dir = PathResolver::new().security_dir();
+    if let Some(r) = bypass::active_file_only(Some(security_dir.as_str())) {
         println!("{}", hook_decision_json(&IntentDecision::Allow,
             &format!("bypass active ({}) — AI-agent protection disabled", r.as_audit_str())));
         return ExitCode::SUCCESS;

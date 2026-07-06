@@ -81,6 +81,7 @@ impl NotificationConfig {
     }
 
     /// Save to `{config_dir}/notification-config.json`.
+    #[allow(dead_code)] // public API; not yet wired into the setup flow
     pub fn save(&self, config_dir: &str) -> Result<(), String> {
         let path = PathBuf::from(config_dir).join("notification-config.json");
         let json = serde_json::to_string_pretty(self)

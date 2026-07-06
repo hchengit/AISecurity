@@ -27,7 +27,7 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Install system dependencies
-        run: sudo apt-get update && sudo apt-get install -y libdbus-1-dev libsqlite3-dev pkg-config
+        run: sudo apt-get update && sudo apt-get install -y libdbus-1-dev libsqlite3-dev pkg-config clang libclang-dev llvm-dev libpam0g-dev
 
       - name: Cache cargo registry & build
         uses: actions/cache@v4
@@ -55,7 +55,7 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Install system dependencies
-        run: sudo apt-get update && sudo apt-get install -y libdbus-1-dev libsqlite3-dev pkg-config
+        run: sudo apt-get update && sudo apt-get install -y libdbus-1-dev libsqlite3-dev pkg-config clang libclang-dev llvm-dev libpam0g-dev
 
       - name: Cache cargo registry & build
         uses: actions/cache@v4

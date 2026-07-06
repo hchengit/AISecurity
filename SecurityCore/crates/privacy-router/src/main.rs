@@ -98,6 +98,7 @@ fn main() -> ExitCode {
         bind_addr: bind.clone(),
         config_path: Some(config_path.clone()),
         audit_log_path: args.audit_log.clone(),
+        security_dir: None,
     };
 
     eprintln!(
