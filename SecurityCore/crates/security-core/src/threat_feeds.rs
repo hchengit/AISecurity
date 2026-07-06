@@ -458,7 +458,15 @@ mod tests {
     use super::*;
     use std::fs;
 
-    fn test_db(name: &str) -> String {
+    // The feed DB is a process-global `static DB`, so tests that (re)init it
+    // must run serially — otherwise one test's test_db() swaps the global
+    // connection out from under another's insert→lookup. Hold this for the
+    // whole test.
+    static TEST_GUARD: Mutex<()> = Mutex::new(());
+
+    fn test_db(name: &str) -> (std::sync::MutexGuard<'static, ()>, String) {
+        // Tolerate poisoning so a panicking test doesn't cascade-fail the rest.
+        let guard = TEST_GUARD.lock().unwrap_or_else(|e| e.into_inner());
         let dir = std::env::temp_dir().join(format!("aisec_feeds_{}", name));
         let _ = fs::create_dir_all(&dir);
         // Reset global DB state
@@ -466,7 +474,7 @@ mod tests {
         *db = None;
         drop(db);
         init(dir.to_str().unwrap()).unwrap();
-        dir.to_str().unwrap().to_string()
+        (guard, dir.to_str().unwrap().to_string())
     }
 
     fn cleanup(dir: &str) {
@@ -477,7 +485,7 @@ mod tests {
 
     #[test]
     fn init_creates_db() {
-        let dir = test_db("init");
+        let (_guard, dir) = test_db("init");
         let db_path = format!("{}/threat-feeds.db", dir);
         assert!(fs::metadata(&db_path).is_ok());
         cleanup(&dir);
@@ -485,7 +493,7 @@ mod tests {
 
     #[test]
     fn check_url_no_match() {
-        let dir = test_db("no_match");
+        let (_guard, dir) = test_db("no_match");
         let result = check_url("https://google.com");
         assert!(!result.is_match());
         assert_eq!(result.threat_level, -1);
@@ -494,7 +502,7 @@ mod tests {
 
     #[test]
     fn insert_and_lookup_url() {
-        let dir = test_db("lookup_url");
+        let (_guard, dir) = test_db("lookup_url");
         let db = DB.lock().unwrap();
         let conn = db.as_ref().unwrap();
         let now = Utc::now().to_rfc3339();
@@ -514,7 +522,7 @@ mod tests {
 
     #[test]
     fn insert_and_lookup_domain() {
-        let dir = test_db("lookup_domain");
+        let (_guard, dir) = test_db("lookup_domain");
         let db = DB.lock().unwrap();
         let conn = db.as_ref().unwrap();
         let now = Utc::now().to_rfc3339();
@@ -541,7 +549,7 @@ mod tests {
 
     #[test]
     fn domain_extraction_from_url() {
-        let dir = test_db("domain_extract");
+        let (_guard, dir) = test_db("domain_extract");
         let db = DB.lock().unwrap();
         let conn = db.as_ref().unwrap();
         let now = Utc::now().to_rfc3339();
@@ -561,7 +569,7 @@ mod tests {
 
     #[test]
     fn expired_entries_dont_match() {
-        let dir = test_db("expired");
+        let (_guard, dir) = test_db("expired");
         let db = DB.lock().unwrap();
         let conn = db.as_ref().unwrap();
         let now = Utc::now().to_rfc3339();
@@ -587,7 +595,7 @@ mod tests {
 
     #[test]
     fn stats_initialized() {
-        let dir = test_db("stats");
+        let (_guard, dir) = test_db("stats");
         let stats = get_stats();
         assert_eq!(stats.len(), 2); // openphish + spamhaus
         assert_eq!(stats[0].refresh_count, 0);

@@ -187,7 +187,7 @@ fn check_signatures(text: &str) -> Option<SignatureMatch> {
     let has_gov = any_match(text, &TRAIT_GOV_AGENCY);
     let has_fin = any_match(text, &TRAIT_FINANCIAL);
     let has_tech = any_match(text, &TRAIT_TECH_COMPANY);
-    let _has_crypto_ctx = any_match(text, &TRAIT_CRYPTO);
+    let has_crypto_ctx = any_match(text, &TRAIT_CRYPTO);
     let has_creds = any_match(text, &TRAIT_ASK_CREDENTIALS);
     let has_ssn = any_match(text, &TRAIT_ASK_SSN);
     let has_fin_data = any_match(text, &TRAIT_ASK_FINANCIAL);
@@ -306,6 +306,22 @@ fn check_signatures(text: &str) -> Option<SignatureMatch> {
     // Crypto payment + secrecy IS suspicious though.
     sig!("Crypto payment + secrecy", 80,
         has_crypto_pay && has_secrecy);
+    // Crypto exchanges/wallets (Coinbase, Binance, etc.) are impersonation
+    // targets like banks and tech companies, but are not in TRAIT_FINANCIAL
+    // or TRAIT_TECH_COMPANY — so mirror the bank/tech credential-phishing
+    // rules here using the crypto-context signal. Scoped to credential asks
+    // and account threats (not payment/urgency, which is newsletter-noisy).
+    // Fake-exchange login harvesting.
+    sig!("Crypto exchange + credential request + suspicious URL", 90,
+        has_crypto_ctx && has_creds && has_sus_url);
+    // The credential ask against a crypto brand is itself the red flag —
+    // legit exchanges never ask you to reply with/confirm your password.
+    // (Mirrors "Bank + credential request" = 70.)
+    sig!("Crypto exchange + credential request", 70,
+        has_crypto_ctx && has_creds);
+    // "Your Coinbase account is suspended — click here" wallet-drain lure.
+    sig!("Crypto exchange + account threat + suspicious URL", 80,
+        has_crypto_ctx && has_acct_threat && has_sus_url);
 
     // ── CATEGORY: Credential Harvesting (generic) ─────────────────
     // Credential request + suspicious URL (no specific brand needed)
@@ -559,6 +575,30 @@ mod tests {
         let r = parse(text, Channel::Email);
         assert!(r.is_threat, "Seed phrase request should be threat, score={}", r.score);
         assert!(r.score >= 90);
+    }
+
+    #[test]
+    fn crypto_exchange_credential_phishing() {
+        // Crypto-brand credential phishing with no suspicious URL: a Coinbase
+        // exchange is not in TRAIT_FINANCIAL/TRAIT_TECH_COMPANY, so before the
+        // crypto-context signal was wired in this scored below threshold and
+        // slipped through, unlike the equivalent bank/tech phish.
+        let text = "Security alert from Coinbase: your account has been locked. \
+                     Confirm your password to restore access to your wallet.";
+        let r = parse(text, Channel::Email);
+        assert!(r.is_threat, "Crypto exchange credential phish should be threat, score={}", r.score);
+        assert!(r.score >= 70, "Expected >=70, got {}", r.score);
+    }
+
+    #[test]
+    fn legitimate_crypto_newsletter_safe() {
+        // Crypto context + payment/urgency language, but no credential ask or
+        // account threat — must stay below threshold (the false-positive case
+        // the payment+urgency rules were deliberately left out to avoid).
+        let text = "Bitcoin weekly: BTC and ethereum rallied. Our analysts expect \
+                     more crypto momentum soon — read the full report now.";
+        let r = parse(text, Channel::Email);
+        assert!(!r.is_threat, "Crypto newsletter should be safe, score={}, label={}", r.score, r.label);
     }
 
     #[test]
