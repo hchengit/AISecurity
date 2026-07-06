@@ -221,7 +221,7 @@ pub fn discover_model_directories() -> Vec<String> {
     }
 
     // 2. Scan home directory (depth 4) for model files
-    discover_in_dir(&home, &mut model_dirs, 0, 4);
+    discover_in_dir(home, &mut model_dirs, 0, 4);
 
     // 3. Scan /Volumes/ for external drives with model files (depth 4)
     if Path::new("/Volumes").exists() {
@@ -229,7 +229,7 @@ pub fn discover_model_directories() -> Vec<String> {
             for entry in entries.flatten() {
                 let vol_path = entry.path();
                 // Skip the boot volume (it's just a symlink to /)
-                if vol_path.to_str().map_or(false, |p| p == "/Volumes/Macintosh HD") {
+                if vol_path.to_str() == Some("/Volumes/Macintosh HD") {
                     continue;
                 }
                 if vol_path.is_dir() {

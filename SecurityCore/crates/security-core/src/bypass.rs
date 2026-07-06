@@ -14,7 +14,6 @@
 //! File wins — it's the "stable" signal (survives across shells, matches
 //! the menu-bar UX when that lands). Env var is for per-process overrides.
 
-use std::path::PathBuf;
 
 /// Reason an individual call was bypassed. Serialized into the audit log.
 #[derive(Debug, Clone, PartialEq, Eq)]

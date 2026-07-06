@@ -5,7 +5,7 @@
 
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
-use std::fs::{self, File, OpenOptions};
+use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::PathBuf;
 
@@ -31,6 +31,14 @@ pub struct PolicyAuditLog {
     log_path: PathBuf,
 }
 
+impl Default for PolicyAuditLog {
+    /// Create using default security directory from PathResolver.
+    fn default() -> Self {
+        let resolver = PathResolver::new();
+        Self::new(&resolver.security_dir())
+    }
+}
+
 impl PolicyAuditLog {
     /// Create a new audit logger. Creates the log directory if needed.
     pub fn new(security_dir: &str) -> Self {
@@ -39,12 +47,6 @@ impl PolicyAuditLog {
         Self {
             log_path: log_dir.join("policy-audit.jsonl"),
         }
-    }
-
-    /// Create using default security directory from PathResolver.
-    pub fn default() -> Self {
-        let resolver = PathResolver::new();
-        Self::new(&resolver.security_dir())
     }
 
     /// Log a policy decision.

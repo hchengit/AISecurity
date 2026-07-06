@@ -213,10 +213,10 @@ pub fn evaluate_floor_only(
 
 /// Evaluate an outbound request against the privacy policy.
 ///
-/// * `host`       — the destination host (e.g. "api.anthropic.com").
-/// * `body`       — the request body as UTF-8 text. Non-text bodies are the
-///                  caller's concern to skip; this function only handles text.
-/// * `config`     — the loaded policy.
+/// * `host` — the destination host (e.g. "api.anthropic.com").
+/// * `body` — the request body as UTF-8 text. Non-text bodies are the
+///   caller's concern to skip; this function only handles text.
+/// * `config` — the loaded policy.
 pub fn evaluate_request(
     host: &str,
     body: &str,
@@ -326,7 +326,7 @@ fn locate_match(body: &str, f: &Finding) -> Option<(usize, usize)> {
             let start = f.offset;
             let slice = &body[start..];
             let end_rel = slice
-                .find(|c: char| c == '\n')
+                .find('\n')
                 .unwrap_or(slice.len().min(256));
             return Some((start, start + end_rel));
         }

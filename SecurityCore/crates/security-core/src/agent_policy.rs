@@ -25,8 +25,10 @@ use crate::path_resolver::PathResolver;
 /// Command-policy stance attached to an agent.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
+#[derive(Default)]
 pub enum AgentCommandStance {
     /// Use project-wide command policy unchanged.
+    #[default]
     Default,
     /// Treat anything not explicitly allowed as Deny.
     Restrictive,
@@ -34,9 +36,6 @@ pub enum AgentCommandStance {
     Permissive,
 }
 
-impl Default for AgentCommandStance {
-    fn default() -> Self { AgentCommandStance::Default }
-}
 
 /// Policy for a single named agent. All path fields support `~/` prefix.
 #[derive(Debug, Clone, Deserialize, Serialize, Default)]
@@ -256,7 +255,7 @@ pub fn generate_sandbox_profile(policy: &AgentPolicy) -> Result<String, String> 
             let sanitized: String = h.chars().filter(|c| !c.is_control()).collect();
             out.push_str(&format!(";;   - {}\n", sanitized));
         }
-        out.push_str("\n");
+        out.push('\n');
     }
 
     Ok(out)

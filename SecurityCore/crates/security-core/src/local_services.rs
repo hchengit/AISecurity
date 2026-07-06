@@ -497,7 +497,6 @@ fn json_escape(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Read as _;
 
     fn start_test_server() -> ServiceHandle {
         // Pin the bypass check to an empty temp dir so these tests are

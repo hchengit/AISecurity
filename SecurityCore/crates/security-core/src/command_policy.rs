@@ -282,10 +282,7 @@ fn word_boundary_match(command: &str, prefix: &str) -> bool {
     if command == prefix { return true; }
     if command.starts_with(prefix) {
         let next_char = command.as_bytes().get(prefix.len());
-        match next_char {
-            Some(b' ') | Some(b'\t') | Some(b'\n') | None => true,
-            _ => false,
-        }
+        matches!(next_char, Some(b' ') | Some(b'\t') | Some(b'\n') | None)
     } else {
         false
     }
