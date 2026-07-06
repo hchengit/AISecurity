@@ -103,6 +103,7 @@ or before releases, and fuzz the hand-rolled parsers (`local_services.rs` HTTP,
 `email_scanner`, the PyPI/manifest parser). A model finds the interesting logic bugs;
 fuzzers and `cargo deny` find the complete boring set — use both.
 
-**Known accepted debt:** `wasmtime` is pinned at 27 and carries advisories (incl. aarch64
-sandbox-escape) whose fix needs a major 27→43 migration — tracked separately; do not add
-new wasm-plugin surface assuming the sandbox is current until that lands.
+**WASM sandbox:** runs on `wasmtime` 43 with fuel metering (bounds guest instructions per
+call), a linear-memory cap, and a host-side result-size cap — see `wasm_sandbox.rs`.
+wasmtime ships frequent security releases, so keep it current; the supply-chain gate flags
+new advisories. Any new plugin entry point must preserve those three limits.
