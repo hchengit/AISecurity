@@ -206,6 +206,12 @@ struct SecurityConfig: Sendable {
         let mailDir: String
         let alertCategories: [String]
         let startupScanLimit: Int
+        // Mailbox coverage (Inbox always scanned).
+        let scanJunk: Bool
+        let scanTrash: Bool
+        let scanArchive: Bool
+        let scanAllMail: Bool
+        let scanSentDrafts: Bool
     }
     let emailScanner: EmailScannerConfig
 
@@ -469,7 +475,12 @@ struct SecurityConfig: Sendable {
                 "sensitive_data_request", "malicious_url", "dangerous_attachment",
                 "crypto_scam", "malware_dropper", "prompt_injection"
             ],
-            startupScanLimit: Self.tomlInt(toml, "email_scanner", "startup_scan_limit") ?? 50
+            startupScanLimit: Self.tomlInt(toml, "email_scanner", "startup_scan_limit") ?? 50,
+            scanJunk: Self.tomlBool(toml, "email_scanner", "scan_junk") ?? true,
+            scanTrash: Self.tomlBool(toml, "email_scanner", "scan_trash") ?? true,
+            scanArchive: Self.tomlBool(toml, "email_scanner", "scan_archive") ?? true,
+            scanAllMail: Self.tomlBool(toml, "email_scanner", "scan_all_mail") ?? false,
+            scanSentDrafts: Self.tomlBool(toml, "email_scanner", "scan_sent_drafts") ?? false
         )
 
         // ── Messages Scanner ────────────────────────────────────────

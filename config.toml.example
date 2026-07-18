@@ -54,6 +54,17 @@ debounce_ms = 300
 [email_scanner]
 enabled = true
 startup_scan_limit = 50
+# Mailbox coverage (Inbox is always scanned). Junk/Spam is the highest live-threat
+# surface — spam filters divert threats without neutralizing them, and users rummage
+# junk for lost invoices/password resets with defenses down. Messages that sit in a
+# flagged folder do NOT receive sender-trust or SPF/DKIM suppression, and never bank
+# "clean" credit into sender-history (so spam volume can't poison inbox scoring).
+scan_junk = true        # Junk / Spam / Bulk Mail (incl. Gmail [Gmail]/Spam)
+scan_trash = true       # Trash / Deleted / Bin
+scan_archive = true     # Archive (distinct, retained mail)
+scan_all_mail = false   # Gmail "All Mail" background sweep — off by default; it is a
+                        # copy of the ENTIRE mailbox, so enabling it ~doubles scan cost
+scan_sent_drafts = false # Sent / Drafts — outbound, outside the inbound-phishing model
 
 [messages_scanner]
 enabled = true

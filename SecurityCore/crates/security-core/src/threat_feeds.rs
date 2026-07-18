@@ -154,6 +154,35 @@ pub fn init_default() -> Result<(), String> {
 // Lookup
 // ═══════════════════════════════════════════════════════════════════
 
+/// Shared infrastructure — cloud storage, CDNs, and email click-trackers that host both
+/// legitimate and malicious content. A phishing page on one of these (e.g. an openphish URL like
+/// `https://s3.us-east-1.amazonaws.com/bucket/phish.html`) reduces to a *host* that thousands of
+/// legitimate senders also use, so matching a URL by that host produces massive false positives
+/// (TikTok's `post.spmailtechnol.com` tracker, Postmark's `track.pstmrk.it`, any S3 link…). For
+/// these hosts we require an EXACT full-URL feed match instead of a host-level one; a dedicated
+/// phishing domain, by contrast, is still matched by host.
+const SHARED_INFRA_SUFFIXES: &[&str] = &[
+    // Object storage on a SHARED, path-addressed endpoint (many tenants → one hostname). NOTE:
+    // deliberately does NOT include per-tenant-subdomain platforms (*.web.app, *.pages.dev,
+    // *.azurewebsites.net, *.firebaseapp.com, *.r2.dev, *.backblazeb2.com, *.blob.core.windows.net,
+    // *.cloudfront.net, *.googleusercontent.com): there each host is a single attacker-owned tenant,
+    // so a host-level feed match is precise and SHOULD flag it.
+    "amazonaws.com", "storage.googleapis.com",
+    // Email service providers' click/open trackers (shared tracking hostnames).
+    "spmailtechnol.com", "pstmrk.it", "sendgrid.net", "sparkpostmail.com", "mailgun.org",
+    "mcusercontent.com", "list-manage.com", "createsend.com", "rs6.net", "hubspotemail.net",
+    "hubspotlinks.com", "klclick.com", "klclick2.com", "mailanyone.net", "sptrans.io",
+    "cmail19.com", "cmail20.com", "mailchimpapp.net", "sendibm1.com", "sendibm2.com",
+];
+
+/// True if `host` is (or is a subdomain of) a shared-infrastructure suffix.
+fn is_shared_infra_host(host: &str) -> bool {
+    let h = host.trim().trim_end_matches('.').to_lowercase();
+    SHARED_INFRA_SUFFIXES
+        .iter()
+        .any(|s| h == *s || h.ends_with(&format!(".{s}")))
+}
+
 /// Check a URL against all feeds. Checks exact URL match, then extracts domain and checks that.
 pub fn check_url(url_str: &str) -> FeedLookupResult {
     let db = DB.lock().unwrap();
@@ -185,14 +214,22 @@ pub fn check_url(url_str: &str) -> FeedLookupResult {
         }
     }
 
-    // 2. Extract domain from URL and check domain
+    // 2. Extract domain from URL and check domain — but NOT for shared-infrastructure hosts
+    //    (cloud storage, CDNs, ESP click-trackers). For those, a host-level feed hit is unreliable
+    //    (legit and malicious content share the host), so only the exact-URL match above counts.
     if let Ok(parsed) = url::Url::parse(&normalized) {
         if let Some(host) = parsed.host_str() {
+            if is_shared_infra_host(host) {
+                return FeedLookupResult::no_match();
+            }
             return check_domain_with_conn(conn, host, &now);
         }
     }
     // Fallback: try extracting domain with simple split
     if let Some(domain) = extract_domain_simple(&normalized) {
+        if is_shared_infra_host(&domain) {
+            return FeedLookupResult::no_match();
+        }
         return check_domain_with_conn(conn, &domain, &now);
     }
 
@@ -361,11 +398,17 @@ fn refresh_feed(conn: &Connection, feed: &FeedMeta) -> Result<u32, String> {
         );
         count += 1;
 
-        // Also extract and store the domain from URL feeds (for domain-level lookups)
+        // Also extract and store the domain from URL feeds (for domain-level lookups) — but skip
+        // shared-infrastructure hosts (S3, CDNs, ESP trackers), where a bare-host indicator would
+        // match every legitimate email that links through them. The full-URL indicator above is
+        // still stored, so an exact hit on that specific phishing page is preserved.
         if feed.indicator_type == "url" {
             if let Ok(parsed) = url::Url::parse(&indicator) {
                 if let Some(host) = parsed.host_str() {
                     let host_lower = host.to_lowercase();
+                    if is_shared_infra_host(&host_lower) {
+                        continue;
+                    }
                     let _ = conn.execute(
                         "INSERT INTO feed_entries (feed_name, indicator_type, indicator, severity, first_seen, last_seen, expires_at)
                          VALUES (?1, 'domain', ?2, ?3, ?4, ?4, ?5)
@@ -544,6 +587,41 @@ mod tests {
         let result3 = check_domain("google.com");
         assert!(!result3.is_match());
 
+        cleanup(&dir);
+    }
+
+    #[test]
+    fn is_shared_infra_host_matches_suffixes() {
+        assert!(is_shared_infra_host("s3.us-east-1.amazonaws.com"));
+        assert!(is_shared_infra_host("post.spmailtechnol.com"));
+        assert!(is_shared_infra_host("track.pstmrk.it"));
+        assert!(is_shared_infra_host("AMAZONAWS.COM")); // case-insensitive, bare suffix
+        assert!(!is_shared_infra_host("evil-phish.com"));
+        assert!(!is_shared_infra_host("notamazonaws.com")); // suffix must be dot-bounded
+    }
+
+    #[test]
+    fn shared_infra_url_not_matched_by_host() {
+        let (_guard, dir) = test_db("shared_infra");
+        let db = DB.lock().unwrap();
+        let conn = db.as_ref().unwrap();
+        let now = Utc::now().to_rfc3339();
+        let expires = (Utc::now() + chrono::Duration::hours(24)).to_rfc3339();
+        // Simulate the stale bare-host indicators the old ingestion produced from openphish URLs,
+        // plus a dedicated phishing domain.
+        for host in ["s3.us-east-1.amazonaws.com", "post.spmailtechnol.com", "evil-phish.com"] {
+            conn.execute(
+                "INSERT INTO feed_entries (feed_name, indicator_type, indicator, severity, first_seen, last_seen, expires_at) VALUES (?1, ?2, ?3, ?4, ?5, ?5, ?6)",
+                params!["openphish", "domain", host, 3, &now, &expires],
+            ).unwrap();
+        }
+        drop(db);
+
+        // Legit mail linking through shared infra must NOT match on the host alone.
+        assert!(!check_url("https://s3.us-east-1.amazonaws.com/bucket/legit-image.png").is_match());
+        assert!(!check_url("https://post.spmailtechnol.com/click/abc123").is_match());
+        // A dedicated phishing domain is still matched by host.
+        assert!(check_url("https://evil-phish.com/login").is_match());
         cleanup(&dir);
     }
 

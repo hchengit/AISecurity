@@ -554,7 +554,9 @@ final class SecurityDaemon: ObservableObject {
 
     func getRecentAlerts() -> [SecurityAlert] {
         guard modulesReady else { return [] }
-        return logger.getRecentAlerts(limit: 50)
+        // Show all recorded threats in the window (was capped at 50). The Recent Threats
+        // window is scrollable, so surface the full alert history rather than truncating.
+        return logger.getRecentAlerts(limit: Int.max)
     }
 
     // MARK: - Protection Tier

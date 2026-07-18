@@ -98,10 +98,19 @@ static TRAIT_WIRE_TRANSFER: Lazy<Vec<Regex>> = Lazy::new(|| compile(&[
     r"\b(?:initiate|process|complete)\s+(?:a\s+)?(?:wire\s+transfer|bank\s+transfer)\b",
 ]));
 static TRAIT_GIFT_CARDS: Lazy<Vec<Regex>> = Lazy::new(|| compile(&[
-    r"\b(?:purchase|buy|get)\s+(?:\w+\s+)*gift\s+cards?\b",
-    r"\b(?:apple|google\s+play|amazon|steam|itunes|ebay)\s+gift\s+cards?\b",
-    r"\bgift\s+cards?\s+(?:for|worth|at|of)\s+\$?\d",
-    r"\b(?:send|give)\s+(?:me\s+)?the\s+(?:codes?|numbers?)\b",
+    // Gift-card PROCUREMENT / code exfiltration — the BEC scam ask. Deliberately does NOT match
+    // bare "get an Apple Gift Card" / "Apple gift card" retail *reward* language (Apple/Target
+    // promos: "get a $200 gift card when you buy an eligible product… offer ends tonight"), which
+    // combined with marketing urgency false-positived as a threat.
+    r"\b(?:purchase|buy)\s+(?:\w+\s+){0,4}gift\s+cards?\b",
+    r"\b(?:purchase|buy|send)\s+(?:\w+\s+){0,4}(?:apple|google\s+play|amazon|steam|itunes|ebay)\s+gift\s+cards?\b",
+    // Procurement-for-the-sender with "get/grab": "get me gift cards" / "get 5 gift cards" — a
+    // common BEC phrasing — WITHOUT matching "get a gift card [reward]" retail promos.
+    r"\b(?:get|grab|pick\s+up|obtain)\s+(?:me|us)\s+(?:\w+\s+){0,4}gift\s+cards?\b",
+    r"\b(?:get|grab|purchase|buy)\s+\d+\s+(?:\w+\s+){0,3}gift\s+cards?\b",
+    r"\bgift\s+cards?\s+(?:worth|totaling|for)\s+\$?\d",
+    r"\bgift\s+cards?\s+(?:codes?|numbers?|pins?)\b",
+    r"\b(?:send|give|share|text)\s+(?:me\s+)?the\s+(?:gift\s+card\s+)?(?:codes?|numbers?|pins?)\b",
 ]));
 static TRAIT_CRYPTO_PAYMENT: Lazy<Vec<Regex>> = Lazy::new(|| compile(&[
     // Explicit crypto payment demand — must mention crypto currency by name
@@ -558,6 +567,24 @@ mod tests {
         let r = parse(text, Channel::Email);
         assert!(r.is_threat, "BEC gift card should be threat, score={}", r.score);
         assert!(r.score >= 75);
+    }
+
+    #[test]
+    fn bec_gift_card_get_variant() {
+        // "get me / get N gift cards" is a common BEC phrasing and must still be caught.
+        let text = "Hi, can you get 5 Amazon gift cards for me today? Keep this between us and don't tell anyone.";
+        let r = parse(text, Channel::Email);
+        assert!(r.is_threat, "'get N gift cards' BEC should be a threat, score={}", r.score);
+    }
+
+    #[test]
+    fn retail_gift_card_promo_not_threat() {
+        // Legit retail reward promo — "get a gift card when you buy" + marketing urgency — must
+        // NOT be classified a threat (Apple Shopping Event false positive).
+        let text = "The Apple Store Shopping Event. Last chance to get an Apple Gift Card up to \
+                     $200 when you buy an eligible product. Offer ends tonight.";
+        let r = parse(text, Channel::Email);
+        assert!(!r.is_threat, "retail gift-card promo should not be a threat, score={}", r.score);
     }
 
     #[test]
