@@ -26,6 +26,13 @@ echo "==> Copying static library..."
 mkdir -p "$OUT_DIR/lib" "$OUT_DIR/include"
 cp "$TARGET_DIR/libsecurity_core_ffi.a" "$OUT_DIR/lib/"
 
+# Force the Swift build to relink against the new .a. SPM does NOT treat this prebuilt
+# static library as a tracked input, so a `swift build` with no Swift-source changes will
+# happily reuse a cached link against the OLD .a — silently shipping stale Rust logic.
+# Removing the linked product guarantees the next `swift build` relinks.
+echo "==> Invalidating stale Swift link (forces relink against new .a)..."
+rm -f "$SCRIPT_DIR/.build/release/AISecurity" "$SCRIPT_DIR/.build/debug/AISecurity" 2>/dev/null || true
+
 echo "==> Done."
 echo "    Header:  $OUT_DIR/include/security_core.h"
 echo "    Library:  $OUT_DIR/lib/libsecurity_core_ffi.a"
