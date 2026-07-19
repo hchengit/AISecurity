@@ -24,6 +24,21 @@ final class FileWatcher: @unchecked Sendable {
 
     private let config = SecurityConfig.shared
 
+    /// Apple Mail writes an attachment here (sandbox container) when the user opens/saves it —
+    /// inside a per-attachment randomly-named SUBFOLDER (`Mail Downloads/<uuid>/file`), which is why
+    /// the scan of this tree must be recursive.
+    static let mailAttachmentDir: String = (NSHomeDirectory() as NSString)
+        .appendingPathComponent("Library/Containers/com.apple.mail/Data/Library/Mail Downloads")
+
+    /// Periodic recursive rescan of the Mail attachment subtree — the correctness backstop for the
+    /// two things the top-level vnode watch can't do: see files written into new per-attachment
+    /// subfolders, and cover the dir being created lazily after launch.
+    private var mailRescanTimer: DispatchSourceTimer?
+    /// Serializes scanMailAttachmentTree so the 10s timer and a vnode event can't both scan the same
+    /// tree concurrently (which would double-count/double-alert a freshly-materialized attachment).
+    private let mailScanLock = NSLock()
+    private var mailScanInProgress = false
+
     /// macOS routine file patterns — silently skip (no log at all)
     private let routinePatterns: [NSRegularExpression] = {
         let pats = [
@@ -94,9 +109,27 @@ final class FileWatcher: @unchecked Sendable {
             watchDirectory(path, type: "PROTECTED")
         }
 
+        // Watch Apple Mail's attachment-materialization dir as a STRICT malware-scan dir. Email
+        // attachments live base64-encoded inside the .emlx until Mail writes them here the moment
+        // the user opens or saves one — this is where a dangerous attachment first becomes a real,
+        // runnable file, so it's where containment (quarantine) can actually catch it. Scoped to
+        // this dir so legit browser-downloaded installers elsewhere are untouched.
+        watchDirectory(Self.mailAttachmentDir, type: "MAIL_ATTACHMENT")
+
+        // Periodic recursive rescan of the Mail attachment subtree (every 10s). This is the
+        // correctness backstop: the vnode watch above only fires on the top level and cannot arm on
+        // an absent dir, whereas Mail writes each opened attachment into a fresh per-attachment
+        // subfolder and creates the dir lazily. scanFile's content cache makes each repeat cheap.
+        let mailTimer = DispatchSource.makeTimerSource(queue: DispatchQueue.global(qos: .utility))
+        mailTimer.schedule(deadline: .now() + 10, repeating: 10)
+        mailTimer.setEventHandler { [weak self] in self?.scanMailAttachmentTree() }
+        mailTimer.resume()
+        mailRescanTimer = mailTimer
+
         logger.info("\u{1F4C2} File Watcher started", data: [
             "monitored": "\(config.fileWatcher.monitoredDirectories.count)",
-            "protected": "\(SensitiveDataDetector.protectedPaths.count)"
+            "protected": "\(SensitiveDataDetector.protectedPaths.count)",
+            "mailAttachments": FileManager.default.fileExists(atPath: Self.mailAttachmentDir) ? "watched" : "absent"
         ])
     }
 
@@ -109,6 +142,8 @@ final class FileWatcher: @unchecked Sendable {
         }
         sources.removeAll()
         fileDescriptors.removeAll()
+        mailRescanTimer?.cancel()
+        mailRescanTimer = nil
         isRunning = false
         logger.info("\u{1F4C2} File Watcher stopped")
     }
@@ -145,6 +180,19 @@ final class FileWatcher: @unchecked Sendable {
     }
 
     private func handleDirectoryEvent(_ dirPath: String, type: String) {
+        // Mail's attachment dir gets a debounced RECURSIVE scan — the opened attachment lands in a
+        // freshly-created per-attachment subfolder, not flat in this dir.
+        if type == "MAIL_ATTACHMENT" {
+            let work = DispatchWorkItem { [weak self] in self?.scanMailAttachmentTree() }
+            timerLock.lock()
+            debounceTimers["__mail_attachment__"]?.cancel()
+            debounceTimers["__mail_attachment__"] = work
+            timerLock.unlock()
+            DispatchQueue.global(qos: .utility).asyncAfter(
+                deadline: .now() + .milliseconds(config.fileWatcher.debounceMs), execute: work)
+            return
+        }
+
         let fm = FileManager.default
         guard let entries = try? fm.contentsOfDirectory(atPath: dirPath) else { return }
 
@@ -202,7 +250,8 @@ final class FileWatcher: @unchecked Sendable {
             onAlert?(alert)
         }
 
-        // Run ExternalFileSanitizer on new files in monitored directories
+        // Run ExternalFileSanitizer on new files in monitored directories. (Mail-attachment dirs
+        // are handled recursively/strictly in scanMailAttachmentTree, never here.)
         if let sanitizer = sanitizer {
             let result = sanitizer.scanFile(filePath)
             if !result.safe && !result.threats.isEmpty {
@@ -226,6 +275,35 @@ final class FileWatcher: @unchecked Sendable {
 
         if scannableExtensions.contains(dotExt) && size < UInt64(config.fileWatcher.maxScanSizeBytes) {
             scanFileContent(filePath)
+        }
+    }
+
+    /// Recursively strict-scan Apple Mail's attachment subtree and raise EXTERNAL_FILE_THREAT for
+    /// any dangerous file so the daemon quarantines it. Files already seen (same content) are
+    /// cheap no-ops via the sanitizer's cache, so running this on both the vnode event and the 10s
+    /// timer is safe and de-duplicated.
+    private func scanMailAttachmentTree() {
+        guard let sanitizer = sanitizer else { return }
+        // Only one tree scan at a time (timer vs. vnode event).
+        mailScanLock.lock()
+        if mailScanInProgress { mailScanLock.unlock(); return }
+        mailScanInProgress = true
+        mailScanLock.unlock()
+        defer { mailScanLock.lock(); mailScanInProgress = false; mailScanLock.unlock() }
+
+        let results = sanitizer.scanDirectoryTree(Self.mailAttachmentDir, strictExecCheck: true, maxFiles: 2000)
+        for r in results where !r.safe && !r.threats.isEmpty {
+            let topSeverity = r.threats.map(\.severity).max() ?? .critical
+            let alert = SecurityAlert(
+                type: "EXTERNAL_FILE_THREAT",
+                severity: topSeverity,
+                message: "\u{1F6A8} Malicious mail attachment: \((r.filePath as NSString).lastPathComponent) — \(r.threats.map(\.label).joined(separator: ", "))",
+                filePath: r.filePath,
+                threats: r.threats.map { ThreatDetail(label: $0.label, category: $0.category, severity: $0.severity) }
+            )
+            // scanFile already logged/notified this threat; here we only drive the daemon's
+            // quarantine + counter via onAlert (no second log/notification for the same file).
+            onAlert?(alert)
         }
     }
 

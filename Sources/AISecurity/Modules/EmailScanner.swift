@@ -1,15 +1,27 @@
 import Foundation
+import CryptoKit
 
 /// Apple Mail email scanner — monitors ~/Library/Mail/ for new .emlx files.
 /// Pattern matching now backed by Rust security-core via FFI.
 /// .emlx parsing, file watching, attachment checks, and whitelist logic stay in Swift.
 ///
 /// Scanning strategy:
-/// - Only scans Inbox and custom folders (skips Deleted, Junk, Sent, Drafts)
+/// - Scans Inbox, custom folders, and (by config, default on) Junk/Spam, Trash, Archive.
+///   Junk/Spam is the highest live-threat surface: spam filters divert threats without
+///   neutralizing them, and users rummage junk with defenses down. See MailboxRole.
+/// - Skips outbound/duplicate folders: Sent, Drafts, Notes, Sync Issues, and Gmail
+///   "All Mail" (a copy of the whole mailbox — scanning it double-counts everything).
+/// - Mailbox context feeds detection: a message in a flagged folder (Junk/Spam/Trash)
+///   does NOT get sender-trust / SPF-DKIM suppression, and never banks "clean" credit
+///   into sender-history, so spam volume can't poison inbox scoring.
+/// - Rescue path: a never-before-seen file is always scanned regardless of age, so a
+///   message moved Junk→Inbox ("Not Junk") is re-checked at the moment before the user
+///   opens it, and the existing junk backlog is swept once on first expanded launch.
 /// - Tracks unique emails scanned (not rescan count)
 /// - Deduplicates via file path (same file modified = update, not new count)
 /// - Polls every 60s for emails from the last 10 minutes
-/// - Startup: scans last 30 days (or ALL on first launch)
+/// - Startup: scans last 30 days (or ALL on first launch); backlog finds alert
+///   critical-only (weaponized content pops; lesser matches are logged, not notified)
 final class EmailScanner: @unchecked Sendable {
 
     typealias AlertHandler = @Sendable (SecurityAlert) -> Void
@@ -23,6 +35,14 @@ final class EmailScanner: @unchecked Sendable {
     private var fileDescriptor: Int32 = -1
     private var pollTimer: DispatchSourceTimer?
     private var scannedFiles: [String: TimeInterval] = [:] // path → mtime (last scanned)
+    /// Serializes every poll (startup sweep, file-watch, 60s timer) so they can't run
+    /// concurrently — this both guards `scannedFiles`/counters against races and ensures the
+    /// startup backlog sweep finishes before any live poll processes the same files (so the
+    /// backlog can't be re-scanned as live and defeat the critical-only notification policy).
+    private let scanQueue = DispatchQueue(label: "com.aisecurity.email.scan")
+    /// Set once the first startup backlog sweep completes. Until then every poll is treated as
+    /// backlog, so a file-watch event that fires mid-sweep can't notify on the junk backlog.
+    private var backfillDone = false
     private let stateFile: String
     private(set) var isRunning = false
     /// Unique emails scanned (each email counted once, rescans don't inflate)
@@ -41,19 +61,104 @@ final class EmailScanner: @unchecked Sendable {
 
     // MARK: - Mailbox filtering
 
-    /// Mailbox name prefixes to SKIP (lowercased, compared against .mbox dir names).
-    /// Covers Apple Mail, Gmail, Exchange/Outlook, and generic IMAP names.
-    /// Only Inbox and custom user folders are scanned.
-    private let skippedMailboxPrefixes: [String] = [
-        "deleted", "trash", "bin",           // deleted/trash
-        "junk", "spam",                       // junk/spam
-        "sent", "outbox",                     // sent mail
-        "drafts", "draft",                    // drafts
-        "archive", "all mail",                // archive
-        "[gmail]",                            // Gmail container (has Sent/Trash/Spam inside)
-        "sync issues",                        // Exchange sync artifacts
-        "notes",                              // Apple Notes sync folder
-    ]
+    /// Role of a mailbox, derived from its `.mbox` leaf name. Covers Apple Mail, Gmail
+    /// (IMAP labels), Exchange/Outlook, and generic IMAP naming.
+    enum MailboxRole {
+        case inbox          // always scanned
+        case junk           // Junk / Spam / Bulk — flagged folder, highest threat density
+        case trash          // Trash / Deleted / Bin — flagged folder (people fish things out)
+        case archive        // Archive — distinct retained mail
+        case allMail        // Gmail "All Mail" — a copy of the whole mailbox (dedup target)
+        case sentOrDraft    // Sent / Drafts / Outbox — outbound, out of inbound model
+        case container      // Gmail "[Gmail]" wrapper — holds child mailboxes, descend into it
+        case labelView      // Gmail Important/Starred — label views that duplicate real mail
+        case noise          // Notes / Sync Issues — not mail, skip
+        case custom         // user folder — scanned like Inbox
+
+        /// Flagged by the provider as suspicious/discarded: suppress no threats, bank no trust.
+        var isFlagged: Bool { self == .junk || self == .trash }
+
+        /// Newly added coverage (vs. the historical Inbox-only scan). Used to scope the
+        /// backlog notification-suppression to these folders, so Inbox alerting — which
+        /// predates this change — keeps notifying normally on the startup sweep.
+        var isExpandedCoverage: Bool {
+            self == .junk || self == .trash || self == .archive || self == .allMail
+        }
+    }
+
+    /// Classify a mailbox from its `.mbox` leaf name (without the `.mbox` suffix).
+    static func mailboxRole(leaf: String) -> MailboxRole {
+        let n = leaf.lowercased()
+        if n == "[gmail]" || n == "[google mail]" { return .container }
+        if n.hasPrefix("inbox") { return .inbox }
+        if n.hasPrefix("junk") || n.hasPrefix("spam") || n.hasPrefix("bulk") { return .junk }
+        if n.hasPrefix("trash") || n.hasPrefix("deleted") || n.hasPrefix("bin") { return .trash }
+        if n.hasPrefix("all mail") { return .allMail }
+        if n.hasPrefix("archive") { return .archive }
+        if n.hasPrefix("sent") || n.hasPrefix("outbox") || n.hasPrefix("draft") { return .sentOrDraft }
+        // Important/Starred are only Gmail label views (duplicating real mail) when they sit
+        // *inside* the [Gmail] container — that context is applied by the walker. As a bare
+        // leaf name they may be a real user folder ("Important Clients"), so classify .custom.
+        if n == "important" || n == "starred" { return .labelView }
+        if n.hasPrefix("notes") || n.hasPrefix("sync issues") { return .noise }
+        return .custom  // unknown folder → scan (fail toward coverage)
+    }
+
+    /// Role of the mailbox a message file lives in = the deepest `.mbox` ancestor in its path.
+    static func mailboxRole(forPath path: String) -> MailboxRole {
+        let comps = path.components(separatedBy: "/")
+        for comp in comps.reversed() where comp.hasSuffix(".mbox") {
+            return mailboxRole(leaf: String(comp.dropLast(".mbox".count)))
+        }
+        return .custom
+    }
+
+    /// True if ANY mailbox in the path is Junk/Spam/Trash — so a message filed into a
+    /// subfolder of Junk (e.g. `Junk.mbox/Quarantine.mbox/…`) is still treated as flagged,
+    /// not waved through because its deepest folder happens to be unrecognized.
+    static func isInFlaggedSubtree(forPath path: String) -> Bool {
+        for comp in path.components(separatedBy: "/") where comp.hasSuffix(".mbox") {
+            if mailboxRole(leaf: String(comp.dropLast(".mbox".count))).isFlagged { return true }
+        }
+        return false
+    }
+
+    /// True if ANY mailbox in the path is newly-covered (Junk/Trash/Archive/All Mail) — so a
+    /// message in a subfolder of one of those still gets the critical-only backlog treatment
+    /// (a subfolder's own name may classify as .custom and escape a deepest-role-only check).
+    static func isInExpandedCoverageSubtree(forPath path: String) -> Bool {
+        for comp in path.components(separatedBy: "/") where comp.hasSuffix(".mbox") {
+            if mailboxRole(leaf: String(comp.dropLast(".mbox".count))).isExpandedCoverage { return true }
+        }
+        return false
+    }
+
+    /// Should the walker skip this mailbox subtree entirely, given config coverage?
+    private func skipSubtree(role: MailboxRole) -> Bool {
+        switch role {
+        case .inbox, .custom, .container: return false
+        case .junk:        return !config.emailScanner.scanJunk
+        case .trash:       return !config.emailScanner.scanTrash
+        case .archive:     return !config.emailScanner.scanArchive
+        case .allMail:     return !config.emailScanner.scanAllMail
+        case .sentOrDraft: return !config.emailScanner.scanSentDrafts
+        case .labelView:   return true   // Gmail Important/Starred duplicate real mail
+        case .noise:       return true
+        }
+    }
+
+    /// Walk priority (lower = visited first) so the file-count cap can't starve Junk
+    /// behind a large Inbox. Honors the endorsed order: Junk → Trash → Inbox → custom → Archive.
+    private static func walkPriority(role: MailboxRole) -> Int {
+        switch role {
+        case .junk: return 0
+        case .trash: return 1
+        case .inbox: return 2
+        case .custom, .container: return 3
+        case .archive, .allMail: return 4
+        case .sentOrDraft, .labelView, .noise: return 5
+        }
+    }
 
     // MARK: - Attachment checks (stay in Swift — operate on parsed email structure)
 
@@ -84,12 +189,23 @@ final class EmailScanner: @unchecked Sendable {
             if dict.count < beforeCount {
                 logger.info("\u{1F4E7} Pruned \(beforeCount - dict.count) old email scan entries (>90 days)")
             }
-            // Also prune entries from skipped mailboxes (cleanup from before filtering was added)
+            // Prune entries from mailboxes we no longer scan under current config
+            // (e.g. Sent/Drafts/All Mail). Keeps the state file in sync with coverage.
             let beforeMailboxPrune = dict.count
-            let prefixes = skippedMailboxPrefixes
-            dict = dict.filter { path, _ in !Self.isSkippedMailbox(path: path, prefixes: prefixes) }
+            let cfg = SecurityConfig.shared.emailScanner
+            dict = dict.filter { path, _ in
+                switch Self.mailboxRole(forPath: path) {
+                case .inbox, .custom, .container: return true
+                case .junk:        return cfg.scanJunk
+                case .trash:       return cfg.scanTrash
+                case .archive:     return cfg.scanArchive
+                case .allMail:     return cfg.scanAllMail
+                case .sentOrDraft: return cfg.scanSentDrafts
+                case .labelView, .noise: return false
+                }
+            }
             if dict.count < beforeMailboxPrune {
-                logger.info("\u{1F4E7} Pruned \(beforeMailboxPrune - dict.count) entries from skipped mailboxes (Deleted/Junk/Sent)")
+                logger.info("\u{1F4E7} Pruned \(beforeMailboxPrune - dict.count) entries from unscanned mailboxes")
             }
             self.scannedFiles = dict
             // emailsScanned starts at 0 on every launch — counts today's scans only.
@@ -152,7 +268,8 @@ final class EmailScanner: @unchecked Sendable {
                 queue: DispatchQueue.global(qos: .utility)
             )
             src.setEventHandler { [weak self] in
-                self?.pollRecentEmails(windowMs: 600_000) // 10 minutes
+                guard let self else { return }
+                self.scanQueue.async { self.pollRecentEmails(windowMs: 600_000) } // live poll
             }
             src.setCancelHandler { close(fd) }
             src.resume()
@@ -163,26 +280,53 @@ final class EmailScanner: @unchecked Sendable {
         let timer = DispatchSource.makeTimerSource(queue: DispatchQueue.global(qos: .utility))
         timer.schedule(deadline: .now() + 60, repeating: 60)
         timer.setEventHandler { [weak self] in
-            self?.pollRecentEmails(windowMs: 600_000) // 10 minutes
+            guard let self else { return }
+            self.scanQueue.async { self.pollRecentEmails(windowMs: 600_000) } // live poll
         }
         timer.resume()
         pollTimer = timer
 
         // Startup scan: delayed 30s to let Apple Mail sync new emails after wake/boot.
-        // First launch → scan ALL, subsequent → scan last 30 days.
+        // First launch → scan ALL, subsequent → scan last 30 days. Marked as backlog so
+        // pre-existing junk/trash finds alert critical-only (no notification burst). Runs on
+        // scanQueue ahead of live polls so those files are already seen when live polls run.
         let isFirstLaunch = scannedFiles.isEmpty
-        DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + (isFirstLaunch ? 0 : 30)) { [weak self] in
+        scheduleBacklogSweep(isFirstLaunch: isFirstLaunch, attempt: 0)
+
+        let cfg = config.emailScanner
+        let covered = ["Inbox",
+                       cfg.scanJunk ? "Junk/Spam" : nil,
+                       cfg.scanTrash ? "Trash" : nil,
+                       cfg.scanArchive ? "Archive" : nil,
+                       cfg.scanAllMail ? "All Mail" : nil,
+                       cfg.scanSentDrafts ? "Sent/Drafts" : nil].compactMap { $0 }.joined(separator: ", ")
+        logger.info("\u{1F4E7} Email Scanner started (scanning: \(covered))", data: ["mailDir": mailDir, "mode": fd >= 0 ? "watch+poll" : "poll-only"])
+    }
+
+    /// Run the one-shot startup backlog sweep, re-arming itself if it couldn't run yet because
+    /// Full Disk Access wasn't granted. This is what flips `backfillDone`; without the re-arm a
+    /// cold start before FDA (or before Mail has synced) would leave `backfillDone` false forever
+    /// and permanently suppress live junk/trash notifications. Bounded so it can't loop endlessly.
+    private func scheduleBacklogSweep(isFirstLaunch: Bool, attempt: Int) {
+        // First pass immediate; then re-arm on a short cadence. Each pass scans up to `limit`
+        // never-seen files as backlog; `backfillDone` flips only once a pass finds NO unseen
+        // files left (the whole backlog is drained — see pollRecentEmails). Re-arm is UNBOUNDED
+        // (while running & not done): a mailbox larger than one pass's cap needs several passes to
+        // drain, and if Full Disk Access is granted late we must keep trying until it succeeds —
+        // otherwise leftover backlog would later surface as a live-notification flood.
+        let delay: Double = (isFirstLaunch && attempt == 0) ? 0 : 20
+        DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + delay) { [weak self] in
             guard let self else { return }
-            if isFirstLaunch {
-                self.logger.info("\u{1F4E7} First launch: scanning all emails...")
-                self.pollRecentEmails(windowMs: 0) // 0 = scan all
-            } else {
-                self.logger.info("\u{1F4E7} Startup scan (delayed 30s for Mail sync)...")
-                self.pollRecentEmails(windowMs: 30 * 24 * 60 * 60 * 1000) // 30 days
+            self.scanQueue.async {
+                guard self.isRunning, !self.backfillDone else { return }
+                let windowMs = isFirstLaunch ? 0 : 30 * 24 * 60 * 60 * 1000
+                self.logger.info("\u{1F4E7} Startup \(isFirstLaunch ? "first-launch " : "")backlog sweep (pass \(attempt + 1))...")
+                self.pollRecentEmails(windowMs: windowMs, backlog: true)
+                if !self.backfillDone && self.isRunning {
+                    self.scheduleBacklogSweep(isFirstLaunch: isFirstLaunch, attempt: attempt + 1)
+                }
             }
         }
-
-        logger.info("\u{1F4E7} Email Scanner started (skipping: Deleted, Junk, Sent, Drafts)", data: ["mailDir": mailDir, "mode": fd >= 0 ? "watch+poll" : "poll-only"])
     }
 
     /// Diagnostic check: can we actually read the Mail directory tree?
@@ -231,25 +375,10 @@ final class EmailScanner: @unchecked Sendable {
         pollTimer = nil
         if fileDescriptor >= 0 { close(fileDescriptor); fileDescriptor = -1 }
         isRunning = false
+        // Re-arm the backlog sweep on the next start() (e.g. the daemon restarting us once FDA
+        // is granted) so the initial sweep runs against real files rather than being skipped.
+        backfillDone = false
         logger.info("\u{1F4E7} Email Scanner stopped")
-    }
-
-    // MARK: - Mailbox Filtering
-
-    /// Check if a file path is inside a skipped mailbox (Deleted, Junk, Sent, Drafts).
-    private static func isSkippedMailbox(path: String, prefixes: [String]) -> Bool {
-        // Extract all .mbox directory names from the path
-        let lower = path.lowercased()
-        let components = lower.components(separatedBy: "/")
-        for comp in components where comp.hasSuffix(".mbox") {
-            let mboxName = String(comp.dropLast(".mbox".count))
-            for prefix in prefixes {
-                if mboxName.hasPrefix(prefix) {
-                    return true
-                }
-            }
-        }
-        return false
     }
 
     // MARK: - State Persistence
@@ -262,21 +391,40 @@ final class EmailScanner: @unchecked Sendable {
 
     // MARK: - Poll
 
-    private func pollRecentEmails(windowMs: Int) {
+    /// - Parameter backlog: true for the startup/backfill sweep (30-day / first-launch-all).
+    ///   Backlog finds alert critical-only; live-poll finds (new mail, rescued-from-junk)
+    ///   alert normally. See `scanEmail(_:isBacklog:)`.
+    private func pollRecentEmails(windowMs: Int, backlog: Bool = false) {
         // windowMs == 0 means scan ALL emails (first launch)
         let cutoff: TimeInterval = windowMs > 0
             ? Date().timeIntervalSince1970 - Double(windowMs) / 1000.0 - 5.0
             : 0
-        let limit = windowMs == 0 ? 50000 : 10000
-        let emlxFiles = findEmlxFiles(in: config.emailScanner.mailDir, limit: limit)
+        let limit = windowMs == 0 ? 50000 : 20000
+        // Until the first backlog sweep has completed, treat every poll as backlog so a
+        // file-watch event mid-sweep can't fire live notifications on the junk backfill.
+        let effectiveBacklog = backlog || !backfillDone
+        let mailDir = config.emailScanner.mailDir
+        let emlxFiles = findEmlxFiles(in: mailDir, limit: limit) { self.scannedFiles[$0] != nil }
 
         if emlxFiles.isEmpty {
-            if !fdaRequired {
-                fdaRequired = true
-                scannerStatus = "Inactive — FDA required (0 .emlx files found)"
-                notifyStatus()
+            // Distinguish "FDA blocked" (can't even list the Mail dir) from "accessible but
+            // empty". If it's genuinely accessible, there is no backlog to protect, so let a
+            // backlog sweep count as complete — otherwise backfillDone could stick false forever
+            // and permanently suppress live junk/trash notifications once mail does arrive.
+            let accessible = (try? FileManager.default.contentsOfDirectory(atPath: mailDir)) != nil
+            if accessible {
+                fdaRequired = false
+                // Accessible with no .emlx = there is no backlog to drain → backfill complete.
+                if effectiveBacklog { backfillDone = true }
+                logger.info("\u{1F4E7} Email poll: mailbox accessible but no .emlx found (empty)")
+            } else {
+                if !fdaRequired {
+                    fdaRequired = true
+                    scannerStatus = "Inactive — FDA required (cannot read Mail directory)"
+                    notifyStatus()
+                }
+                logger.warn("\u{1F4E7} Email poll: cannot read Mail directory — FDA not active")
             }
-            logger.warn("\u{1F4E7} Email poll: 0 .emlx files found — FDA may not be active")
             return
         }
 
@@ -291,19 +439,22 @@ final class EmailScanner: @unchecked Sendable {
             guard let attrs = try? FileManager.default.attributesOfItem(atPath: filePath),
                   let mdate = attrs[.modificationDate] as? Date else { continue }
             let mtime = mdate.timeIntervalSince1970
-            guard mtime >= cutoff else { continue }
 
             let existingMtime = scannedFiles[filePath]
             if existingMtime == nil {
-                // Brand new email — never seen before
+                // Brand-new path — scan regardless of age. The time window is only an
+                // optimization to skip re-reading known-unchanged files; a file we've
+                // never seen must be scanned even if old, or a message rescued from Junk
+                // (old received-date, new Inbox path) would teleport in unscanned.
                 scannedFiles[filePath] = mtime
-                scanEmail(filePath)
+                scanEmail(filePath, isBacklog: effectiveBacklog)
                 emailsScanned += 1
                 newCount += 1
-            } else if existingMtime != mtime {
-                // File modified (e.g. marked read/unread) — rescan for threats but don't inflate count
+            } else if existingMtime != mtime && mtime >= cutoff {
+                // Known file changed recently (e.g. marked read/unread) — rescan for
+                // threats but don't inflate the unique count.
                 scannedFiles[filePath] = mtime
-                scanEmail(filePath)
+                scanEmail(filePath, isBacklog: effectiveBacklog)
                 rescanCount += 1
             }
             // If existingMtime == mtime: skip entirely (already scanned, unchanged)
@@ -319,6 +470,13 @@ final class EmailScanner: @unchecked Sendable {
         } else if windowMs == 0 || windowMs > 600000 {
             logger.info("\u{1F4E7} Scan complete: \(emlxFiles.count) emails checked, \(emailsScanned) unique scanned, \(threatsFound) threats")
         }
+
+        // Backfill is complete only when a pass finds NO unseen files (newCount == 0). Because
+        // findEmlxFiles returns ALL unseen files first (round-robin phase 1), newCount == 0 means
+        // no unseen mail remains anywhere — the whole backlog is drained. Flipping here (rather
+        // than after one capped pass) keeps leftover backlog on a large mailbox classified as
+        // backlog (critical-only) until it's actually all scanned, instead of flooding live.
+        if effectiveBacklog && newCount == 0 { backfillDone = true }
 
         // Update status for UI — always, so the menu reflects current state
         let now = DateFormatter.localizedString(from: Date(), dateStyle: .none, timeStyle: .short)
@@ -337,9 +495,18 @@ final class EmailScanner: @unchecked Sendable {
 
     // MARK: - Scan Email
 
-    private func scanEmail(_ filePath: String) {
+    /// - Parameter isBacklog: when true (startup/backfill sweep), non-critical finds are
+    ///   logged but do not raise a user notification, so the first junk sweep can't flood.
+    private func scanEmail(_ filePath: String, isBacklog: Bool) {
         guard FileManager.default.fileExists(atPath: filePath),
               let email = parseEmlx(filePath) else { return }
+
+        // Mailbox the message lives in. Junk/Spam/Trash are "flagged": the provider
+        // already treated them as suspicious/discarded, so we withhold the trust and
+        // authentication suppression that a clean inbox would grant. `flaggedFolder` checks
+        // the whole path so a subfolder nested under Junk/Trash counts too.
+        let folderRole = Self.mailboxRole(forPath: filePath)
+        let flaggedFolder = Self.isInFlaggedSubtree(forPath: filePath)
 
         var threats: [(type: String, label: String, severity: SeverityLevel, category: String)] = []
         var warnings: [(label: String, detail: String)] = []
@@ -392,13 +559,29 @@ final class EmailScanner: @unchecked Sendable {
             }
         }
 
-        // Check attachment names (stays in Swift — operates on parsed email structure)
+        // Check attachment names (stays in Swift — operates on parsed email structure). The raw
+        // message is read at most ONCE here and reused for the Tier-2 magic-byte check and the
+        // Tier-1 defanged-copy quarantine below. `email.attachmentNames` is capped in parseEmlx
+        // (maxAttachments), so the per-attachment full-message decode below can't be amplified into
+        // an O(N^2) scan by a crafted message.
+        var dangerousAttachmentNames: [String] = []
+        let attachmentRaw: String? = email.attachmentNames.isEmpty ? nil : Self.rawMessage(fromEmlx: filePath)
         for attachName in email.attachmentNames {
             let ext = (attachName as NSString).pathExtension.lowercased()
             let dotExt = ext.isEmpty ? "" : ".\(ext)"
 
             if dangerousExtensions.contains(dotExt) {
                 threats.append((type: "dangerous_attachment_ext", label: "Dangerous attachment: \(attachName)", severity: .critical, category: "dangerous_attachment"))
+                dangerousAttachmentNames.append(attachName)
+            } else if let raw = attachmentRaw,
+                      let prefix = Self.decodeMimeAttachmentPrefix(named: attachName, fromRawMessage: raw, prefixBytes: 1024) {
+                // Tier 2: the extension looks benign — check what the bytes ACTUALLY are. A document/
+                // image whose magic bytes are a native executable is a disguised-executable attack the
+                // extension check can't see.
+                for t in SecurityCoreBridge.analyzeAttachmentStructure(prefix, filename: attachName) {
+                    threats.append((type: t.type, label: t.label, severity: t.severity, category: t.category))
+                    dangerousAttachmentNames.append(attachName)
+                }
             }
 
             let bnRange = NSRange(location: 0, length: (attachName as NSString).length)
@@ -461,15 +644,18 @@ final class EmailScanner: @unchecked Sendable {
         // Trusted sender (10+ clean emails, <5% threat rate):
         // Only flag hard bypass (dangerous attachments, malware, prompt injection).
         // Soft bypass (crypto_scam, sensitive_data, malicious_url) suppressed for trusted.
-        if trust == .trusted {
+        // NOT applied in a flagged folder: a "trusted" domain whose message landed in
+        // Junk is exactly the spoof/lookalike case — give it full scrutiny.
+        if trust == .trusted && !flaggedFolder {
             confirmedThreats = confirmedThreats.filter { t in
                 hardBypassCategories.contains(t.category)
             }
         }
 
         // Fully authenticated (SPF+DKIM+DMARC pass):
-        // Suppress intent-only threats from authenticated senders
-        if auth.allPass && !confirmedThreats.isEmpty {
+        // Suppress intent-only threats from authenticated senders.
+        // Also withheld in a flagged folder (auth passing doesn't make junk safe).
+        if auth.allPass && !flaggedFolder && !confirmedThreats.isEmpty {
             confirmedThreats = confirmedThreats.filter { t in
                 hardBypassCategories.contains(t.category) ||
                 softBypassCategories.contains(t.category) ||
@@ -490,17 +676,24 @@ final class EmailScanner: @unchecked Sendable {
             ))
         }
 
-        // Apply whitelist policy (final pass)
+        // Apply whitelist policy (final pass). Not honored in a flagged folder — a
+        // whitelist match is only the From address, which a spoof reproduces; a
+        // whitelisted sender's mail sitting in Junk should not be waved through.
         let senderPolicy = whitelist.policy(for: from)
-        if senderPolicy.isWhitelisted {
+        if senderPolicy.isWhitelisted && !flaggedFolder {
             confirmedThreats = confirmedThreats.filter { t in
                 senderPolicy.shouldAlert(category: t.category, intentLayers: intent.score)
             }
         }
 
         // ── Record sender history ───────────────────────────────────
+        // Only the Inbox banks "clean" credit toward sender trust. Threats are recorded from
+        // anywhere, but a clean scan only builds trust when it's a real Inbox message — so a
+        // spam/junk/archive message (or a mis-classified localized junk folder that fell
+        // through to .custom) can never earn a domain the .trusted status that suppresses
+        // Inbox alerts. This closes the junk-poisons-inbox-trust channel regardless of locale.
         let hadThreat = !confirmedThreats.isEmpty
-        if !senderDomain.isEmpty {
+        if !senderDomain.isEmpty && (hadThreat || folderRole == .inbox) {
             senderHistory.recordScan(domain: senderDomain, hadThreat: hadThreat)
         }
 
@@ -511,6 +704,29 @@ final class EmailScanner: @unchecked Sendable {
             let patternSeverity: SeverityLevel = confirmedThreats.contains(where: { $0.severity == .critical }) ? .critical : .high
             let finalSeverity = max(intent.severity ?? .low, patternSeverity)
 
+            // Disposition: for a confirmed dangerous attachment, extract a DEFANGED evidence copy
+            // into quarantine (mode 0600, renamed off its dangerous extension). This does not touch
+            // the email — the runnable file is contained separately when Mail materializes it
+            // (file-watch on Mail's attachment dir). Records what was done on the alert.
+            var disposition: String? = nil
+            if !dangerousAttachmentNames.isEmpty
+                && confirmedThreats.contains(where: { $0.category == "dangerous_attachment" })
+                && SecurityConfig.shared.shouldQuarantine,
+               let rawMessage = attachmentRaw {
+                var quarantined: [String] = []
+                // Cap: a crafted email can name thousands of attachments — process a bounded few off
+                // the single already-read raw message (no per-attachment re-read of the whole .emlx).
+                for name in dangerousAttachmentNames.prefix(10) {
+                    if let path = quarantineEmailAttachment(rawMessage: rawMessage, attachmentName: name) {
+                        quarantined.append((path as NSString).lastPathComponent)
+                    }
+                }
+                if !quarantined.isEmpty {
+                    disposition = "defanged copy quarantined: \(quarantined.joined(separator: ", "))"
+                    logger.info("\u{1F512} Email attachment defanged \u{2192} quarantine: \(quarantined.joined(separator: ", "))")
+                }
+            }
+
             let alert = SecurityAlert(
                 type: "EMAIL_THREAT_DETECTED",
                 severity: finalSeverity,
@@ -519,10 +735,26 @@ final class EmailScanner: @unchecked Sendable {
                 from: from,
                 to: to,
                 subject: subject,
-                threats: confirmedThreats.map { ThreatDetail(label: $0.label, category: $0.category, severity: $0.severity) }
+                threats: confirmedThreats.map { ThreatDetail(label: $0.label, category: $0.category, severity: $0.severity) },
+                disposition: disposition
             )
+            // Always record to the alert log. On the backlog sweep, only weaponized
+            // (hard-bypass / critical) finds raise a user notification when they're in a
+            // newly-covered folder (junk/trash/archive) — lesser matches in that
+            // pre-existing pile are logged silently to avoid a burst. Inbox keeps its
+            // prior always-notify behavior; live-poll finds (new mail, rescued-from-junk)
+            // always notify. `isCritical` uses the effective `finalSeverity` so an
+            // intent-driven CRITICAL (high pattern + critical intent score) is never
+            // silently downgraded to a suppressed backlog notification.
+            let isCritical = finalSeverity == .critical
+                || confirmedThreats.contains { hardBypassCategories.contains($0.category) }
+            let suppressPopup = isBacklog && Self.isInExpandedCoverageSubtree(forPath: filePath) && !isCritical
             logger.alert(alert)
-            onAlert?(alert)
+            if suppressPopup {
+                logger.info("\u{1F4E7} Backlog find (notification suppressed, non-critical): \(from) — \(subject)")
+            } else {
+                onAlert?(alert)
+            }
         } else if !warnings.isEmpty {
             logger.warn("\u{26A0}\u{FE0F} Suspicious email from \(from.isEmpty ? "unknown" : from): \(subject)")
         }
@@ -581,7 +813,9 @@ final class EmailScanner: @unchecked Sendable {
     }
 
     private func parseEmlx(_ filePath: String) -> ParsedEmail? {
-        guard let data = FileManager.default.contents(atPath: filePath),
+        // Bound the read (mirrors rawMessage): a single legitimate message is far under 80MB, and a
+        // crafted multi-GB .emlx dropped in the mail dir must not be loaded whole into memory.
+        guard let data = FileManager.default.contents(atPath: filePath), data.count < 80 * 1024 * 1024,
               var raw = String(data: data, encoding: .utf8) else { return nil }
 
         // .emlx files start with a byte count on the first line — skip it
@@ -624,19 +858,23 @@ final class EmailScanner: @unchecked Sendable {
         // Parse authentication results (SPF/DKIM/DMARC)
         email.auth = parseAuthResults(email.headers["authentication-results"])
 
-        // Extract attachment filenames
-        let attachPattern = try? NSRegularExpression(
+        // Extract attachment filenames — BOUNDED. A crafted message can name a huge number of
+        // attachments (repeated Content-Disposition lines); left uncapped, the per-attachment
+        // Tier-2 magic-byte decode below (a full-message regex scan each) would amplify into an
+        // O(N^2) hang triggerable by one email. Cap the count here so every downstream consumer
+        // (this parse, the scan loop, the quarantine loop) is bounded at the source. A legitimate
+        // email has at most a handful of attachments; 64 is generous headroom.
+        let maxAttachments = 64
+        if let ap = try? NSRegularExpression(
             pattern: #"Content-Disposition:.*?filename[*]?=["']?([^"';\r\n]+)"#,
-            options: .caseInsensitive)
-        if let ap = attachPattern {
+            options: .caseInsensitive) {
             let nsRaw = raw as NSString
-            let matches = ap.matches(in: raw, range: NSRange(location: 0, length: nsRaw.length))
-            for match in matches {
-                if match.numberOfRanges > 1 {
-                    let name = nsRaw.substring(with: match.range(at: 1))
-                        .trimmingCharacters(in: CharacterSet(charactersIn: "\"'"))
-                    email.attachmentNames.append(name)
-                }
+            ap.enumerateMatches(in: raw, range: NSRange(location: 0, length: nsRaw.length)) { match, _, stop in
+                guard let match = match, match.numberOfRanges > 1 else { return }
+                let name = nsRaw.substring(with: match.range(at: 1))
+                    .trimmingCharacters(in: CharacterSet(charactersIn: "\"'"))
+                email.attachmentNames.append(name)
+                if email.attachmentNames.count >= maxAttachments { stop.pointee = true }
             }
         }
 
@@ -645,44 +883,104 @@ final class EmailScanner: @unchecked Sendable {
 
     // MARK: - Helpers
 
-    private func findEmlxFiles(in dir: String, limit: Int) -> [String] {
-        var files: [String] = []
+    /// Enumerate .emlx files to consider this poll, with **per-mailbox fair budgeting** so no
+    /// single folder can starve another under the global `limit`. A single DFS attributes each
+    /// message to its nearest enclosing scannable mailbox "root" (the deepest `.mbox` ancestor
+    /// that isn't a container). The budget is then filled by round-robin across roots — so every
+    /// folder (incl. Inbox on multi-account setups) is served and none can hoard — taking ALL
+    /// unseen (new) mail before ANY already-scanned file, so a large seen backlog never spends the
+    /// budget on no-op re-reads while new mail waits. Roots are in priority order (Junk → Trash →
+    /// Inbox → custom → Archive). `isSeen` reports whether a path is already in `scannedFiles`.
+    ///
+    /// Cost note: fair budgeting requires a full walk of the scanned mailboxes each poll (it can't
+    /// know the shares without counting every root), i.e. O(scanned emails) stats per poll. That is
+    /// fine at realistic sizes and is bounded by keeping Gmail "All Mail" (a whole-mailbox copy)
+    /// off by default; only pathologically large multi-account stores would notice.
+    private func findEmlxFiles(in dir: String, limit: Int, isSeen: (String) -> Bool) -> [String] {
         let fm = FileManager.default
+        var byRoot: [String: (role: MailboxRole, files: [String])] = [:]
 
-        func walk(_ d: String) {
-            guard files.count < limit else { return }
+        // DFS carrying the current mailbox root context and whether we're inside [Gmail].
+        func walk(_ d: String, rootPath: String?, rootRole: MailboxRole?, inGmail: Bool) {
+            var curRoot = rootPath
+            var curRole = rootRole
+            var curInGmail = inGmail
 
-            // Skip mailboxes we don't care about (Deleted, Junk, Sent, Drafts, etc.)
-            let dirName = (d as NSString).lastPathComponent.lowercased()
-            if dirName.hasSuffix(".mbox") {
-                let mboxName = String(dirName.dropLast(".mbox".count))
-                for prefix in skippedMailboxPrefixes {
-                    if mboxName.hasPrefix(prefix) { return }
+            let name = (d as NSString).lastPathComponent
+            if name.hasSuffix(".mbox") {
+                var role = Self.mailboxRole(leaf: String(name.dropLast(".mbox".count)))
+                if role == .container {
+                    curInGmail = true   // descend; children are the real roots
+                } else {
+                    // Inside [Gmail]: Important/Starred are label views that always duplicate
+                    // real mail (no config toggle) — always skip. All Mail / Sent / Drafts /
+                    // Archive fall through to skipSubtree so their config toggles are honored
+                    // (e.g. scan_all_mail=true actually scans [Gmail]/All Mail). At top level a
+                    // same-named folder is a real user folder, scanned as .custom.
+                    if curInGmail {
+                        if role == .labelView { return }
+                    } else if role == .labelView {
+                        role = .custom
+                    }
+                    if skipSubtree(role: role) { return }
+                    curRoot = d       // entering a new scannable mailbox root
+                    curRole = role
                 }
             }
 
+            let entries: [String]
             do {
-                let entries = try fm.contentsOfDirectory(atPath: d)
-                for entry in entries {
-                    guard files.count < limit else { return }
-                    let full = (d as NSString).appendingPathComponent(entry)
-                    var isDir: ObjCBool = false
-                    guard fm.fileExists(atPath: full, isDirectory: &isDir) else { continue }
-                    if isDir.boolValue {
-                        walk(full)
-                    } else if entry.hasSuffix(".emlx") {
-                        files.append(full)
-                    }
-                }
+                entries = try fm.contentsOfDirectory(atPath: d)
             } catch {
                 logger.warn("\u{1F4E7} Cannot read directory \(d): \(error.localizedDescription)")
-                if d == dir {
-                    fdaRequired = true
+                if d == dir { fdaRequired = true }
+                return
+            }
+            for entry in entries {
+                let full = (d as NSString).appendingPathComponent(entry)
+                var isDir: ObjCBool = false
+                guard fm.fileExists(atPath: full, isDirectory: &isDir) else { continue }
+                if isDir.boolValue {
+                    walk(full, rootPath: curRoot, rootRole: curRole, inGmail: curInGmail)
+                } else if entry.hasSuffix(".emlx"), let rp = curRoot, let rr = curRole {
+                    byRoot[rp, default: (rr, [])].files.append(full)
                 }
             }
         }
 
-        walk(dir)
+        walk(dir, rootPath: nil, rootRole: nil, inGmail: false)
+
+        let roots = byRoot.sorted { a, b in
+            let pa = Self.walkPriority(role: a.value.role)
+            let pb = Self.walkPriority(role: b.value.role)
+            return pa != pb ? pa < pb : a.key < b.key
+        }
+        guard !roots.isEmpty else { return [] }
+
+        // Fill the budget by round-robin across roots so no folder is starved, and take ALL
+        // unseen (new) mail before ANY already-scanned file — a huge already-scanned Junk folder
+        // must never spend the budget on no-op re-reads while new Inbox mail waits. Roots are in
+        // priority order, so within a round Junk is served just ahead of Inbox. Phase 1 = new
+        // mail (what threat detection cares about); phase 2 fills any remainder with seen files
+        // for change/rescan detection.
+        var files: [String] = []
+        func roundRobin(_ perRoot: [[String]]) {
+            var idx = Array(repeating: 0, count: perRoot.count)
+            var progressed = true
+            while files.count < limit && progressed {
+                progressed = false
+                for r in 0..<perRoot.count where idx[r] < perRoot[r].count {
+                    if files.count >= limit { break }
+                    files.append(perRoot[r][idx[r]])
+                    idx[r] += 1
+                    progressed = true
+                }
+            }
+        }
+        roundRobin(roots.map { $0.value.files.filter { !isSeen($0) } })   // phase 1: new mail
+        if files.count < limit {
+            roundRobin(roots.map { $0.value.files.filter { isSeen($0) } }) // phase 2: rescan pool
+        }
         return files
     }
 
@@ -710,5 +1008,108 @@ final class EmailScanner: @unchecked Sendable {
 
     func getStats() -> [String: Any] {
         ["emailsScanned": emailsScanned, "threatsFound": threatsFound, "isRunning": isRunning]
+    }
+
+    // MARK: - Attachment evidence extraction (Tier-1 disposition)
+
+    /// Read the .emlx and strip its leading byte-count line. Bounded; nil on oversize/unreadable.
+    /// Read ONCE per email so extracting several attachments doesn't re-read/re-parse the whole file.
+    static func rawMessage(fromEmlx path: String) -> String? {
+        guard let data = FileManager.default.contents(atPath: path), data.count < 80 * 1024 * 1024,
+              var raw = String(data: data, encoding: .utf8) else { return nil }
+        if let nl = raw.firstIndex(of: "\n") {
+            let firstLine = String(raw[raw.startIndex..<nl]).trimmingCharacters(in: .whitespaces)
+            if firstLine.allSatisfy(\.isNumber) { raw = String(raw[raw.index(after: nl)...]) }
+        }
+        return raw
+    }
+
+    /// Locate the named attachment part in a raw RFC-822 message; return its raw body + whether it's
+    /// base64. The filename match is anchored to a `Content-Disposition`/`Content-Type` HEADER line,
+    /// so a `filename=` string in body text can't forge/redirect it; the transfer-encoding is read
+    /// from this part's header block (bounded window trimmed at the preceding boundary). Nil if the
+    /// part isn't found.
+    private static func attachmentPart(named name: String, fromRawMessage raw: String) -> (body: String, isBase64: Bool)? {
+        let leaf = (name as NSString).lastPathComponent
+        guard !leaf.isEmpty else { return nil }
+        let escaped = NSRegularExpression.escapedPattern(for: leaf)
+        let pat = "^Content-(?:Disposition|Type):[^\\n]*?(?:filename\\*?|name)\\s*=\\s*\"?\(escaped)\"?"
+        guard let re = try? NSRegularExpression(pattern: pat, options: [.caseInsensitive, .anchorsMatchLines]) else { return nil }
+        let ns = raw as NSString
+        guard let m = re.firstMatch(in: raw, range: NSRange(location: 0, length: ns.length)) else { return nil }
+        let afterMatch = m.range.location + m.range.length
+        let rest = ns.substring(from: afterMatch)
+        guard let sep = rest.range(of: "\r\n\r\n") ?? rest.range(of: "\n\n") else { return nil }
+        var body = String(rest[sep.upperBound...])
+        if let bnd = body.range(of: "\n--") { body = String(body[body.startIndex..<bnd.lowerBound]) }
+        let winStart = max(0, m.range.location - 600)
+        var pre = ns.substring(with: NSRange(location: winStart, length: m.range.location - winStart))
+        if let lastBoundary = pre.range(of: "\n--", options: .backwards) { pre = String(pre[lastBoundary.upperBound...]) }
+        let partHeaders = (pre + String(rest[rest.startIndex..<sep.lowerBound])).lowercased()
+        let isBase64 = partHeaders.range(of: "content-transfer-encoding:\\s*base64", options: .regularExpression) != nil
+        return (body, isBase64)
+    }
+
+    /// Full defanged-copy decode. Size-bounded before the allocating decode so a huge body with no
+    /// closing boundary can't amplify memory (base64 expands ~4/3, hence ×2). Nil on malformed.
+    static func decodeMimeAttachment(named name: String, fromRawMessage raw: String, maxBytes: Int) -> Data? {
+        guard let (body, isBase64) = attachmentPart(named: name, fromRawMessage: raw) else { return nil }
+        guard body.utf8.count <= maxBytes * 2 else { return nil }
+        let decoded: Data?
+        if isBase64 {
+            let b64 = body.components(separatedBy: .whitespacesAndNewlines).joined()
+            decoded = b64.count >= 4 ? Data(base64Encoded: b64, options: .ignoreUnknownCharacters) : nil
+        } else {
+            decoded = body.data(using: .utf8) ?? body.data(using: .isoLatin1)
+        }
+        guard let d = decoded, !d.isEmpty, d.count <= maxBytes else { return nil }
+        return d
+    }
+
+    /// Decode only the first ~`prefixBytes` of the attachment — cheap enough to run on EVERY
+    /// benign-looking attachment for the magic-byte true-type check, even for large files.
+    static func decodeMimeAttachmentPrefix(named name: String, fromRawMessage raw: String, prefixBytes: Int) -> Data? {
+        guard let (body, isBase64) = attachmentPart(named: name, fromRawMessage: raw) else { return nil }
+        if isBase64 {
+            let want = ((prefixBytes + 2) / 3 + 1) * 4           // whole base64 groups covering the prefix
+            // Only the first ~`want` base64 chars are needed for the leading-bytes check. Bound the
+            // slice BEFORE stripping whitespace so a huge (or unterminated) body can't force an
+            // O(bodySize) split/join allocation per attachment. `want * 2 + 4096` generously covers
+            // the prefix even with MIME line-wrapping whitespace interspersed.
+            let bounded = String(body.prefix(want * 2 + 4096))
+            let b64 = bounded.components(separatedBy: .whitespacesAndNewlines).joined()
+            let n = min(b64.count, want)
+            let n4 = n - (n % 4)                                  // a whole number of 4-char groups decodes cleanly
+            guard n4 >= 4, let d = Data(base64Encoded: String(b64.prefix(n4)), options: .ignoreUnknownCharacters) else { return nil }
+            return Data(d.prefix(prefixBytes))
+        } else {
+            let head = String(body.prefix(prefixBytes))
+            return head.data(using: .utf8) ?? head.data(using: .isoLatin1)
+        }
+    }
+
+    /// Write a **defanged** copy of attachment bytes into quarantine (mode 0600, no execute bit,
+    /// renamed off its dangerous extension). Deduplicated by content hash so re-scans of the same
+    /// email (marked read, moved folders) don't accumulate duplicate copies. Returns the path.
+    private func writeDefangedCopy(_ bytes: Data, name: String) -> String? {
+        let qDir = SecurityConfig.shared.externalFileSanitizer.quarantineDir
+        try? FileManager.default.createDirectory(atPath: qDir, withIntermediateDirectories: true)
+        let leaf = (name as NSString).lastPathComponent
+        let short = SHA256.hash(data: bytes).prefix(8).map { String(format: "%02x", $0) }.joined()
+        let dest = (qDir as NSString).appendingPathComponent("email_\(short)_\(leaf).quarantined")
+        if FileManager.default.fileExists(atPath: dest) { return dest }   // already have this exact content
+        do {
+            try bytes.write(to: URL(fileURLWithPath: dest), options: .atomic)
+            try? FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: dest)
+            return dest
+        } catch { return nil }
+    }
+
+    /// Extract the named attachment from an already-read raw message and quarantine a defanged copy.
+    /// Does NOT touch the email — that lives in Apple Mail's store; the runnable file is contained
+    /// separately (file-watch on Mail's attachment dir) when Mail materializes it.
+    private func quarantineEmailAttachment(rawMessage raw: String, attachmentName: String) -> String? {
+        guard let bytes = Self.decodeMimeAttachment(named: attachmentName, fromRawMessage: raw, maxBytes: 25 * 1024 * 1024) else { return nil }
+        return writeDefangedCopy(bytes, name: attachmentName)
     }
 }

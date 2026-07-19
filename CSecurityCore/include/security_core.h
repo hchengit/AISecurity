@@ -207,6 +207,15 @@ struct SanitizationResultFFI *sec_sanitize_text(const char *text);
 struct ThreatsArrayFFI *sec_scan_file_content(const char *text);
 
 /**
+ * Analyze an attachment's leading bytes vs. its filename for a disguised executable (magic-byte
+ * true-type check). `prefix`/`len` describe a byte buffer (a small prefix is sufficient). Caller
+ * must free with sec_free_threats.
+ */
+struct ThreatsArrayFFI *sec_analyze_attachment_structure(const uint8_t *prefix,
+                                                         uintptr_t len,
+                                                         const char *filename);
+
+/**
  * Analyze email text for threats. Caller must free with sec_free_threats.
  */
 struct ThreatsArrayFFI *sec_analyze_email(const char *text);
