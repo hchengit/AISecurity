@@ -277,6 +277,28 @@ pub extern "C" fn sec_scan_file_content(text: *const c_char) -> *mut ThreatsArra
     threats_to_ffi(threats.iter().map(|t| (&t.threat_type, &t.label, t.severity, &t.category)))
 }
 
+/// Analyze an attachment's leading bytes vs. its filename for a disguised executable (magic-byte
+/// true-type check). `prefix`/`len` describe a byte buffer (a small prefix is sufficient). Caller
+/// must free with sec_free_threats.
+#[no_mangle]
+pub extern "C" fn sec_analyze_attachment_structure(
+    prefix: *const u8,
+    len: usize,
+    filename: *const c_char,
+) -> *mut ThreatsArrayFFI {
+    let filename = match unsafe { from_c_str(filename) } {
+        Some(f) => f,
+        None => return ptr::null_mut(),
+    };
+    let bytes: &[u8] = if prefix.is_null() || len == 0 {
+        &[]
+    } else {
+        unsafe { std::slice::from_raw_parts(prefix, len) }
+    };
+    let threats = file_sanitizer::analyze_attachment_structure(bytes, &filename);
+    threats_to_ffi(threats.iter().map(|t| (&t.threat_type, &t.label, t.severity, &t.category)))
+}
+
 // ---------------------------------------------------------------------------
 // Email Analyzer
 // ---------------------------------------------------------------------------

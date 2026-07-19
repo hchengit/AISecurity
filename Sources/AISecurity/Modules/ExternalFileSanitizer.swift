@@ -148,6 +148,17 @@ final class ExternalFileSanitizer: @unchecked Sendable {
                 threatsDetected += 1
                 byCategory["dangerous_attachment", default: 0] += 1
                 lock.unlock()
+            } else {
+                // Tier 2: a benign-named file whose leading bytes are a native executable — a
+                // disguised executable the extension check above can't see.
+                for t in SecurityCoreBridge.analyzeAttachmentStructure(Data(data.prefix(1024)), filename: basename) {
+                    result.safe = false
+                    result.threats.append(.init(type: t.type, label: t.label, severity: t.severity, category: t.category))
+                    lock.lock()
+                    threatsDetected += 1
+                    byCategory[t.category, default: 0] += 1
+                    lock.unlock()
+                }
             }
         }
 

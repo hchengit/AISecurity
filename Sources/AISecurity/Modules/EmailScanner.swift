@@ -559,8 +559,13 @@ final class EmailScanner: @unchecked Sendable {
             }
         }
 
-        // Check attachment names (stays in Swift — operates on parsed email structure)
+        // Check attachment names (stays in Swift — operates on parsed email structure). The raw
+        // message is read at most ONCE here and reused for the Tier-2 magic-byte check and the
+        // Tier-1 defanged-copy quarantine below. `email.attachmentNames` is capped in parseEmlx
+        // (maxAttachments), so the per-attachment full-message decode below can't be amplified into
+        // an O(N^2) scan by a crafted message.
         var dangerousAttachmentNames: [String] = []
+        let attachmentRaw: String? = email.attachmentNames.isEmpty ? nil : Self.rawMessage(fromEmlx: filePath)
         for attachName in email.attachmentNames {
             let ext = (attachName as NSString).pathExtension.lowercased()
             let dotExt = ext.isEmpty ? "" : ".\(ext)"
@@ -568,6 +573,15 @@ final class EmailScanner: @unchecked Sendable {
             if dangerousExtensions.contains(dotExt) {
                 threats.append((type: "dangerous_attachment_ext", label: "Dangerous attachment: \(attachName)", severity: .critical, category: "dangerous_attachment"))
                 dangerousAttachmentNames.append(attachName)
+            } else if let raw = attachmentRaw,
+                      let prefix = Self.decodeMimeAttachmentPrefix(named: attachName, fromRawMessage: raw, prefixBytes: 1024) {
+                // Tier 2: the extension looks benign — check what the bytes ACTUALLY are. A document/
+                // image whose magic bytes are a native executable is a disguised-executable attack the
+                // extension check can't see.
+                for t in SecurityCoreBridge.analyzeAttachmentStructure(prefix, filename: attachName) {
+                    threats.append((type: t.type, label: t.label, severity: t.severity, category: t.category))
+                    dangerousAttachmentNames.append(attachName)
+                }
             }
 
             let bnRange = NSRange(location: 0, length: (attachName as NSString).length)
@@ -698,7 +712,7 @@ final class EmailScanner: @unchecked Sendable {
             if !dangerousAttachmentNames.isEmpty
                 && confirmedThreats.contains(where: { $0.category == "dangerous_attachment" })
                 && SecurityConfig.shared.shouldQuarantine,
-               let rawMessage = Self.rawMessage(fromEmlx: filePath) {
+               let rawMessage = attachmentRaw {
                 var quarantined: [String] = []
                 // Cap: a crafted email can name thousands of attachments — process a bounded few off
                 // the single already-read raw message (no per-attachment re-read of the whole .emlx).
@@ -799,7 +813,9 @@ final class EmailScanner: @unchecked Sendable {
     }
 
     private func parseEmlx(_ filePath: String) -> ParsedEmail? {
-        guard let data = FileManager.default.contents(atPath: filePath),
+        // Bound the read (mirrors rawMessage): a single legitimate message is far under 80MB, and a
+        // crafted multi-GB .emlx dropped in the mail dir must not be loaded whole into memory.
+        guard let data = FileManager.default.contents(atPath: filePath), data.count < 80 * 1024 * 1024,
               var raw = String(data: data, encoding: .utf8) else { return nil }
 
         // .emlx files start with a byte count on the first line — skip it
@@ -842,19 +858,23 @@ final class EmailScanner: @unchecked Sendable {
         // Parse authentication results (SPF/DKIM/DMARC)
         email.auth = parseAuthResults(email.headers["authentication-results"])
 
-        // Extract attachment filenames
-        let attachPattern = try? NSRegularExpression(
+        // Extract attachment filenames — BOUNDED. A crafted message can name a huge number of
+        // attachments (repeated Content-Disposition lines); left uncapped, the per-attachment
+        // Tier-2 magic-byte decode below (a full-message regex scan each) would amplify into an
+        // O(N^2) hang triggerable by one email. Cap the count here so every downstream consumer
+        // (this parse, the scan loop, the quarantine loop) is bounded at the source. A legitimate
+        // email has at most a handful of attachments; 64 is generous headroom.
+        let maxAttachments = 64
+        if let ap = try? NSRegularExpression(
             pattern: #"Content-Disposition:.*?filename[*]?=["']?([^"';\r\n]+)"#,
-            options: .caseInsensitive)
-        if let ap = attachPattern {
+            options: .caseInsensitive) {
             let nsRaw = raw as NSString
-            let matches = ap.matches(in: raw, range: NSRange(location: 0, length: nsRaw.length))
-            for match in matches {
-                if match.numberOfRanges > 1 {
-                    let name = nsRaw.substring(with: match.range(at: 1))
-                        .trimmingCharacters(in: CharacterSet(charactersIn: "\"'"))
-                    email.attachmentNames.append(name)
-                }
+            ap.enumerateMatches(in: raw, range: NSRange(location: 0, length: nsRaw.length)) { match, _, stop in
+                guard let match = match, match.numberOfRanges > 1 else { return }
+                let name = nsRaw.substring(with: match.range(at: 1))
+                    .trimmingCharacters(in: CharacterSet(charactersIn: "\"'"))
+                email.attachmentNames.append(name)
+                if email.attachmentNames.count >= maxAttachments { stop.pointee = true }
             }
         }
 
@@ -1004,48 +1024,68 @@ final class EmailScanner: @unchecked Sendable {
         return raw
     }
 
-    /// Decode the named attachment from a raw RFC-822 message. The filename match is anchored to a
-    /// `Content-Disposition`/`Content-Type` HEADER line, so a `filename=` string sitting in body
-    /// text cannot forge/redirect the match. Transfer-encoding aware (base64, else the raw part body
-    /// for 7bit/8bit/quoted-printable). Returns nil on malformed / oversized input; never crashes.
-    static func decodeMimeAttachment(named name: String, fromRawMessage raw: String, maxBytes: Int) -> Data? {
+    /// Locate the named attachment part in a raw RFC-822 message; return its raw body + whether it's
+    /// base64. The filename match is anchored to a `Content-Disposition`/`Content-Type` HEADER line,
+    /// so a `filename=` string in body text can't forge/redirect it; the transfer-encoding is read
+    /// from this part's header block (bounded window trimmed at the preceding boundary). Nil if the
+    /// part isn't found.
+    private static func attachmentPart(named name: String, fromRawMessage raw: String) -> (body: String, isBase64: Bool)? {
         let leaf = (name as NSString).lastPathComponent
         guard !leaf.isEmpty else { return nil }
         let escaped = NSRegularExpression.escapedPattern(for: leaf)
-        // Line-anchored: the filename= must sit on an actual Content-Disposition/Content-Type HEADER
-        // line, so the string can't be forged from arbitrary body text mid-line.
         let pat = "^Content-(?:Disposition|Type):[^\\n]*?(?:filename\\*?|name)\\s*=\\s*\"?\(escaped)\"?"
         guard let re = try? NSRegularExpression(pattern: pat, options: [.caseInsensitive, .anchorsMatchLines]) else { return nil }
         let ns = raw as NSString
         guard let m = re.firstMatch(in: raw, range: NSRange(location: 0, length: ns.length)) else { return nil }
         let afterMatch = m.range.location + m.range.length
         let rest = ns.substring(from: afterMatch)
-        // Body begins after the blank line ending this part's headers; ends at the next boundary.
         guard let sep = rest.range(of: "\r\n\r\n") ?? rest.range(of: "\n\n") else { return nil }
         var body = String(rest[sep.upperBound...])
         if let bnd = body.range(of: "\n--") { body = String(body[body.startIndex..<bnd.lowerBound]) }
-        // Bound the body BEFORE the (allocating) whitespace-strip/base64-decode, so a part with a
-        // huge body and no closing boundary can't amplify memory. base64 expands ~4/3, hence ×2.
-        guard body.utf8.count <= maxBytes * 2 else { return nil }
-        // Transfer encoding: match the actual header (not a stray "base64" inside the filename), in
-        // THIS part's header block — the transfer-encoding line may sit before or after the filename
-        // line, so include a bounded window before the match, trimmed at the preceding boundary so
-        // it can't straddle into a neighboring part.
         let winStart = max(0, m.range.location - 600)
         var pre = ns.substring(with: NSRange(location: winStart, length: m.range.location - winStart))
         if let lastBoundary = pre.range(of: "\n--", options: .backwards) { pre = String(pre[lastBoundary.upperBound...]) }
         let partHeaders = (pre + String(rest[rest.startIndex..<sep.lowerBound])).lowercased()
         let isBase64 = partHeaders.range(of: "content-transfer-encoding:\\s*base64", options: .regularExpression) != nil
+        return (body, isBase64)
+    }
+
+    /// Full defanged-copy decode. Size-bounded before the allocating decode so a huge body with no
+    /// closing boundary can't amplify memory (base64 expands ~4/3, hence ×2). Nil on malformed.
+    static func decodeMimeAttachment(named name: String, fromRawMessage raw: String, maxBytes: Int) -> Data? {
+        guard let (body, isBase64) = attachmentPart(named: name, fromRawMessage: raw) else { return nil }
+        guard body.utf8.count <= maxBytes * 2 else { return nil }
         let decoded: Data?
         if isBase64 {
             let b64 = body.components(separatedBy: .whitespacesAndNewlines).joined()
             decoded = b64.count >= 4 ? Data(base64Encoded: b64, options: .ignoreUnknownCharacters) : nil
         } else {
-            // 7bit / 8bit / binary / quoted-printable: keep the raw part body as the evidence copy.
             decoded = body.data(using: .utf8) ?? body.data(using: .isoLatin1)
         }
         guard let d = decoded, !d.isEmpty, d.count <= maxBytes else { return nil }
         return d
+    }
+
+    /// Decode only the first ~`prefixBytes` of the attachment — cheap enough to run on EVERY
+    /// benign-looking attachment for the magic-byte true-type check, even for large files.
+    static func decodeMimeAttachmentPrefix(named name: String, fromRawMessage raw: String, prefixBytes: Int) -> Data? {
+        guard let (body, isBase64) = attachmentPart(named: name, fromRawMessage: raw) else { return nil }
+        if isBase64 {
+            let want = ((prefixBytes + 2) / 3 + 1) * 4           // whole base64 groups covering the prefix
+            // Only the first ~`want` base64 chars are needed for the leading-bytes check. Bound the
+            // slice BEFORE stripping whitespace so a huge (or unterminated) body can't force an
+            // O(bodySize) split/join allocation per attachment. `want * 2 + 4096` generously covers
+            // the prefix even with MIME line-wrapping whitespace interspersed.
+            let bounded = String(body.prefix(want * 2 + 4096))
+            let b64 = bounded.components(separatedBy: .whitespacesAndNewlines).joined()
+            let n = min(b64.count, want)
+            let n4 = n - (n % 4)                                  // a whole number of 4-char groups decodes cleanly
+            guard n4 >= 4, let d = Data(base64Encoded: String(b64.prefix(n4)), options: .ignoreUnknownCharacters) else { return nil }
+            return Data(d.prefix(prefixBytes))
+        } else {
+            let head = String(body.prefix(prefixBytes))
+            return head.data(using: .utf8) ?? head.data(using: .isoLatin1)
+        }
     }
 
     /// Write a **defanged** copy of attachment bytes into quarantine (mode 0600, no execute bit,

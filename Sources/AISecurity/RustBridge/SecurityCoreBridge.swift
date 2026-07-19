@@ -155,6 +155,18 @@ enum SecurityCoreBridge {
         return threatsFromFFI(ptr)
     }
 
+    /// Magic-byte true-type check: flag an attachment whose bytes are a native executable but whose
+    /// filename claims a benign document/image type (a disguised executable).
+    static func analyzeAttachmentStructure(_ prefix: Data, filename: String) -> [Threat] {
+        let ptr = filename.withCString { fname in
+            prefix.withUnsafeBytes { raw in
+                sec_analyze_attachment_structure(
+                    raw.baseAddress?.assumingMemoryBound(to: UInt8.self), UInt(prefix.count), fname)
+            }
+        }
+        return threatsFromFFI(ptr)
+    }
+
     // MARK: - Email Analyzer
 
     static func analyzeEmail(_ text: String) -> [Threat] {
