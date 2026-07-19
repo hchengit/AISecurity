@@ -138,6 +138,19 @@ final class SecurityDaemon: ObservableObject {
                         _ = san.quarantine(r.filePath)
                     }
                 }
+
+                // Also strict-scan (recursively — attachments live in per-attachment subfolders)
+                // any email attachments Mail already materialized before launch, so a dangerous one
+                // left in Mail's attachment dir is contained on startup.
+                let mailDir = FileWatcher.mailAttachmentDir
+                let mailResults = san.scanDirectoryTree(mailDir, strictExecCheck: true)
+                let mailThreats = mailResults.filter { !$0.safe && !$0.threats.isEmpty }
+                if !mailThreats.isEmpty {
+                    log.info("\u{1F4CA} Startup mail-attachment scan: \(mailResults.count) files, \(mailThreats.count) threats")
+                    if cfg.shouldQuarantine {
+                        for r in mailThreats { _ = san.quarantine(r.filePath) }
+                    }
+                }
             }
         }
 

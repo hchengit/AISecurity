@@ -1,4 +1,5 @@
 import Foundation
+import CryptoKit
 
 /// Apple Mail email scanner — monitors ~/Library/Mail/ for new .emlx files.
 /// Pattern matching now backed by Rust security-core via FFI.
@@ -559,12 +560,14 @@ final class EmailScanner: @unchecked Sendable {
         }
 
         // Check attachment names (stays in Swift — operates on parsed email structure)
+        var dangerousAttachmentNames: [String] = []
         for attachName in email.attachmentNames {
             let ext = (attachName as NSString).pathExtension.lowercased()
             let dotExt = ext.isEmpty ? "" : ".\(ext)"
 
             if dangerousExtensions.contains(dotExt) {
                 threats.append((type: "dangerous_attachment_ext", label: "Dangerous attachment: \(attachName)", severity: .critical, category: "dangerous_attachment"))
+                dangerousAttachmentNames.append(attachName)
             }
 
             let bnRange = NSRange(location: 0, length: (attachName as NSString).length)
@@ -687,6 +690,29 @@ final class EmailScanner: @unchecked Sendable {
             let patternSeverity: SeverityLevel = confirmedThreats.contains(where: { $0.severity == .critical }) ? .critical : .high
             let finalSeverity = max(intent.severity ?? .low, patternSeverity)
 
+            // Disposition: for a confirmed dangerous attachment, extract a DEFANGED evidence copy
+            // into quarantine (mode 0600, renamed off its dangerous extension). This does not touch
+            // the email — the runnable file is contained separately when Mail materializes it
+            // (file-watch on Mail's attachment dir). Records what was done on the alert.
+            var disposition: String? = nil
+            if !dangerousAttachmentNames.isEmpty
+                && confirmedThreats.contains(where: { $0.category == "dangerous_attachment" })
+                && SecurityConfig.shared.shouldQuarantine,
+               let rawMessage = Self.rawMessage(fromEmlx: filePath) {
+                var quarantined: [String] = []
+                // Cap: a crafted email can name thousands of attachments — process a bounded few off
+                // the single already-read raw message (no per-attachment re-read of the whole .emlx).
+                for name in dangerousAttachmentNames.prefix(10) {
+                    if let path = quarantineEmailAttachment(rawMessage: rawMessage, attachmentName: name) {
+                        quarantined.append((path as NSString).lastPathComponent)
+                    }
+                }
+                if !quarantined.isEmpty {
+                    disposition = "defanged copy quarantined: \(quarantined.joined(separator: ", "))"
+                    logger.info("\u{1F512} Email attachment defanged \u{2192} quarantine: \(quarantined.joined(separator: ", "))")
+                }
+            }
+
             let alert = SecurityAlert(
                 type: "EMAIL_THREAT_DETECTED",
                 severity: finalSeverity,
@@ -695,7 +721,8 @@ final class EmailScanner: @unchecked Sendable {
                 from: from,
                 to: to,
                 subject: subject,
-                threats: confirmedThreats.map { ThreatDetail(label: $0.label, category: $0.category, severity: $0.severity) }
+                threats: confirmedThreats.map { ThreatDetail(label: $0.label, category: $0.category, severity: $0.severity) },
+                disposition: disposition
             )
             // Always record to the alert log. On the backlog sweep, only weaponized
             // (hard-bypass / critical) finds raise a user notification when they're in a
@@ -961,5 +988,88 @@ final class EmailScanner: @unchecked Sendable {
 
     func getStats() -> [String: Any] {
         ["emailsScanned": emailsScanned, "threatsFound": threatsFound, "isRunning": isRunning]
+    }
+
+    // MARK: - Attachment evidence extraction (Tier-1 disposition)
+
+    /// Read the .emlx and strip its leading byte-count line. Bounded; nil on oversize/unreadable.
+    /// Read ONCE per email so extracting several attachments doesn't re-read/re-parse the whole file.
+    static func rawMessage(fromEmlx path: String) -> String? {
+        guard let data = FileManager.default.contents(atPath: path), data.count < 80 * 1024 * 1024,
+              var raw = String(data: data, encoding: .utf8) else { return nil }
+        if let nl = raw.firstIndex(of: "\n") {
+            let firstLine = String(raw[raw.startIndex..<nl]).trimmingCharacters(in: .whitespaces)
+            if firstLine.allSatisfy(\.isNumber) { raw = String(raw[raw.index(after: nl)...]) }
+        }
+        return raw
+    }
+
+    /// Decode the named attachment from a raw RFC-822 message. The filename match is anchored to a
+    /// `Content-Disposition`/`Content-Type` HEADER line, so a `filename=` string sitting in body
+    /// text cannot forge/redirect the match. Transfer-encoding aware (base64, else the raw part body
+    /// for 7bit/8bit/quoted-printable). Returns nil on malformed / oversized input; never crashes.
+    static func decodeMimeAttachment(named name: String, fromRawMessage raw: String, maxBytes: Int) -> Data? {
+        let leaf = (name as NSString).lastPathComponent
+        guard !leaf.isEmpty else { return nil }
+        let escaped = NSRegularExpression.escapedPattern(for: leaf)
+        // Line-anchored: the filename= must sit on an actual Content-Disposition/Content-Type HEADER
+        // line, so the string can't be forged from arbitrary body text mid-line.
+        let pat = "^Content-(?:Disposition|Type):[^\\n]*?(?:filename\\*?|name)\\s*=\\s*\"?\(escaped)\"?"
+        guard let re = try? NSRegularExpression(pattern: pat, options: [.caseInsensitive, .anchorsMatchLines]) else { return nil }
+        let ns = raw as NSString
+        guard let m = re.firstMatch(in: raw, range: NSRange(location: 0, length: ns.length)) else { return nil }
+        let afterMatch = m.range.location + m.range.length
+        let rest = ns.substring(from: afterMatch)
+        // Body begins after the blank line ending this part's headers; ends at the next boundary.
+        guard let sep = rest.range(of: "\r\n\r\n") ?? rest.range(of: "\n\n") else { return nil }
+        var body = String(rest[sep.upperBound...])
+        if let bnd = body.range(of: "\n--") { body = String(body[body.startIndex..<bnd.lowerBound]) }
+        // Bound the body BEFORE the (allocating) whitespace-strip/base64-decode, so a part with a
+        // huge body and no closing boundary can't amplify memory. base64 expands ~4/3, hence ×2.
+        guard body.utf8.count <= maxBytes * 2 else { return nil }
+        // Transfer encoding: match the actual header (not a stray "base64" inside the filename), in
+        // THIS part's header block — the transfer-encoding line may sit before or after the filename
+        // line, so include a bounded window before the match, trimmed at the preceding boundary so
+        // it can't straddle into a neighboring part.
+        let winStart = max(0, m.range.location - 600)
+        var pre = ns.substring(with: NSRange(location: winStart, length: m.range.location - winStart))
+        if let lastBoundary = pre.range(of: "\n--", options: .backwards) { pre = String(pre[lastBoundary.upperBound...]) }
+        let partHeaders = (pre + String(rest[rest.startIndex..<sep.lowerBound])).lowercased()
+        let isBase64 = partHeaders.range(of: "content-transfer-encoding:\\s*base64", options: .regularExpression) != nil
+        let decoded: Data?
+        if isBase64 {
+            let b64 = body.components(separatedBy: .whitespacesAndNewlines).joined()
+            decoded = b64.count >= 4 ? Data(base64Encoded: b64, options: .ignoreUnknownCharacters) : nil
+        } else {
+            // 7bit / 8bit / binary / quoted-printable: keep the raw part body as the evidence copy.
+            decoded = body.data(using: .utf8) ?? body.data(using: .isoLatin1)
+        }
+        guard let d = decoded, !d.isEmpty, d.count <= maxBytes else { return nil }
+        return d
+    }
+
+    /// Write a **defanged** copy of attachment bytes into quarantine (mode 0600, no execute bit,
+    /// renamed off its dangerous extension). Deduplicated by content hash so re-scans of the same
+    /// email (marked read, moved folders) don't accumulate duplicate copies. Returns the path.
+    private func writeDefangedCopy(_ bytes: Data, name: String) -> String? {
+        let qDir = SecurityConfig.shared.externalFileSanitizer.quarantineDir
+        try? FileManager.default.createDirectory(atPath: qDir, withIntermediateDirectories: true)
+        let leaf = (name as NSString).lastPathComponent
+        let short = SHA256.hash(data: bytes).prefix(8).map { String(format: "%02x", $0) }.joined()
+        let dest = (qDir as NSString).appendingPathComponent("email_\(short)_\(leaf).quarantined")
+        if FileManager.default.fileExists(atPath: dest) { return dest }   // already have this exact content
+        do {
+            try bytes.write(to: URL(fileURLWithPath: dest), options: .atomic)
+            try? FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: dest)
+            return dest
+        } catch { return nil }
+    }
+
+    /// Extract the named attachment from an already-read raw message and quarantine a defanged copy.
+    /// Does NOT touch the email — that lives in Apple Mail's store; the runnable file is contained
+    /// separately (file-watch on Mail's attachment dir) when Mail materializes it.
+    private func quarantineEmailAttachment(rawMessage raw: String, attachmentName: String) -> String? {
+        guard let bytes = Self.decodeMimeAttachment(named: attachmentName, fromRawMessage: raw, maxBytes: 25 * 1024 * 1024) else { return nil }
+        return writeDefangedCopy(bytes, name: attachmentName)
     }
 }

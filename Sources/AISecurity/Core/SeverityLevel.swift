@@ -36,6 +36,9 @@ struct SecurityAlert: Codable, Sendable {
     var preview: String?
     var sender: String?
     var category: String?
+    /// What was DONE about this threat, if anything — e.g. "quarantined: <path>". Optional so
+    /// prior log entries (written before dispositions existed) still decode.
+    var disposition: String?
 
     init(
         type: String,
@@ -49,7 +52,8 @@ struct SecurityAlert: Codable, Sendable {
         findings: [FindingDetail]? = nil,
         preview: String? = nil,
         sender: String? = nil,
-        category: String? = nil
+        category: String? = nil,
+        disposition: String? = nil
     ) {
         self.type = type
         self.severity = severity
@@ -66,6 +70,7 @@ struct SecurityAlert: Codable, Sendable {
         self.preview = preview
         self.sender = sender
         self.category = category
+        self.disposition = disposition
     }
 }
 
