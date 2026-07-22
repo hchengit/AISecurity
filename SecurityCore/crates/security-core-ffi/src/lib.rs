@@ -299,6 +299,29 @@ pub extern "C" fn sec_analyze_attachment_structure(
     threats_to_ffi(threats.iter().map(|t| (&t.threat_type, &t.label, t.severity, &t.category)))
 }
 
+/// Inspect a container attachment (Office OOXML doc or ZIP archive) for a disguised macro document,
+/// dangerous archive contents, or an encrypted archive — by reading ZIP entry metadata only (no
+/// decompression). `prefix`/`len` describe a byte buffer (a bounded prefix is sufficient). Caller
+/// must free with sec_free_threats.
+#[no_mangle]
+pub extern "C" fn sec_analyze_container(
+    prefix: *const u8,
+    len: usize,
+    filename: *const c_char,
+) -> *mut ThreatsArrayFFI {
+    let filename = match unsafe { from_c_str(filename) } {
+        Some(f) => f,
+        None => return ptr::null_mut(),
+    };
+    let bytes: &[u8] = if prefix.is_null() || len == 0 {
+        &[]
+    } else {
+        unsafe { std::slice::from_raw_parts(prefix, len) }
+    };
+    let threats = file_sanitizer::analyze_container(bytes, &filename);
+    threats_to_ffi(threats.iter().map(|t| (&t.threat_type, &t.label, t.severity, &t.category)))
+}
+
 // ---------------------------------------------------------------------------
 // Email Analyzer
 // ---------------------------------------------------------------------------

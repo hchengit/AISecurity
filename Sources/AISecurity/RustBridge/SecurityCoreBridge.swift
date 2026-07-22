@@ -167,6 +167,19 @@ enum SecurityCoreBridge {
         return threatsFromFFI(ptr)
     }
 
+    /// Container inspection: read ZIP entry metadata (no decompression) to flag a disguised macro
+    /// document (a macro-free-looking Office doc carrying `vbaProject.bin`), an archive smuggling an
+    /// executable / double-extension entry, or an encrypted (uninspectable) archive.
+    static func analyzeContainer(_ prefix: Data, filename: String) -> [Threat] {
+        let ptr = filename.withCString { fname in
+            prefix.withUnsafeBytes { raw in
+                sec_analyze_container(
+                    raw.baseAddress?.assumingMemoryBound(to: UInt8.self), UInt(prefix.count), fname)
+            }
+        }
+        return threatsFromFFI(ptr)
+    }
+
     // MARK: - Email Analyzer
 
     static func analyzeEmail(_ text: String) -> [Threat] {

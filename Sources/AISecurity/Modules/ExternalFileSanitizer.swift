@@ -62,6 +62,11 @@ final class ExternalFileSanitizer: @unchecked Sendable {
         // Disk images (auto-mount + bypass mark-of-the-web)
         ".iso", ".img",
     ]
+    /// Container types whose ZIP entry listing we inspect (Tier-2 inc-2): Office OOXML macro-FREE
+    /// documents (macro-enabled types are in `dangerousAttachmentExtensions`) plus `.zip` archives.
+    static let containerExtensions: Set<String> = [
+        ".docx", ".xlsx", ".pptx", ".dotx", ".xltx", ".potx", ".ppsx", ".zip",
+    ]
     private var safeMetaCache: [String: String] = [:] // path → "mtime:size", SAFE results only
     private let lock = NSLock()
     private(set) var filesScanned = 0
@@ -149,7 +154,7 @@ final class ExternalFileSanitizer: @unchecked Sendable {
                 byCategory["dangerous_attachment", default: 0] += 1
                 lock.unlock()
             } else {
-                // Tier 2: a benign-named file whose leading bytes are a native executable — a
+                // Tier 2 inc-1: a benign-named file whose leading bytes are a native executable — a
                 // disguised executable the extension check above can't see.
                 for t in SecurityCoreBridge.analyzeAttachmentStructure(Data(data.prefix(1024)), filename: basename) {
                     result.safe = false
@@ -158,6 +163,19 @@ final class ExternalFileSanitizer: @unchecked Sendable {
                     threatsDetected += 1
                     byCategory[t.category, default: 0] += 1
                     lock.unlock()
+                }
+                // Tier 2 inc-2: container inspection (ZIP entry listing) for an Office OOXML doc or a
+                // zip — catches a disguised macro document or an archive smuggling an executable /
+                // encrypted payload. Bounded prefix (the whole file if smaller).
+                if Self.containerExtensions.contains(".\(ext)") {
+                    for t in SecurityCoreBridge.analyzeContainer(Data(data.prefix(1024 * 1024)), filename: basename) {
+                        result.safe = false
+                        result.threats.append(.init(type: t.type, label: t.label, severity: t.severity, category: t.category))
+                        lock.lock()
+                        threatsDetected += 1
+                        byCategory[t.category, default: 0] += 1
+                        lock.unlock()
+                    }
                 }
             }
         }

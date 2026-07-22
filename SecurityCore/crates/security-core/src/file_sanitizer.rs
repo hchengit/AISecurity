@@ -332,6 +332,172 @@ pub fn analyze_attachment_structure(prefix: &[u8], filename: &str) -> Vec<FileTh
     Vec::new()
 }
 
+fn u16_le(bytes: &[u8], at: usize) -> Option<u16> {
+    let end = at.checked_add(2)?;
+    bytes.get(at..end).map(|b| u16::from_le_bytes([b[0], b[1]]))
+}
+
+/// A ZIP entry recovered from a local file header: its name and whether it is encrypted.
+struct ZipEntry {
+    name: String,
+    encrypted: bool,
+}
+
+/// True if `bytes` begins with any ZIP signature (local file header, empty-archive EOCD, or spanned).
+fn is_zip(bytes: &[u8]) -> bool {
+    matches!(
+        bytes.get(0..4),
+        Some(&[0x50, 0x4B, 0x03, 0x04]) | Some(&[0x50, 0x4B, 0x05, 0x06]) | Some(&[0x50, 0x4B, 0x07, 0x08])
+    )
+}
+
+/// Enumerate ZIP entries by scanning `prefix` for local file header signatures (`PK\x03\x04`). We
+/// NEVER decompress — only the cleartext entry name (which is never compressed) and the
+/// general-purpose bit flag (encryption) are read. This means no zip-bomb amplification and no zip
+/// crate dependency. Scanning for the signature (rather than walking via the compressed size) is
+/// robust to the data-descriptor streaming mode where the header's size field is 0. Bounded to
+/// `max` entries within the supplied prefix; each candidate is validated (plausible name length +
+/// printable path bytes) so a stray signature inside compressed data can't fabricate an entry.
+fn zip_entries(prefix: &[u8], max: usize) -> Vec<ZipEntry> {
+    const LFH_SIG: [u8; 4] = [0x50, 0x4B, 0x03, 0x04];
+    let mut out = Vec::new();
+    let mut i = 0usize;
+    while out.len() < max && i + 30 <= prefix.len() {
+        if prefix[i..i + 4] != LFH_SIG {
+            i += 1;
+            continue;
+        }
+        let gp = u16_le(prefix, i + 6).unwrap_or(0);
+        let name_len = u16_le(prefix, i + 26).unwrap_or(0) as usize;
+        let extra_len = u16_le(prefix, i + 28).unwrap_or(0) as usize;
+        let name_start = i + 30;
+        let name_end = name_start.saturating_add(name_len);
+        if name_len == 0
+            || name_len > 1024
+            || name_end > prefix.len()
+            || !prefix[name_start..name_end].iter().all(|&b| b >= 0x20 && b != 0x7f)
+        {
+            i += 1;
+            continue;
+        }
+        out.push(ZipEntry {
+            name: String::from_utf8_lossy(&prefix[name_start..name_end]).into_owned(),
+            encrypted: gp & 0x0001 != 0,
+        });
+        i = name_end.saturating_add(extra_len);
+    }
+    out
+}
+
+/// A "double extension" lure: a benign document/image extension sitting BEFORE the real final
+/// extension, e.g. `invoice.pdf.exe` or `statement.pdf.xyz`.
+fn is_double_extension(leaf: &str) -> bool {
+    const LURE: &[&str] = &[
+        "pdf", "doc", "docx", "xls", "xlsx", "ppt", "pptx", "jpg", "jpeg", "png", "gif", "txt",
+        "htm", "html", "zip", "rtf", "csv",
+    ];
+    let parts: Vec<&str> = leaf.split('.').collect();
+    if parts.len() < 3 {
+        return false;
+    }
+    LURE.contains(&parts[parts.len() - 2].to_lowercase().as_str())
+}
+
+/// Inspect a **container** attachment (Office OOXML document or ZIP archive) by reading its ZIP
+/// entry metadata WITHOUT decompressing (no zip-bomb, no dependency). Catches two attacks the
+/// magic-byte check can't see because the payload is a *container*, not a bare executable:
+///   1. A macro-free-looking Office doc (`.docx`) that actually carries VBA macros (`vbaProject.bin`).
+///   2. A `.zip` smuggling an executable / double-extension entry, or an encrypted (uninspectable)
+///      archive — a classic AV-evasion delivery.
+///
+/// Macro-ENABLED Office extensions (`.docm` etc.) are already flagged by the extension check, so
+/// they are out of scope here (avoids double-counting).
+pub fn analyze_container(prefix: &[u8], filename: &str) -> Vec<FileThreat> {
+    const OOXML_MACRO_FREE: &[&str] = &["docx", "xlsx", "pptx", "dotx", "xltx", "potx", "ppsx"];
+    const ARCHIVE_EXTS: &[&str] = &["zip"];
+    // Extensions that are dangerous when found INSIDE an archive (native execs, scripts, auto-run,
+    // macro Office docs, disk images).
+    const DANGEROUS_INNER: &[&str] = &[
+        "exe", "scr", "com", "pif", "bat", "cmd", "vbs", "vbe", "js", "jse", "jar", "ps1", "wsf",
+        "hta", "msi", "lnk", "cpl", "reg", "app", "command", "scpt", "sh", "bash", "zsh", "dmg",
+        "pkg", "mpkg", "iso", "img", "docm", "xlsm", "pptm", "dotm", "xlam",
+    ];
+
+    let ext = filename.rsplit('.').next().unwrap_or("").to_lowercase();
+    let is_ooxml = OOXML_MACRO_FREE.contains(&ext.as_str());
+    let is_archive = ARCHIVE_EXTS.contains(&ext.as_str());
+    if !is_ooxml && !is_archive {
+        return Vec::new();
+    }
+    // Out of scope if it isn't actually a ZIP (e.g. a legacy OLE .doc, or a non-container renamed
+    // .zip) — the magic-byte / extension checks handle those.
+    if !is_zip(prefix) {
+        return Vec::new();
+    }
+
+    let entries = zip_entries(prefix, 512);
+    let mut threats = Vec::new();
+
+    if is_ooxml
+        && entries.iter().any(|e| {
+            e.name.rsplit(['/', '\\']).next().unwrap_or("").eq_ignore_ascii_case("vbaProject.bin")
+        })
+    {
+        threats.push(FileThreat {
+            threat_type: "disguised_macro_document".to_string(),
+            label: format!(
+                "Disguised macro document: \"{filename}\" claims a macro-free type but contains VBA macros (vbaProject.bin)"
+            ),
+            severity: SeverityLevel::Critical,
+            category: "dangerous_attachment".to_string(),
+        });
+    }
+
+    if is_archive {
+        let dangerous: Vec<String> = entries
+            .iter()
+            .filter_map(|e| {
+                let leaf = e.name.rsplit(['/', '\\']).next().unwrap_or("");
+                if leaf.is_empty() {
+                    return None;
+                }
+                let inner_ext = leaf.rsplit('.').next().unwrap_or("").to_lowercase();
+                if DANGEROUS_INNER.contains(&inner_ext.as_str()) || is_double_extension(leaf) {
+                    Some(leaf.to_string())
+                } else {
+                    None
+                }
+            })
+            .collect();
+        if !dangerous.is_empty() {
+            let shown = dangerous.iter().take(3).cloned().collect::<Vec<_>>().join(", ");
+            let more = if dangerous.len() > 3 {
+                format!(" (+{} more)", dangerous.len() - 3)
+            } else {
+                String::new()
+            };
+            threats.push(FileThreat {
+                threat_type: "dangerous_archive_content".to_string(),
+                label: format!("Archive \"{filename}\" contains dangerous content: {shown}{more}"),
+                severity: SeverityLevel::Critical,
+                category: "dangerous_attachment".to_string(),
+            });
+        }
+        if entries.iter().any(|e| e.encrypted) {
+            threats.push(FileThreat {
+                threat_type: "encrypted_archive".to_string(),
+                label: format!(
+                    "Encrypted archive \"{filename}\": password-protected, contents cannot be inspected"
+                ),
+                severity: SeverityLevel::High,
+                category: "dangerous_attachment".to_string(),
+            });
+        }
+    }
+
+    threats
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -403,6 +569,112 @@ mod tests {
     #[test]
     fn empty_prefix_safe() {
         assert!(analyze_attachment_structure(&[], "invoice.pdf").is_empty());
+    }
+
+    // ── analyze_container (increment-2): Office-macro + archive-contents inspection ──
+
+    /// Build a ZIP local file header (fixed part + cleartext name, no data) for a test archive.
+    fn lfh(name: &str, encrypted: bool) -> Vec<u8> {
+        let mut v = vec![0x50, 0x4B, 0x03, 0x04]; // PK\x03\x04
+        v.extend_from_slice(&[14, 0]); // version needed
+        let gp: u16 = if encrypted { 0x0001 } else { 0 };
+        v.extend_from_slice(&gp.to_le_bytes()); // general-purpose bit flag
+        v.extend_from_slice(&[0, 0]); // compression method
+        v.extend_from_slice(&[0, 0, 0, 0]); // mod time + date
+        v.extend_from_slice(&[0, 0, 0, 0]); // crc32
+        v.extend_from_slice(&[0, 0, 0, 0]); // compressed size
+        v.extend_from_slice(&[0, 0, 0, 0]); // uncompressed size
+        v.extend_from_slice(&(name.len() as u16).to_le_bytes()); // name length
+        v.extend_from_slice(&[0, 0]); // extra length
+        v.extend_from_slice(name.as_bytes());
+        v
+    }
+
+    fn zip_of(entries: &[(&str, bool)]) -> Vec<u8> {
+        let mut v = Vec::new();
+        for (n, enc) in entries {
+            v.extend(lfh(n, *enc));
+        }
+        v
+    }
+
+    #[test]
+    fn docx_with_vba_is_disguised_macro() {
+        let z = zip_of(&[("[Content_Types].xml", false), ("word/vbaProject.bin", false)]);
+        let t = analyze_container(&z, "report.docx");
+        assert_eq!(t.len(), 1);
+        assert_eq!(t[0].threat_type, "disguised_macro_document");
+        assert_eq!(t[0].severity, SeverityLevel::Critical);
+    }
+
+    #[test]
+    fn clean_docx_not_flagged() {
+        let z = zip_of(&[("[Content_Types].xml", false), ("word/document.xml", false)]);
+        assert!(analyze_container(&z, "report.docx").is_empty());
+    }
+
+    #[test]
+    fn docm_macro_extension_out_of_scope() {
+        // A macro-ENABLED extension is already flagged by the extension check — analyze_container
+        // must not also flag it (avoids double-counting).
+        let z = zip_of(&[("word/vbaProject.bin", false)]);
+        assert!(analyze_container(&z, "report.docm").is_empty());
+    }
+
+    #[test]
+    fn zip_with_exe_flagged() {
+        let z = zip_of(&[("readme.txt", false), ("invoice.exe", false)]);
+        let t = analyze_container(&z, "files.zip");
+        assert_eq!(t.len(), 1);
+        assert_eq!(t[0].threat_type, "dangerous_archive_content");
+        assert_eq!(t[0].severity, SeverityLevel::Critical);
+    }
+
+    #[test]
+    fn zip_with_double_extension_flagged() {
+        // Last extension (.xyz) is NOT itself dangerous — caught purely by the double-extension lure.
+        let z = zip_of(&[("statement.pdf.xyz", false)]);
+        let t = analyze_container(&z, "a.zip");
+        assert_eq!(t.len(), 1);
+        assert_eq!(t[0].threat_type, "dangerous_archive_content");
+    }
+
+    #[test]
+    fn encrypted_zip_flagged() {
+        let z = zip_of(&[("secret.docx", true)]);
+        let t = analyze_container(&z, "a.zip");
+        assert_eq!(t.len(), 1);
+        assert_eq!(t[0].threat_type, "encrypted_archive");
+        assert_eq!(t[0].severity, SeverityLevel::High);
+    }
+
+    #[test]
+    fn clean_zip_not_flagged() {
+        let z = zip_of(&[("photos/beach.jpg", false), ("notes.txt", false)]);
+        assert!(analyze_container(&z, "vacation.zip").is_empty());
+    }
+
+    #[test]
+    fn non_zip_container_ext_not_flagged() {
+        // A .docx-named file that isn't a ZIP (e.g. legacy OLE) is out of scope, no false positive.
+        assert!(analyze_container(b"\xD0\xCF\x11\xE0not a zip", "report.docx").is_empty());
+    }
+
+    #[test]
+    fn non_container_ext_ignored() {
+        // A real ZIP, but the attachment claims a non-container extension — not our job here.
+        let z = zip_of(&[("word/vbaProject.bin", false)]);
+        assert!(analyze_container(&z, "photo.jpg").is_empty());
+    }
+
+    #[test]
+    fn truncated_zip_no_panic() {
+        // A local file header signature followed by a bogus/oversized name length must not panic.
+        let mut z = vec![0x50, 0x4B, 0x03, 0x04];
+        z.extend_from_slice(&[0u8; 22]); // up to name-length field
+        z.extend_from_slice(&[0xFF, 0xFF]); // name length = 65535, far beyond the buffer
+        z.extend_from_slice(&[0, 0]); // extra length
+        assert!(analyze_container(&z, "report.docx").is_empty());
     }
 
     #[test]

@@ -216,6 +216,16 @@ struct ThreatsArrayFFI *sec_analyze_attachment_structure(const uint8_t *prefix,
                                                          const char *filename);
 
 /**
+ * Inspect a container attachment (Office OOXML doc or ZIP archive) for a disguised macro document,
+ * dangerous archive contents, or an encrypted archive — by reading ZIP entry metadata only (no
+ * decompression). `prefix`/`len` describe a byte buffer (a bounded prefix is sufficient). Caller
+ * must free with sec_free_threats.
+ */
+struct ThreatsArrayFFI *sec_analyze_container(const uint8_t *prefix,
+                                              uintptr_t len,
+                                              const char *filename);
+
+/**
  * Analyze email text for threats. Caller must free with sec_free_threats.
  */
 struct ThreatsArrayFFI *sec_analyze_email(const char *text);

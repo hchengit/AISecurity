@@ -165,6 +165,13 @@ final class EmailScanner: @unchecked Sendable {
     private let dangerousExtensions: Set<String>
     private let suspiciousAttachmentNames: [NSRegularExpression]
 
+    /// Container types whose ZIP entry listing we inspect (Tier-2 inc-2): Office OOXML macro-FREE
+    /// documents (a `.docm`/`.xlsm` is already in `dangerousExtensions`, so excluded here) plus
+    /// `.zip` archives. These get a larger bounded prefix decode so the ZIP entry listing is visible.
+    static let containerExtensions: Set<String> = [
+        ".docx", ".xlsx", ".pptx", ".dotx", ".xltx", ".potx", ".ppsx", ".zip",
+    ]
+
     // Trusted domains list replaced by dynamic SenderHistory tracking.
     // Sender trust is now earned through clean email history, not a static list.
 
@@ -573,14 +580,28 @@ final class EmailScanner: @unchecked Sendable {
             if dangerousExtensions.contains(dotExt) {
                 threats.append((type: "dangerous_attachment_ext", label: "Dangerous attachment: \(attachName)", severity: .critical, category: "dangerous_attachment"))
                 dangerousAttachmentNames.append(attachName)
-            } else if let raw = attachmentRaw,
-                      let prefix = Self.decodeMimeAttachmentPrefix(named: attachName, fromRawMessage: raw, prefixBytes: 1024) {
-                // Tier 2: the extension looks benign — check what the bytes ACTUALLY are. A document/
-                // image whose magic bytes are a native executable is a disguised-executable attack the
-                // extension check can't see.
-                for t in SecurityCoreBridge.analyzeAttachmentStructure(prefix, filename: attachName) {
-                    threats.append((type: t.type, label: t.label, severity: t.severity, category: t.category))
-                    dangerousAttachmentNames.append(attachName)
+            } else if let raw = attachmentRaw {
+                // The extension looks benign — inspect what the bytes ACTUALLY are. Decode a bounded
+                // prefix ONCE: an archive gets a larger window (a padded zip can push the malicious
+                // entry deep), an Office OOXML doc a smaller one (macro droppers are small), everything
+                // else just the leading magic bytes.
+                let isContainer = Self.containerExtensions.contains(dotExt)
+                let prefixBytes = dotExt == ".zip" ? 1024 * 1024 : (isContainer ? 128 * 1024 : 1024)
+                if let prefix = Self.decodeMimeAttachmentPrefix(named: attachName, fromRawMessage: raw, prefixBytes: prefixBytes) {
+                    // Tier 2 inc-1: a document/image whose magic bytes are a native executable — a
+                    // disguised executable the extension check can't see.
+                    for t in SecurityCoreBridge.analyzeAttachmentStructure(prefix, filename: attachName) {
+                        threats.append((type: t.type, label: t.label, severity: t.severity, category: t.category))
+                        dangerousAttachmentNames.append(attachName)
+                    }
+                    // Tier 2 inc-2: a macro-free-looking Office doc carrying VBA macros, or a zip
+                    // smuggling an executable / double-extension / encrypted payload.
+                    if isContainer {
+                        for t in SecurityCoreBridge.analyzeContainer(prefix, filename: attachName) {
+                            threats.append((type: t.type, label: t.label, severity: t.severity, category: t.category))
+                            dangerousAttachmentNames.append(attachName)
+                        }
+                    }
                 }
             }
 
