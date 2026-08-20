@@ -59,9 +59,8 @@ receipts, and the diff arrive in one commit. Unchecked boxes are listed under
 - Red-test drill: run 2026-08-19, gate confirmed RED then GREEN
   (see `docs/build-records/2026-08-19-phase0-gates.md`).
 
-**The smoke gate is currently RED on `cargo deny`** — pre-existing advisories,
-one of them a live wasmtime vulnerability with no semver-compatible fix. The
-build record lists all four and what each needs. Do not paper over it.
+The smoke gate is GREEN, `cargo deny` included. Keep it that way — a red gate
+stops the line (Law 2), it does not get papered over.
 
 ## What this is
 
@@ -164,7 +163,17 @@ or before releases, and fuzz the hand-rolled parsers (`local_services.rs` HTTP,
 `email_scanner`, the PyPI/manifest parser). A model finds the interesting logic bugs;
 fuzzers and `cargo deny` find the complete boring set — use both.
 
-**WASM sandbox:** runs on `wasmtime` 43 with fuel metering (bounds guest instructions per
+**WASM sandbox:** runs on `wasmtime` 47 **with default features off** (only
+`cranelift`, `runtime`, `std`) with fuel metering (bounds guest instructions per
 call), a linear-memory cap, and a host-side result-size cap — see `wasm_sandbox.rs`.
 wasmtime ships frequent security releases, so keep it current; the supply-chain gate flags
 new advisories. Any new plugin entry point must preserve those three limits.
+
+The default features are OFF deliberately, and that is a security property not
+a build-time nicety: they pulled `wasm-compose` -> `im-rc` -> `bitmaps` +
+`sized-chunks` (32 crates, three of them RUSTSEC-unmaintained) for a
+component-model API `wasm_sandbox.rs` never calls. They also pulled `wat`, so
+the shipped sandbox now cannot parse text-format modules at all — it accepts
+compiled `.wasm` and nothing else. Tests compile their own fixtures through the
+`wat` dev-dependency, exercising the same binary path a real plugin takes. If
+you re-enable a wasmtime feature, say why in the manifest.

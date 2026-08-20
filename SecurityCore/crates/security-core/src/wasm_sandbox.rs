@@ -312,12 +312,16 @@ mod tests {
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
-    // Compile inline WAT to a temp `.wasm` file (Module::new parses WAT when
-    // the bytes aren't a binary module) and return its path.
-    fn write_wat(dir: &Path, file: &str, wat: &str) -> PathBuf {
-        let _ = std::fs::create_dir_all(dir);
+    // Compile inline WAT to REAL wasm bytes and write a binary `.wasm`.
+    // wasmtime ships with default features off, so the sandbox cannot parse
+    // the text format — which is the point: production accepts compiled
+    // modules only. Tests therefore compile their own, exercising the same
+    // binary path a real plugin takes.
+    fn write_wat(dir: &Path, file: &str, wat_src: &str) -> PathBuf {
+        std::fs::create_dir_all(dir).unwrap();
         let p = dir.join(file);
-        std::fs::write(&p, wat.as_bytes()).unwrap();
+        let bytes = wat::parse_str(wat_src).expect("fixture WAT must compile");
+        std::fs::write(&p, bytes).unwrap();
         p
     }
 
