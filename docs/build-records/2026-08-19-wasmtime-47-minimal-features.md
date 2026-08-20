@@ -72,11 +72,26 @@
 - [x] Commit message explains WHY; record committed with the change.
 
 ## Skipped items — visible, never silent
-- **`swift build` not run.** The Rust staticlib and the cbindgen header both
-  rebuild clean and the FFI surface is unchanged by a dependency swap, so the
-  risk is low — but "the app compiles and runs" is a claim this record does not
-  make. Worth one `./build-rust.sh release && swift build -c release` before
-  the next release gate.
+- (none — the Swift half was closed before this record was committed; see below.)
+
+## Addendum — the Swift half, closed
+The first draft of this record listed `swift build` as skipped. It is now done,
+and it mattered more than "low risk" suggested: the linked
+`CSecurityCore/lib/libsecurity_core_ffi.a` was dated **2026-07-21**. Swift links
+that COPY, not the cargo output, so a Rust-only green says nothing about what
+the app actually contains — the shipped binary still had wasmtime 43 in it
+until `build-rust.sh` ran. That is the source-vs-running drift the procedure
+calls a slow-motion outage.
+
+    ./build-rust.sh release   -> header + .a regenerated, stale Swift link invalidated
+    .a size: 86 MiB -> 72 MiB (consistent with 32 crates removed)
+    swift build -c release    -> "Build complete! (53.50s)"
+
+PRE-EXISTING and NOT introduced here: the linker warns that objects in the `.a`
+were "built for newer 'macOS' version (26.5) than being linked (13.0)" — a
+deployment-target mismatch between the Rust toolchain's default and the Swift
+package's target. It is noise on every build, which is exactly how a real
+warning would hide. Worth pinning the Rust target explicitly; not this change.
 
 ## Evidence log
 ```
