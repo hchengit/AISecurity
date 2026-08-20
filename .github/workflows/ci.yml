@@ -106,4 +106,4 @@ jobs:
       # scripts/ratchet-baseline.txt; a rise fails the build. Pure shell, so
       # it needs no Rust or Swift toolchain and runs in seconds.
       - name: Ratchet
-        run: ./scripts/ratchet.sh
+        run: ./scripts/ratchet.sh --check-only

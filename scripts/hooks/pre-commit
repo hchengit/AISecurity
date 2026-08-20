@@ -70,5 +70,26 @@ while IFS= read -r f; do
   fi
 done <<< "$STAGED"
 
+# ── 5. debt ratchet: a rise refuses the commit, a drop self-corrects ──
+# Running it here is what makes the ratchet maintenance-free: when a counter
+# falls the script lowers the baseline and we stage it, so the improvement
+# lands in the same commit that earned it. Nobody has to remember.
+if [ -x scripts/ratchet.sh ]; then
+  if scripts/ratchet.sh >/tmp/rt.$$ 2>&1; then
+    if git diff --name-only -- scripts/ratchet-baseline.txt | grep -q .; then
+      git add scripts/ratchet-baseline.txt
+      printf '\033[32m%s\033[0m\n' "ratchet: a counter improved — baseline lowered and staged"
+      grep -E 'lower|LOWERED' /tmp/rt.$$ | head -3 | sed 's/^/          /'
+    fi
+  else
+    red "BLOCKED: a ratcheted metric rose"
+    grep -E 'RISEN' /tmp/rt.$$ | sed 's/^/          /'
+    echo "          Reduce it, or raise the baseline deliberately with"
+    echo "          ./scripts/ratchet.sh --update and say why in the commit."
+    FAIL=1
+  fi
+  rm -f /tmp/rt.$$
+fi
+
 [ "$FAIL" -eq 0 ] || { echo; red "pre-commit gate RED — commit refused."; echo "If this is a false positive, fix the pattern in scripts/hooks/pre-commit rather than habitually using --no-verify."; }
 exit "$FAIL"

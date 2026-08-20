@@ -143,7 +143,7 @@ fi
 
 echo "── debt ratchet ───────────────────────────────────────────"
 if [ -x scripts/ratchet.sh ]; then
-  if scripts/ratchet.sh >/tmp/rt.$$ 2>&1; then
+  if scripts/ratchet.sh --check-only >/tmp/rt.$$ 2>&1; then
     ok "ratchet — $(grep -E '^RATCHET' /tmp/rt.$$ | head -1)"
   else
     bad "ratchet — a counted metric rose"; grep -E 'RISEN' /tmp/rt.$$ | sed 's/^/      /'

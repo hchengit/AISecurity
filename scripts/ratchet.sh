@@ -6,8 +6,17 @@
 # A DROP is reported and the baseline should be lowered in the same change —
 # that is the whole mechanism: debt is allowed to shrink, never to grow back.
 #
-#   ./scripts/ratchet.sh           check against the baseline
-#   ./scripts/ratchet.sh --update  rewrite the baseline from current counts
+#   ./scripts/ratchet.sh              check; AUTO-LOWERS the baseline on a drop
+#   ./scripts/ratchet.sh --check-only  check only, never write (CI, smoke)
+#   ./scripts/ratchet.sh --update      rewrite ALL baselines, including UP
+#
+# THE DROP SELF-CORRECTS, THE RISE NEVER DOES. That asymmetry is not a
+# convenience — it is what a ratchet IS. Lowering the baseline when a number
+# falls is always safe: it locks in the improvement. Raising it silently would
+# erase the mechanism, so a rise is always RED and always needs a human to say
+# why. The pre-commit hook runs this and stages the lowered baseline, so the
+# improvement lands in the same commit that earned it without anyone having to
+# remember.
 #
 # WHAT IS DELIBERATELY NOT COUNTED, and why (a counter that is mostly
 # legitimate noise gets ignored the first time it blocks someone, and then it
@@ -69,7 +78,8 @@ current() {
   esac
 }
 
-if [ "${1:-}" = "--update" ]; then
+MODE="${1:-auto}"
+if [ "$MODE" = "--update" ]; then
   { echo "# Debt ratchet baselines — these may only go DOWN."
     echo "# Regenerate with ./scripts/ratchet.sh --update, in the SAME change that"
     echo "# reduced the number, and say which counter moved in the commit message."
@@ -99,6 +109,19 @@ if [ "$FAIL" -ne 0 ]; then
   echo "debt is accepted and raise the baseline deliberately (never silently)."
   exit 1
 fi
-[ "$DROPPED" -ne 0 ] && echo && echo "RATCHET: GREEN — and something improved. Run --update in this same change."
-[ "$DROPPED" -eq 0 ] && echo && echo "RATCHET: GREEN"
+if [ "$DROPPED" -ne 0 ] && [ "$MODE" != "--check-only" ]; then
+  # lock the improvement in, now, so it cannot quietly re-inflate later
+  { echo "# Debt ratchet baselines — these may only go DOWN."
+    echo "# Lowered automatically when a counter falls; a RISE is always RED and"
+    echo "# needs a human to say why. Regenerate deliberately with --update."
+    for n in "${NAMES[@]}"; do echo "$n=$(current "$n")"; done
+  } > "$BASE"
+  echo
+  echo "RATCHET: GREEN — a counter improved, baseline LOWERED automatically."
+  echo "  $BASE is updated; commit it with this change."
+elif [ "$DROPPED" -ne 0 ]; then
+  echo; echo "RATCHET: GREEN — a counter improved (baseline not written: --check-only)."
+else
+  echo; echo "RATCHET: GREEN"
+fi
 exit 0
