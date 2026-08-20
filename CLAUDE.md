@@ -2,6 +2,53 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
+## How work gets done here — binding
+
+[`docs/BUILD-PROCEDURE.md`](docs/BUILD-PROCEDURE.md) is the standard work for
+this repo: the Five Laws, Phase 0, the per-change loop (PLAN → BUILD → DEBUG →
+TEST/VERIFY → CLOSE OUT), the scrap taxonomy, the periodic drills, the incident
+procedure, and the release gate. **Any session working in this repo is bound by
+it**, and its own "Working with AI Assistants" section says so explicitly.
+
+It is not in tension with the "Security practices" section at the bottom of
+this file — it is the general form of it. Where they overlap, both apply; where
+this repo is stricter (fail-closed, crown-jewel threat-model review), the
+stricter rule wins.
+
+The parts that bite hardest in a security-enforcement product:
+
+- **Nothing is silent** (Law 1). A fallback that engages is an ALERT, not a
+  save. This repo already fails closed on purpose — a relay that quietly
+  degrades to an unguarded path is the exact failure this law names.
+- **Alert on the absence of success** (Law 4). Heartbeats over error handlers:
+  a detection path that stops firing looks identical to a quiet day unless
+  something is watching for the silence.
+- **Encode every lesson as a gate** (Law 5). This is already the house style —
+  `cargo deny` accepted-advisory entries carry a reason and a tracking note,
+  and the `bypass`/`threat_feeds` serial guards exist because flaky tests hid
+  real bugs. Keep converting incidents into tripwires.
+- **The security question, asked explicitly every time** (BUILD step 2): does
+  this change touch auth, money, execution, or private data? Name the gate and
+  the test that proves it holds — **and check both directions**, since a
+  hardening pass that breaks a legitimate path is also a defect.
+- **Clean as you go.** The old version dies in the same change; scratch and
+  probe scripts die with the session, in a scratchpad, never in the repo.
+
+**Every change carries a build record.** Copy
+[`docs/build-records/TEMPLATE.md`](docs/build-records/TEMPLATE.md) to
+`docs/build-records/YYYY-MM-DD-<slug>.md` when planning starts, tick boxes with
+evidence as the work happens, and commit the record with the change. That
+record is what makes a change auditable after the fact: the reasoning, the
+receipts, and the diff arrive in one commit. Unchecked boxes are listed under
+"Skipped items" or the change is not done.
+
+**Phase 0 status, honestly:** CI exists and gates hard (`.github/workflows/ci.yml`
+— clippy `-D warnings`, `cargo deny`, workspace tests, Rust↔Swift parity).
+There is **no smoke script, no pre-commit hooks (including no secret scan), and
+no debt ratchet** yet, and the red-test drill has not been run. Those are Phase 0
+items still open — do not read this section as a claim that the bootstrap is
+complete.
+
 ## What this is
 
 AISecurity is a "General AI Security Layer" — a macOS menu-bar app plus a cross-platform Rust detection engine that guards AI agents (Claude Code, OpenClaw, etc.) and the host machine. All detection logic (pattern matching, scoring, redaction, policy) lives in Rust and is shared by every consumer; the Swift app and the standalone binaries are thin front-ends over it.
