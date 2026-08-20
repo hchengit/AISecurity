@@ -1531,7 +1531,7 @@ struct ThreatsWindowView: View {
         Self.removeFromAlertsLog(matching: alertId(alert))
     }
 
-    /// Delete ALL visible alerts — archives alerts.log and clears dismissed
+    /// Delete ALL visible alerts — archives alerts.log and marks every alert dismissed.
     private func deleteAllAlerts() {
         let alertsPath = Self.alertsLogPath
         let archivePath = alertsPath + ".old"
@@ -1539,7 +1539,7 @@ struct ThreatsWindowView: View {
         try? fm.removeItem(atPath: archivePath)
         try? fm.moveItem(atPath: alertsPath, toPath: archivePath)
         fm.createFile(atPath: alertsPath, contents: nil)
-        dismissed.removeAll()
+        dismissed = Set(alerts.map { alertId($0) })
         Self.saveDismissed(dismissed)
     }
 
