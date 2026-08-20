@@ -42,12 +42,26 @@ record is what makes a change auditable after the fact: the reasoning, the
 receipts, and the diff arrive in one commit. Unchecked boxes are listed under
 "Skipped items" or the change is not done.
 
-**Phase 0 status, honestly:** CI exists and gates hard (`.github/workflows/ci.yml`
-— clippy `-D warnings`, `cargo deny`, workspace tests, Rust↔Swift parity).
-There is **no smoke script, no pre-commit hooks (including no secret scan), and
-no debt ratchet** yet, and the red-test drill has not been run. Those are Phase 0
-items still open — do not read this section as a claim that the bootstrap is
-complete.
+**Phase 0 status, honestly:**
+
+- CI gates hard (`.github/workflows/ci.yml` — clippy `-D warnings`,
+  `cargo deny`, workspace tests, Rust↔Swift parity).
+- `./scripts/smoke.sh` is the session-exit gate: tests, clippy, deny, parity,
+  the agent binaries, and live probes of the `:7459` policy service. It is
+  platform-aware (excludes `security-linux` on macOS, which needs libdbus) and
+  bypass-aware (an active `~/.mac-security/bypass` SKIPs the deny-path
+  assertion instead of failing it). `--fast` skips the slow Rust gates.
+- `./scripts/install-hooks.sh` installs a pre-commit secret scan that runs with
+  no external tooling, and calls `gitleaks` too when it is on PATH. It also
+  refuses a new `#[allow(...)]` without a justification comment.
+- **Still missing: the debt ratchet.** It needs baselines the owner agrees to,
+  so it is a named open item, not an omission.
+- Red-test drill: run 2026-08-19, gate confirmed RED then GREEN
+  (see `docs/build-records/2026-08-19-phase0-gates.md`).
+
+**The smoke gate is currently RED on `cargo deny`** — pre-existing advisories,
+one of them a live wasmtime vulnerability with no semver-compatible fix. The
+build record lists all four and what each needs. Do not paper over it.
 
 ## What this is
 

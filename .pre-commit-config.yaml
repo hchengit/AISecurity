@@ -1,0 +1,15 @@
+# Optional, stronger secret scanning. The repo's own hook
+# (scripts/hooks/pre-commit, installed by scripts/install-hooks.sh) runs with
+# no external dependencies and is the gate that is always on; this adds
+# gitleaks when the framework is installed:
+#
+#   pip install pre-commit && pre-commit install
+#
+# The repo hook also invokes gitleaks directly if the binary is on PATH, so
+# installing gitleaks alone is enough — this file is for teams that prefer the
+# pre-commit framework.
+repos:
+  - repo: https://github.com/gitleaks/gitleaks
+    rev: v8.18.4
+    hooks:
+      - id: gitleaks

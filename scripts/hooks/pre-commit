@@ -1,0 +1,74 @@
+#!/usr/bin/env bash
+# Pre-commit gate — secret scan + a cheap syntax check
+# (docs/BUILD-PROCEDURE.md, Phase 0).
+#
+# Self-contained ON PURPOSE. A .pre-commit-config.yaml that needs a binary
+# nobody installed is an inert gate, and an inert gate is the silent failure
+# Law 1 is about. This runs with nothing but bash and git. When gitleaks IS
+# installed it runs too, as the stronger scanner.
+#
+# Install:  ./scripts/install-hooks.sh      Bypass (announce it):  --no-verify
+set -uo pipefail
+FAIL=0
+red() { printf '\033[31m%s\033[0m\n' "$1"; }
+
+STAGED=$(git diff --cached --name-only --diff-filter=ACM)
+[ -z "$STAGED" ] && exit 0
+
+# ── 1. never commit an environment/secret file ──────────────────
+while IFS= read -r f; do
+  case "$f" in
+    .env|*/.env|*.env|*.pem|*.p12|*.keystore|id_rsa|*/id_rsa|*.key)
+      red "BLOCKED: $f looks like a secret/credential file"; FAIL=1 ;;
+  esac
+done <<< "$STAGED"
+
+# ── 2. scan staged CONTENT for secret-shaped strings ────────────
+# Patterns are deliberately narrow: a wide net that cries wolf gets bypassed,
+# and a bypassed gate is worse than no gate.
+PATTERNS='(-----BEGIN [A-Z ]*PRIVATE KEY-----)|(AKIA[0-9A-Z]{16})|(gh[pousr]_[A-Za-z0-9]{36,})|(xox[abprs]-[A-Za-z0-9-]{10,})|(sk-[A-Za-z0-9]{32,})|(PK[A-Z0-9]{16,})'  # pragma: allowlist secret
+while IFS= read -r f; do
+  [ -f "$f" ] || continue
+  case "$f" in *.lock|*.sum|package-lock.json|Cargo.lock) continue ;; esac
+  # An inline "pragma: allowlist secret" exempts THAT LINE. The exception is
+  # visible in the diff and reviewable, unlike a whole-file exemption or a
+  # habitual --no-verify. Security fixtures (a canonical AWS example key, a
+  # private-key header used as a scanner probe) are the legitimate case.
+  HIT=$(git diff --cached -U0 -- "$f" | grep -E '^\+' \
+        | grep -v 'pragma: allowlist secret' | grep -nEo "$PATTERNS" | head -3)
+  if [ -n "$HIT" ]; then
+    red "BLOCKED: possible secret in $f"; echo "$HIT" | sed 's/^/          /'; FAIL=1
+  fi
+  case "$f" in *example*|*sample*|*test*|*fixture*) ;; *)
+    ASSIGN=$(git diff --cached -U0 -- "$f" | grep -E '^\+' \
+      | grep -v 'pragma: allowlist secret' \
+      | grep -iEo '(api[_-]?key|secret|passwd|password|token)[[:space:]]*[=:][[:space:]]*["'"'"'][A-Za-z0-9/+_-]{24,}["'"'"']' | head -2)
+    if [ -n "$ASSIGN" ]; then
+      red "BLOCKED: hardcoded credential-looking assignment in $f"; echo "$ASSIGN" | sed 's/^/          /'; FAIL=1
+    fi ;;
+  esac
+done <<< "$STAGED"
+
+# ── 3. gitleaks, if the real thing is available ─────────────────
+if command -v gitleaks >/dev/null 2>&1; then
+  gitleaks protect --staged --redact -v >/tmp/gl.$$ 2>&1 || { red "BLOCKED: gitleaks found secrets"; tail -20 /tmp/gl.$$; FAIL=1; }
+  rm -f /tmp/gl.$$
+fi
+
+# ── 4. this is a security product: a fail-OPEN default is a defect ──
+# Cheap grep for the shapes that have historically degraded a gate quietly.
+# The real gates (clippy -D warnings, cargo deny, the parity suite) are CI's
+# job; this only catches the ones that read as innocuous in a diff.
+while IFS= read -r f; do
+  case "$f" in *.rs) ;; *) continue ;; esac
+  [ -f "$f" ] || continue
+  ADDED=$(git diff --cached -U0 -- "$f" | grep -E '^\+' || true)
+  if echo "$ADDED" | grep -qE '#\[allow\(' && ! echo "$ADDED" | grep -qE '//.*(because|reason|justif)'; then
+    red "BLOCKED: new #[allow(...)] in $f without a one-line justification comment"
+    red "         (CLAUDE.md: no new allow without a reason)"
+    FAIL=1
+  fi
+done <<< "$STAGED"
+
+[ "$FAIL" -eq 0 ] || { echo; red "pre-commit gate RED — commit refused."; echo "If this is a false positive, fix the pattern in scripts/hooks/pre-commit rather than habitually using --no-verify."; }
+exit "$FAIL"
