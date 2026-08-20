@@ -1,15 +1,22 @@
 name: CI
 
+# Sources/** and scripts/** are in the trigger paths because the ratchet job
+# counts Swift debt too — a gate that does not fire on a Swift-only change is
+# an inert gate.
 on:
   push:
     branches: [main]
     paths:
       - 'SecurityCore/**'
+      - 'Sources/**'
+      - 'scripts/**'
       - '.github/workflows/ci.yml'
   pull_request:
     branches: [main]
     paths:
       - 'SecurityCore/**'
+      - 'Sources/**'
+      - 'scripts/**'
       - '.github/workflows/ci.yml'
 
 env:
@@ -89,3 +96,14 @@ jobs:
 
       - name: cargo deny (advisories, bans, sources)
         run: cargo deny check advisories bans sources
+
+  ratchet:
+    name: Debt ratchet
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # Counted metrics that may only go DOWN. Baselines in
+      # scripts/ratchet-baseline.txt; a rise fails the build. Pure shell, so
+      # it needs no Rust or Swift toolchain and runs in seconds.
+      - name: Ratchet
+        run: ./scripts/ratchet.sh

@@ -141,6 +141,18 @@ else
   fi
 fi
 
+echo "── debt ratchet ───────────────────────────────────────────"
+if [ -x scripts/ratchet.sh ]; then
+  if scripts/ratchet.sh >/tmp/rt.$$ 2>&1; then
+    ok "ratchet — $(grep -E '^RATCHET' /tmp/rt.$$ | head -1)"
+  else
+    bad "ratchet — a counted metric rose"; grep -E 'RISEN' /tmp/rt.$$ | sed 's/^/      /'
+  fi
+  rm -f /tmp/rt.$$
+else
+  skip "scripts/ratchet.sh missing"
+fi
+
 echo "───────────────────────────────────────────────────────────"
 echo "RESULT: ${PASS} passed, ${FAIL} failed, ${SKIP} skipped — $( [ "$FAIL" -eq 0 ] && echo GREEN || echo RED )"
 [ "$FAIL" -eq 0 ]

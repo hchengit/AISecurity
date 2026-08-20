@@ -54,8 +54,16 @@ receipts, and the diff arrive in one commit. Unchecked boxes are listed under
 - `./scripts/install-hooks.sh` installs a pre-commit secret scan that runs with
   no external tooling, and calls `gitleaks` too when it is on PATH. It also
   refuses a new `#[allow(...)]` without a justification comment.
-- **Still missing: the debt ratchet.** It needs baselines the owner agrees to,
-  so it is a named open item, not an omission.
+- `./scripts/ratchet.sh` is the debt ratchet: counted metrics that may only go
+  DOWN, baselines committed in `scripts/ratchet-baseline.txt`, wired into both
+  CI and the smoke gate. A rise fails. When a number DROPS, run
+  `./scripts/ratchet.sh --update` **in the same change** and say which counter
+  moved — that is the mechanism, not bookkeeping.
+  What is deliberately NOT counted is as important as what is: totals that are
+  mostly legitimate (all `unsafe` lives in the FFI crate; 85% of `unwrap` is
+  inside `#[cfg(test)]`; 122 of 126 `print()` calls are a CLI printing) are
+  excluded, because a counter that blocks someone for a non-reason gets
+  ignored, and then it guards nothing.
 - Red-test drill: run 2026-08-19, gate confirmed RED then GREEN
   (see `docs/build-records/2026-08-19-phase0-gates.md`).
 
