@@ -34,6 +34,7 @@ final class EmailScanner: @unchecked Sendable {
     private var source: DispatchSourceFileSystemObject?
     private var fileDescriptor: Int32 = -1
     private var pollTimer: DispatchSourceTimer?
+    private var dailyResetTimer: DispatchSourceTimer?
     private var scannedFiles: [String: TimeInterval] = [:] // path → mtime (last scanned)
     /// Serializes every poll (startup sweep, file-watch, 60s timer) so they can't run
     /// concurrently — this both guards `scannedFiles`/counters against races and ensures the
@@ -293,6 +294,8 @@ final class EmailScanner: @unchecked Sendable {
         timer.resume()
         pollTimer = timer
 
+        scheduleMidnightReset()
+
         // Startup scan: delayed 30s to let Apple Mail sync new emails after wake/boot.
         // First launch → scan ALL, subsequent → scan last 30 days. Marked as backlog so
         // pre-existing junk/trash finds alert critical-only (no notification burst). Runs on
@@ -380,12 +383,34 @@ final class EmailScanner: @unchecked Sendable {
         source = nil
         pollTimer?.cancel()
         pollTimer = nil
+        dailyResetTimer?.cancel()
+        dailyResetTimer = nil
         if fileDescriptor >= 0 { close(fileDescriptor); fileDescriptor = -1 }
         isRunning = false
         // Re-arm the backlog sweep on the next start() (e.g. the daemon restarting us once FDA
         // is granted) so the initial sweep runs against real files rather than being skipped.
         backfillDone = false
         logger.info("\u{1F4E7} Email Scanner stopped")
+    }
+
+    /// Schedules a one-shot timer that fires at the next local midnight, resets the
+    /// "emails scanned today" counter, then re-arms itself for the following midnight.
+    private func scheduleMidnightReset() {
+        let cal = Calendar.current
+        guard let nextMidnight = cal.nextDate(after: Date(), matching: DateComponents(hour: 0, minute: 0, second: 0), matchingPolicy: .nextTime) else { return }
+        let delay = nextMidnight.timeIntervalSinceNow
+        let timer = DispatchSource.makeTimerSource(queue: scanQueue)
+        timer.schedule(deadline: .now() + delay, repeating: .never)
+        timer.setEventHandler { [weak self] in
+            guard let self, self.isRunning else { return }
+            self.emailsScanned = 0
+            self.logger.info("\u{1F4E7} Daily counter reset (new day)")
+            self.notifyStatus()
+            self.scheduleMidnightReset()
+        }
+        timer.resume()
+        dailyResetTimer?.cancel()
+        dailyResetTimer = timer
     }
 
     // MARK: - State Persistence
