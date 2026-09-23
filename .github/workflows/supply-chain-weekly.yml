@@ -1,0 +1,29 @@
+name: Supply-chain audit (weekly)
+
+# Advisories appear on their own clock, not the code's. ci.yml's cargo deny
+# only runs on a push that touches SecurityCore/**, so RUSTSEC-2026-0268/0269
+# (wasmtime) and 0285 (rustls) sat unseen for weeks until an unrelated push
+# on 2026-09-23 tripped it. Same pattern as rikurinode's dep-audit.yml. A
+# scheduled failure emails the repo owner: that is the alarm.
+
+on:
+  schedule:
+    - cron: '0 8 * * 2'   # Tuesdays 08:00 UTC
+  workflow_dispatch: {}
+
+jobs:
+  deny:
+    name: cargo deny (advisories, bans, sources)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    defaults:
+      run:
+        working-directory: SecurityCore
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install cargo-deny
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-deny
+      - name: cargo deny (advisories, bans, sources)
+        run: cargo deny check advisories bans sources
