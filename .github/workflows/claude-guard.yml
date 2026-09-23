@@ -1,0 +1,32 @@
+name: AI-session guard
+
+# docs/BUILD-PROCEDURE.md > Deterministic gates. The PreToolUse hook that
+# enforces secrets / git / protected-path / install / fix-lock policy on AI
+# sessions is code, so it is gated like code. Separate from ci.yml because
+# ci.yml only triggers on SecurityCore/** — a guard change must not skip CI.
+
+on:
+  push:
+    branches: [main]
+    paths: ['.claude/**', '.github/workflows/claude-guard.yml']
+  pull_request:
+    branches: [main]
+    paths: ['.claude/**', '.github/workflows/claude-guard.yml']
+
+jobs:
+  guard:
+    name: Guard policy tests (py${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    strategy:
+      matrix:
+        python-version: ["3.9", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Guard wired in .claude/settings.json
+        run: grep -q 'guard.py' .claude/settings.json
+      - name: Every config example + generic cases + failure modes
+        run: python -m unittest discover -s .claude/hooks -p 'test_*.py' -v

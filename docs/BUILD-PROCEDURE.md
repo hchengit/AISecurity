@@ -67,6 +67,17 @@ a product.
 
 ## The Per-Change Loop (every feature, every fix — no exceptions)
 
+### 0. INTENT + SPEC (before planning)
+- [ ] **Intent, in the owner's words, approved by the owner**: the problem,
+      the outcome, who/what it affects, open questions. The owner approves
+      the intent, not the code. A misunderstood intent built perfectly is
+      still a defect, and the most expensive kind.
+- [ ] **Spec**: requirements derived from the intent, the design, and policy
+      applied UP FRONT (the first principle, design rules, security gates),
+      not discovered in review. Concerns get flagged to the owner here.
+- [ ] Small change: one line each. Anything touching funds, auth, exec or
+      private data: never skipped.
+
 ### 1. PLAN (before writing code)
 - [ ] State the change in one sentence. If you can't, split it.
 - [ ] Identify the blast radius: which modules, which data, which auth/funds/
@@ -78,6 +89,9 @@ a product.
       already done — and one "dead" module that was load-bearing.)
 - [ ] Decide the verification BEFORE building: "I will know this works when
       ___." If the answer is "it compiles," you don't have a plan yet.
+- [ ] Name the files that change, the order of work, and the riskiest step.
+      The bar: a fresh session could build it from the plan alone. Review
+      later checks the diff against this plan.
 
 ### 2. BUILD
 - [ ] Smallest coherent increment; one concern per commit.
@@ -95,6 +109,11 @@ a product.
 
 ### 3. DEBUG (when something is wrong)
 - [ ] Reproduce first. A fix without a reproduction is a guess.
+- [ ] Write the failing test, SEE it fail, then engage the **fix-lock**
+      (`python3 .claude/hooks/guard.py fix-lock on <record>`). From then
+      on, test files and baselines are read-only to the AI session: the fix
+      goes in the code, not the test. Releasing it (`fix-lock off`) needs
+      the owner.
 - [ ] Read the actual error/log — not what you expect it to say. The clue is
       usually verbatim in there. (Case study: a "stuck" node was printing
       `bad-version-reduced_data` — a consensus rejection, not a hang; every
@@ -117,6 +136,10 @@ a product.
 - [ ] Regression guard: for any bug you just fixed, prove the test fails on
       the OLD code (revert briefly if needed). A guard that never failed
       guards nothing.
+- [ ] **Independent verification**: the `verifier` subagent
+      (`.claude/agents/verifier.md`) runs the gate, exercises the change and
+      its neighbours, and reports against the plan. It never fixes. The
+      builder does not grade its own work.
 
 ### 5. CLOSE OUT (end of every change/session)
 - [ ] Run the full gate: build → typecheck → unit tests → ratchet → smoke.
@@ -127,6 +150,8 @@ a product.
 - [ ] Update the knowledge layer IN THE SAME CHANGE: docs / RAG / runbooks /
       user-facing help for whatever behavior changed. Stale docs are silent
       failures too.
+- [ ] Review per `REVIEW.md` (bugs / security / plan-compliance passes).
+      Important findings are fixed or listed as Skipped.
 - [ ] Commit with a message that explains WHY (the incident, the class, the
       decision) — the diff already shows the what.
 - [ ] Deploy = build: one scripted path from source to running system. Never
@@ -248,6 +273,50 @@ After every drill: findings become fixes become tripwires (Law 5).
 - Multi-session hygiene: sessions do not commit each other's in-flight work;
   uncommitted changes older than a day get dispositioned (finished, stashed,
   or deleted), never left ambient.
+
+---
+
+## Deterministic gates: rules an AI session cannot skip
+
+Everything above is standard work, and standard work is advisory: an AI
+session can skip a checklist. So the rules whose violation is expensive or
+irreversible are enforced by a **PreToolUse hook**, not by prose.
+(Adopted from Anthropic's AI-Native SDLC Playbook, 2026-09-22: "skills are
+advisory; back critical policies with hooks.")
+
+`.claude/hooks/guard.py` (identical in every full-tier repo), wired by
+`.claude/settings.json`, policy in `.claude/hooks/guard-config.json`:
+
+| Rule | Decision |
+|---|---|
+| Reading a secret file (`.env`, keys, macaroons, cookies, tokens) | **deny**: contents never enter a transcript |
+| Any other command touching a secret file | **ask** |
+| `git push` force / delete / mirror / `+refspec` | **deny** |
+| `git push` to a protected branch (`main`) | **ask** |
+| Writing a protected path (constitution, procedure, CI, git hooks, the guard itself) | **ask** |
+| Funds / money-daemon / real-order commands (per-repo list) | **ask** |
+| Writing tests or baselines while the fix-lock is engaged | **deny** |
+| The guard itself fails (bad config, crash) | **ask**, with the error. Never fail-open |
+
+- **Ask means the owner decides**, in the UI, every time, including in auto
+  mode and even when the tool is pre-approved. Deny means no one does, from
+  inside a session. The owner runs it by hand.
+- **The guard is code, so it is gated like code**: `test_guard.py` replays
+  every worked example in the config plus generic and failure-mode cases.
+  CI runs it and smoke checks it is wired *and* green (absence of success
+  is the alarm).
+- **Bash matching is a tripwire, not a wall.** It catches the routine forms
+  and stays silent on routine work. A determined workaround gets past it,
+  which is why review and the owner remain above it.
+- **The lesson loop (Law 5, applied to the AI itself)**: a mistake the AI
+  makes twice becomes a line in CLAUDE.md. A rule it *breaks* becomes an
+  entry in `guard-config.json` with a worked example. Prose for judgement,
+  hooks for rules.
+- **Review policy lives in `REVIEW.md`** at the repo root: the passes,
+  what counts as Important, the nit cap, what not to report.
+- **Deferred, named:** CI evals that re-run real past tasks whenever
+  CLAUDE.md or `.claude/` changes. They cost API spend per run. Revisit when
+  a CLAUDE.md regression is observed twice.
 
 ---
 

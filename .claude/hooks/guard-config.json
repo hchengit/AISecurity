@@ -1,0 +1,66 @@
+{
+  "_doc": "Policy for .claude/hooks/guard.py (see docs/BUILD-PROCEDURE.md > Deterministic gates). Globs without '/' match the basename; with '/' they match the repo-relative path ('*' crosses '/'). Every example below is replayed by test_guard.py: add one whenever the policy changes. guard.py/test_guard.py are identical to rikurinode's; only this file differs. funds_patterns here guard system-level installs (this repo has no funds).",
+
+  "secret_globs": [".env", ".env.*", "*.env", "*.key", "*.pem", "*.p12", "*.cer",
+                   "*.mobileprovision", "*.keychain*", "*.token", "*.secret",
+                   "id_rsa*", "id_ed25519*", "id_ecdsa*", "credentials", "vault.db"],
+  "secret_allow_globs": ["*.example", "*.sample", "*.template", "*.pub"],
+
+  "protected_globs": ["docs/BUILD-PROCEDURE.md",
+                      ".claude/settings.json", ".claude/hooks/*",
+                      ".github/workflows/*", "scripts/hooks/*", "scripts/install-hooks.sh",
+                      "SecurityCore/deny.toml",
+                      "SecurityCore/crates/security-core/src/bypass.rs",
+                      "SecurityCore/crates/security-core/src/privacy_router.rs",
+                      "SecurityCore/crates/security-core/src/intent_verifier.rs",
+                      "SecurityCore/crates/security-core/src/command_policy.rs",
+                      "SecurityCore/crates/security-core/src/local_services.rs",
+                      "SecurityCore/crates/aisec-mcp/*",
+                      "SecurityCore/crates/intent-hook/*",
+                      "SecurityCore/crates/security-core-ffi/*"],
+
+  "protected_branches": ["main", "master"],
+
+  "test_globs": ["tests/*", "*/tests/*", "Tests/*", "*/Tests/*", "*_test.rs",
+                 "*/fixtures/*", "*baseline*"],
+
+  "funds_patterns": [
+    {"regex": "(^|[\\s/])(install|uninstall)\\.sh\\b",
+     "reason": "install/uninstall.sh rewires ~/.claude/settings.json, the MCP server and LaunchAgents on this machine — owner approves"},
+    {"regex": "\\blaunchctl\\b.*\\b(load|unload|bootstrap|bootout|kickstart|remove)\\b",
+     "reason": "changes a running LaunchAgent/daemon — owner approves"},
+    {"regex": "\\bclaude\\s+mcp\\s+(add|remove)\\b",
+     "reason": "changes the user's MCP server registration — owner approves"}
+  ],
+
+  "examples": [
+    {"tool": "Read", "input": {"file_path": ".env"}, "expect": "deny"},
+    {"tool": "Read", "input": {"file_path": "config.toml.example"}, "expect": "allow"},
+    {"tool": "Read", "input": {"file_path": "~/.mac-security/vault.db"}, "expect": "deny"},
+    {"tool": "Bash", "input": {"command": "grep -rn 'BEGIN RSA PRIVATE KEY' SecurityCore/crates"}, "expect": "allow"},
+
+    {"tool": "Edit", "input": {"file_path": "SecurityCore/crates/security-core/src/bypass.rs"}, "expect": "ask"},
+    {"tool": "Edit", "input": {"file_path": "SecurityCore/crates/intent-hook/src/main.rs"}, "expect": "ask"},
+    {"tool": "Edit", "input": {"file_path": "SecurityCore/deny.toml"}, "expect": "ask"},
+    {"tool": "Edit", "input": {"file_path": "scripts/hooks/pre-commit"}, "expect": "ask"},
+    {"tool": "Bash", "input": {"command": "./scripts/smoke.sh --fast"}, "expect": "allow"},
+    {"tool": "Edit", "input": {"file_path": "SecurityCore/crates/security-core/src/sensitive_data.rs"}, "expect": "allow"},
+    {"tool": "Read", "input": {"file_path": "SecurityCore/crates/security-core/src/bypass.rs"}, "expect": "allow"},
+
+    {"tool": "Bash", "input": {"command": "cd SecurityCore && cargo test --workspace"}, "expect": "allow"},
+    {"tool": "Bash", "input": {"command": "./build-rust.sh release && swift build -c release"}, "expect": "allow"},
+    {"tool": "Bash", "input": {"command": "./install.sh"}, "expect": "ask"},
+    {"tool": "Bash", "input": {"command": "bash uninstall.sh"}, "expect": "ask"},
+    {"tool": "Bash", "input": {"command": "launchctl kickstart -k gui/501/com.aisecurity"}, "expect": "ask"},
+    {"tool": "Bash", "input": {"command": "claude mcp add --scope user aisec /usr/local/bin/aisec-mcp"}, "expect": "ask"},
+
+    {"tool": "Bash", "input": {"command": "git push -u origin feat/tier3"}, "branch": "feat/tier3", "expect": "allow"},
+    {"tool": "Bash", "input": {"command": "git push"}, "branch": "main", "expect": "ask"},
+    {"tool": "Bash", "input": {"command": "git push --force"}, "branch": "feat/tier3", "expect": "deny"},
+
+    {"tool": "Edit", "input": {"file_path": "SecurityCore/crates/security-core/tests/cross_validation.rs"}, "lock": false, "expect": "allow"},
+    {"tool": "Edit", "input": {"file_path": "SecurityCore/crates/security-core/tests/cross_validation.rs"}, "lock": true, "expect": "deny"},
+    {"tool": "Bash", "input": {"command": "cd SecurityCore && cargo test -p security-core sensitive_data"}, "lock": true, "expect": "allow"},
+    {"tool": "Bash", "input": {"command": "./scripts/ratchet.sh --update > scripts/ratchet-baseline.txt"}, "lock": true, "expect": "deny"}
+  ]
+}

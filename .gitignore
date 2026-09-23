@@ -59,8 +59,13 @@ AISecurity.app/
 SecurityCore/target/
 CSecurityCore/lib/
 
-# Claude Code
-.claude/
+# Claude Code — per-developer EXCEPT the shared gates (docs/BUILD-PROCEDURE.md >
+# Deterministic gates). state/ (fix-lock) stays local.
+.claude/*
+!.claude/settings.json
+!.claude/hooks/
+!.claude/agents/
+.claude/hooks/__pycache__/
 
 # IDE
 .vscode/

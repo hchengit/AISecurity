@@ -42,6 +42,20 @@ record is what makes a change auditable after the fact: the reasoning, the
 receipts, and the diff arrive in one commit. Unchecked boxes are listed under
 "Skipped items" or the change is not done.
 
+**AI-native SDLC controls** (BUILD-PROCEDURE > Deterministic gates; adopted
+2026-09-22, same as rikurinode and Iceman):
+- Build records open with **Intent** (owner-approved) and **Spec** before the Plan.
+- `.claude/hooks/guard.py` enforces what prose can't: secret files, signing
+  material and the vault are unreadable, and force-push is refused. Edits to
+  crown-jewel code, `deny.toml`, CI, the pre-commit hook or the guard itself need
+  the owner's approval, as do `install.sh`, `launchctl` and `claude mcp` changes.
+  Don't route around a deny — ask the owner. Policy + worked examples:
+  `.claude/hooks/guard-config.json`.
+- Fixing a defect: write the failing test, see it fail, then
+  `python3 .claude/hooks/guard.py fix-lock on <record>`. From then on, tests and
+  the ratchet baseline are read-only.
+- Verify with the `verifier` subagent; review per [`REVIEW.md`](REVIEW.md).
+
 **Phase 0 status, honestly:**
 
 - CI gates hard (`.github/workflows/ci.yml` — clippy `-D warnings`,
@@ -64,6 +78,7 @@ receipts, and the diff arrive in one commit. Unchecked boxes are listed under
   inside `#[cfg(test)]`; 122 of 126 `print()` calls are a CLI printing) are
   excluded, because a counter that blocks someone for a non-reason gets
   ignored, and then it guards nothing.
+- The AI-session guard's tests run in `claude-guard.yml` and in the smoke gate.
 - Red-test drill: run 2026-08-19, gate confirmed RED then GREEN
   (see `docs/build-records/2026-08-19-phase0-gates.md`).
 

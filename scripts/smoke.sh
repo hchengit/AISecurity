@@ -153,6 +153,20 @@ else
   skip "scripts/ratchet.sh missing"
 fi
 
+echo "── AI-session guard ───────────────────────────────────────"
+# Absence of success is the alarm: if settings.json stops naming guard.py,
+# every hook-enforced rule has silently become advisory again.
+if grep -q 'guard.py' .claude/settings.json 2>/dev/null; then
+  if python3 -m unittest discover -s .claude/hooks -p 'test_*.py' >/tmp/gd.$$ 2>&1; then
+    ok "guard wired + $(grep -oE 'Ran [0-9]+ tests' /tmp/gd.$$) green"
+  else
+    bad "guard tests FAILING: $(grep -E '^(FAIL|ERROR):' /tmp/gd.$$ | head -1)"
+  fi
+  rm -f /tmp/gd.$$
+else
+  bad "guard NOT wired — .claude/settings.json does not run .claude/hooks/guard.py"
+fi
+
 echo "───────────────────────────────────────────────────────────"
 echo "RESULT: ${PASS} passed, ${FAIL} failed, ${SKIP} skipped — $( [ "$FAIL" -eq 0 ] && echo GREEN || echo RED )"
 [ "$FAIL" -eq 0 ]
