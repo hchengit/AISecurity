@@ -8,6 +8,8 @@
 
   "protected_globs": ["docs/BUILD-PROCEDURE.md",
                       ".claude/settings.json", ".claude/hooks/*",
+                      ".claude", ".claude/settings.local.json", ".claude/settings*", ".claude/hooks",
+                      ".claude/state", ".claude/state/*",
                       ".github/workflows/*", "scripts/hooks/*", "scripts/install-hooks.sh",
                       "SecurityCore/deny.toml",
                       "SecurityCore/crates/security-core/src/bypass.rs",
@@ -46,6 +48,14 @@
     {"tool": "Bash", "input": {"command": "./scripts/smoke.sh --fast"}, "expect": "allow"},
     {"tool": "Edit", "input": {"file_path": "SecurityCore/crates/security-core/src/sensitive_data.rs"}, "expect": "allow"},
     {"tool": "Read", "input": {"file_path": "SecurityCore/crates/security-core/src/bypass.rs"}, "expect": "allow"},
+    {"tool": "Read", "input": {"file_path": ".claude/settings.local.json"}, "expect": "allow"},
+    {"tool": "Write", "input": {"file_path": ".claude/settings.local.json"}, "expect": "ask"},
+    {"tool": "Bash", "input": {"command": "echo '{\"disableAllHooks\": true}' > .claude/settings.local.json"}, "expect": "ask"},
+    {"tool": "Bash", "input": {"command": "rm -rf .claude"}, "expect": "ask"},
+    {"tool": "Bash", "input": {"command": "rm -rf .claude/hooks"}, "expect": "ask"},
+    {"tool": "Bash", "input": {"command": "rm -rf .claude/state"}, "expect": "ask"},
+    {"tool": "Bash", "input": {"command": "rm -rf .claude/state/*"}, "expect": "ask"},
+    {"tool": "Bash", "input": {"command": "rm -f .claude/settings*"}, "expect": "ask"},
 
     {"tool": "Bash", "input": {"command": "cd SecurityCore && cargo test --workspace"}, "expect": "allow"},
     {"tool": "Bash", "input": {"command": "./build-rust.sh release && swift build -c release"}, "expect": "allow"},
