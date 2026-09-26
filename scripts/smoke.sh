@@ -1,4 +1,4 @@
-#!/usr/bin/env bash
+#!/bin/bash -p
 # AISecurity smoke test — the session-exit gate (docs/BUILD-PROCEDURE.md Phase 0).
 #
 # Probes every surface the system claims to provide with DISTINCT CONTENT
@@ -8,8 +8,20 @@
 #
 #   ./scripts/smoke.sh          full gate (tests + clippy + deny + probes)
 #   ./scripts/smoke.sh --fast   probes only, skip the slow Rust gates
+#
+# ISOLATE FROM THE CALLER'S ENVIRONMENT FIRST — before cd and before any
+# external command. The `-p` on the shebang additionally blocks BASH_ENV and
+# imported shell functions from taking effect before this line. Sourced by a
+# builtin-only path expansion (${0%/*}) so it needs no PATH lookup — PATH is
+# not trusted until the helper resets it. Scope: the documented
+# `./scripts/smoke.sh` entry point.
+. "${0%/*}/lib/harden-env.sh"
 set -uo pipefail
 cd "$(dirname "$0")/.."
+
+# The toolchain PATH is now set by lib/harden-env.sh (sourced above), which
+# owns the whole environment — not just a PATH prefix. A gate whose verdict
+# depends on which shell invoked it is not a gate.
 
 PASS=0; FAIL=0; SKIP=0
 ok()   { printf '  \033[32mPASS\033[0m  %s\n' "$1"; PASS=$((PASS+1)); }
@@ -45,16 +57,40 @@ echo "── Rust core ───────────────────
 if [ "$FAST" -eq 1 ]; then
   skip "cargo test / clippy / deny (--fast)"
 else
+  # PROVENANCE IS A VERDICT, NOT A FOOTNOTE. The configuration block echoes a
+  # rustc line for a human to read, but an echo cannot fail a gate — "rustc
+  # not found" scrolled past while the step below reported PASS. Name the
+  # cargo this run will actually use and fail when there is none, so a
+  # toolchain resolving somewhere unexpected (HOME is caller-controlled, so
+  # $HOME/.cargo/bin is not automatically the real one) lands in the
+  # transcript instead of passing silently. Residual noted in
+  # docs/build-records/2026-09-23-smoke-gate-fail-closed.md.
+  CARGO_BIN=$(command -v cargo 2>/dev/null || true)
+  if [ -z "$CARGO_BIN" ]; then
+    bad "toolchain — no cargo on PATH; the Rust gates below cannot run"
+  else
+    ok "toolchain — cargo=$CARGO_BIN rustc=$(rustc --version 2>/dev/null | awk '{print $2}' || echo '?')"
+  fi
   # AGGREGATE every result line — do not tail them. A run of 339 tests across
   # six crates showed as "7 passed" when this took the last line only, which
   # is precisely how a whole crate silently not running would look green.
-  TOUT=$( (cd SecurityCore && cargo test --workspace $WS_ARGS 2>&1) )
+  TOUT=$( (cd SecurityCore && cargo test --workspace $WS_ARGS 2>&1) ); TRC=$?
+  # COUNT THE SUITES BEFORE TRUSTING THE SUMMARY. awk's END block runs even on
+  # EMPTY input, so `grep | awk` over zero matches still prints a well-formed
+  # "0 suites, 0 passed, 0 failed" — which satisfied the old ' 0 failed' test
+  # and reported PASS for a run that never happened. A missing cargo did
+  # exactly that. The `[ -n "$TSUM" ]` guard meant to catch it could never
+  # fire, because TSUM is never empty. Absence of success is the alarm.
+  NSUITES=$(echo "$TOUT" | grep -cE '^test result:')
   TSUM=$(echo "$TOUT" | grep -E '^test result:' \
     | awk '{p+=$4; f+=$6; n++} END {printf "%d suites, %d passed, %d failed", n, p, f}')
-  if [ -n "$TSUM" ] && echo "$TSUM" | grep -q ' 0 failed' && ! echo "$TOUT" | grep -q 'FAILED'; then
+  if [ "$NSUITES" -eq 0 ]; then
+    bad "cargo test --workspace $WS_ARGS — NO suites ran (cargo exit $TRC); the gate could not run the tests it gates on"
+    echo "$TOUT" | grep -E 'command not found|^error' | head -4 | sed 's/^/        /'
+  elif [ "$TRC" -eq 0 ] && echo "$TSUM" | grep -q ' 0 failed' && ! echo "$TOUT" | grep -q 'FAILED'; then
     ok "cargo test --workspace $WS_ARGS — $TSUM"
   else
-    bad "cargo test --workspace $WS_ARGS — ${TSUM:-no result line}"
+    bad "cargo test --workspace $WS_ARGS — $TSUM (cargo exit $TRC)"
     echo "$TOUT" | grep -E '^(test .* FAILED|error)' | head -8 | sed 's/^/        /'
   fi
   if (cd SecurityCore && cargo clippy --workspace $WS_ARGS -- -D warnings >/tmp/cl.$$ 2>&1); then
