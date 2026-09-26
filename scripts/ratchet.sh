@@ -31,6 +31,28 @@ BASE="scripts/ratchet-baseline.txt"
 RS_FILES() { find SecurityCore/crates -name '*.rs' -not -path '*/target/*'; }
 SW_FILES() { find Sources -name '*.swift' 2>/dev/null; }
 
+# EMPTY DISCOVERY IS A MEASUREMENT FAILURE, NOT PROGRESS. Every counter below
+# derives from RS_FILES/SW_FILES. If a crate directory is renamed or moved and
+# discovery finds nothing, each counter reads 0 — which is BELOW baseline, so
+# the ratchet would report "a counter improved" and, outside --check-only,
+# overwrite the baseline with zeros, erasing the mechanism it exists to be.
+# This repo is a Rust workspace with a Swift app; zero of either is impossible
+# in a healthy tree. Assert it before trusting any count, in every mode.
+# (Law 4 — alert on the absence of success.)
+assert_discovery() {
+  local rs sw
+  rs=$(RS_FILES | grep -c .)
+  sw=$(SW_FILES | grep -c .)
+  if [ "$rs" -eq 0 ] || [ "$sw" -eq 0 ]; then
+    echo "RATCHET: FAIL — file discovery found rs=$rs swift=$sw." >&2
+    echo "  A count cannot be trusted when discovery is empty: a 0 here means" >&2
+    echo "  'could not measure' (a moved/renamed source tree?), not 'debt gone'." >&2
+    echo "  Baseline left untouched. Fix discovery, then re-run." >&2
+    exit 1
+  fi
+}
+assert_discovery
+
 count_allow()      { RS_FILES | tr '\n' '\0' | xargs -0 grep -h '#\[allow(' 2>/dev/null | wc -l | tr -d ' '; }
 count_unsafe_out() { RS_FILES | grep -v 'security-core-ffi' | tr '\n' '\0' | xargs -0 grep -h 'unsafe' 2>/dev/null | wc -l | tr -d ' '; }
 # grep -c prints 0 AND exits 1 when there are no matches, so `|| echo 0`
