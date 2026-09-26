@@ -1,4 +1,4 @@
-#!/usr/bin/env bash
+#!/bin/bash -p
 # AISecurity smoke test — the session-exit gate (docs/BUILD-PROCEDURE.md Phase 0).
 #
 # Probes every surface the system claims to provide with DISTINCT CONTENT
@@ -8,16 +8,20 @@
 #
 #   ./scripts/smoke.sh          full gate (tests + clippy + deny + probes)
 #   ./scripts/smoke.sh --fast   probes only, skip the slow Rust gates
+#
+# ISOLATE FROM THE CALLER'S ENVIRONMENT FIRST — before cd and before any
+# external command. The `-p` on the shebang additionally blocks BASH_ENV and
+# imported shell functions from taking effect before this line. Sourced by a
+# builtin-only path expansion (${0%/*}) so it needs no PATH lookup — PATH is
+# not trusted until the helper resets it. Scope: the documented
+# `./scripts/smoke.sh` entry point.
+. "${0%/*}/lib/harden-env.sh"
 set -uo pipefail
 cd "$(dirname "$0")/.."
 
-# RESOLVE OUR OWN TOOLCHAIN. build-rust.sh does this too, but its export dies
-# with its process, so a shell that never had ~/.cargo/bin on PATH runs
-# build-rust.sh green and then this gate blind: clippy reports "command not
-# found" as a FAIL and cargo-deny reports itself "not installed" as a SKIP.
-# Those are toolchain artifacts wearing the costume of real results. A gate
-# whose verdict depends on which shell invoked it is not a gate.
-export PATH="$HOME/.cargo/bin:$PATH"
+# The toolchain PATH is now set by lib/harden-env.sh (sourced above), which
+# owns the whole environment — not just a PATH prefix. A gate whose verdict
+# depends on which shell invoked it is not a gate.
 
 PASS=0; FAIL=0; SKIP=0
 ok()   { printf '  \033[32mPASS\033[0m  %s\n' "$1"; PASS=$((PASS+1)); }
