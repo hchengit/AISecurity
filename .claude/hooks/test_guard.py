@@ -62,10 +62,15 @@ class GenericPolicy(unittest.TestCase):
         self.assertEqual(verdict("Bash", {"command": "git fetch && git push -fu origin x"}), "deny")
 
     def test_guard_protects_itself(self):
-        for p in (".claude/settings.json", ".claude/hooks/guard.py", ".claude/hooks/guard-config.json"):
-            self.assertEqual(verdict("Edit", {"file_path": p}), "ask", p)
+        # The permission settings are protected in every repo.
+        self.assertEqual(verdict("Edit", {"file_path": ".claude/settings.json"}), "ask")
         self.assertEqual(verdict("Bash", {"command": "echo '{}' > .claude/settings.json"}), "ask")
         self.assertEqual(verdict("Read", {"file_path": ".claude/hooks/guard.py"}), "allow")
+        # The guard's own files follow this repo's policy: protected unless the
+        # owner chose otherwise (rikurinode, 2026-09-26).
+        for p in (".claude/hooks/guard.py", ".claude/hooks/guard-config.json"):
+            want = "ask" if guard.matches(p, CFG["protected_globs"]) else "allow"
+            self.assertEqual(verdict("Edit", {"file_path": p}), want, p)
 
     def test_fix_lock(self):
         t = {"file_path": "tests/test_something.py"}
@@ -74,9 +79,11 @@ class GenericPolicy(unittest.TestCase):
         self.assertEqual(verdict("Bash", {"command": "echo x >> tests/test_something.py"}, lock=True), "deny")
         self.assertEqual(verdict("Bash", {"command": "git checkout -- tests/test_something.py"}, lock=True), "deny")
         self.assertEqual(verdict("Bash", {"command": "cat tests/test_something.py"}, lock=True), "allow")
-        # engaging is free; releasing is the owner's call
+        # engaging is free; releasing is the owner's call unless this repo's
+        # owner chose otherwise (fix_lock_release_needs_owner: false)
         self.assertEqual(verdict("Bash", {"command": "python3 .claude/hooks/guard.py fix-lock on docs/build-records/x.md"}), "allow")
-        self.assertEqual(verdict("Bash", {"command": "python3 .claude/hooks/guard.py fix-lock off"}), "ask")
+        release = "ask" if CFG.get("fix_lock_release_needs_owner", True) else "allow"
+        self.assertEqual(verdict("Bash", {"command": "python3 .claude/hooks/guard.py fix-lock off"}), release)
         self.assertEqual(verdict("Bash", {"command": "rm -f .claude/state/fix-lock"}), "ask")
         self.assertEqual(verdict("Write", {"file_path": ".claude/state/fix-lock"}), "allow")
         self.assertEqual(verdict("Edit", {"file_path": ".claude/state/fix-lock"}), "ask")
@@ -160,6 +167,30 @@ class FailureModes(unittest.TestCase):
         with tempfile.TemporaryDirectory() as root:
             cfg = self._cfg_with(root, None)
             self.assertEqual(guard.fix_lock_cli(["on", "docs/build-records/x.md"], root, cfg), 0)
+
+    # Owner, 2026-09-26: a release may be free, but never invisible.
+    def test_every_release_is_logged(self):
+        with tempfile.TemporaryDirectory() as root:
+            cfg = self._cfg_with(root, None)
+            guard.fix_lock_cli(["on", "docs/build-records/a.md"], root, cfg)
+            guard.fix_lock_cli(["off"], root, cfg)
+            guard.fix_lock_cli(["on", "docs/build-records/b.md"], root, cfg)
+            guard.fix_lock_cli(["off"], root, cfg)
+            with open(os.path.join(root, guard.LOCK_LOG_REL)) as f:
+                rows = [json.loads(line) for line in f]
+            self.assertEqual([r["record"] for r in rows], ["docs/build-records/a.md", "docs/build-records/b.md"])
+            self.assertTrue(all(r.get("engaged_since") and r.get("released_at") for r in rows))
+
+    def test_release_policy_must_be_a_boolean(self):
+        with tempfile.TemporaryDirectory() as root:
+            path = self._cfg_with(root, None)
+            with open(path) as f:
+                cfg = json.load(f)
+            cfg["fix_lock_release_needs_owner"] = "no"
+            with open(path, "w") as f:
+                json.dump(cfg, f)
+            with self.assertRaises(ValueError):
+                guard.load_config(path)
 
     def test_fix_lock_malformed_preflight_refuses(self):
         with tempfile.TemporaryDirectory() as root:

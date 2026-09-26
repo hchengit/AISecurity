@@ -34,6 +34,8 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(os.path.dirname(HERE))
 CONFIG_PATH = os.path.join(HERE, "guard-config.json")
 LOCK_REL = ".claude/state/fix-lock"
+# Every release, one JSON line: a release may be free (the owner's choice) but never invisible.
+LOCK_LOG_REL = ".claude/state/fix-lock.log"
 
 PATH_TOOLS = {"Read": "file_path", "Edit": "file_path", "Write": "file_path",
               "MultiEdit": "file_path", "NotebookEdit": "notebook_path", "Grep": "path"}
@@ -73,6 +75,8 @@ def load_config(path: str = CONFIG_PATH) -> dict:
             isinstance(cmd, list) and cmd and all(isinstance(w, str) and w for w in cmd) for cmd in pre)):
         raise ValueError("guard-config.json: 'fix_lock_preflight' must be a list of argv lists, e.g. "
                          '[["node", "scripts/quality-ratchet.mjs"]]')
+    if not isinstance(cfg.get("fix_lock_release_needs_owner", True), bool):
+        raise ValueError("guard-config.json: 'fix_lock_release_needs_owner' must be true or false")
     return cfg
 
 
@@ -281,7 +285,8 @@ def bash_hits(cmd: str, cwd: str, cfg: dict, root: str, lock_present: bool, bran
             d, r = git_push_verdict(args, cwd, cfg, branch_fn)
             if d != "allow":
                 hits.append((d, r))
-        if "guard.py" in seg and "fix-lock" in words and "off" in words:
+        if ("guard.py" in seg and "fix-lock" in words and "off" in words
+                and cfg.get("fix_lock_release_needs_owner", True)):
             hits.append(("ask", "releasing the fix-lock ends the fix phase — owner approves"))
         for target in write_targets(seg):
             rel = rel_to_root(target, cwd, root)
@@ -353,6 +358,14 @@ def fix_lock_cli(args: list, root: str = ROOT, config_path: str = CONFIG_PATH) -
         return 0
     if args == ["off"]:
         if os.path.exists(lock):
+            try:
+                with open(lock) as f:
+                    held = json.load(f)
+            except (OSError, ValueError):
+                held = {}
+            with open(os.path.join(root, LOCK_LOG_REL), "a") as f:
+                f.write(json.dumps({"record": held.get("record"), "engaged_since": held.get("since"),
+                                    "released_at": time.strftime("%Y-%m-%dT%H:%M:%S%z")}) + "\n")
             os.remove(lock)
         print("fix-lock released")
         return 0
