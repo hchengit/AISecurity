@@ -14,16 +14,17 @@
 # asserts it reads RED and names zero suites. On the pre-fix smoke.sh this
 # test FAILS, which is the point.
 #
-#   ./scripts/test-smoke.sh                     test scripts/smoke.sh
-#   ./scripts/test-smoke.sh scripts/.other.sh   test another copy (A/B drills)
+#   scripts/tests/test-smoke.sh                 test scripts/smoke.sh
+#   scripts/tests/test-smoke.sh scripts/x.sh    test another copy (A/B drills)
 #
-# NOT run by smoke.sh itself — that would recurse. Wire it into CI beside the
-# guard tests (.github/workflows/claude-guard.yml) — owner-approved change.
+# NOT run by smoke.sh itself — that would recurse. Runs in CI via the
+# gate-selftests job in .github/workflows/ci.yml (NOT claude-guard.yml, which
+# only fires on .claude/** and so would miss a scripts/smoke.sh change).
 set -uo pipefail
-cd "$(dirname "$0")/.."
+cd "$(dirname "$0")/../.."
 
 TARGET="${1:-scripts/smoke.sh}"
-[ -x "$TARGET" ] || { echo "FAIL  no executable target at $TARGET"; exit 1; }
+[ -f "$TARGET" ] || { echo "FAIL  no target at $TARGET"; exit 1; }
 
 SANDBOX_HOME=$(mktemp -d)
 trap 'rm -rf "$SANDBOX_HOME"' EXIT
@@ -32,8 +33,12 @@ echo "== smoke-gate regression test =="
 echo "   target        $TARGET"
 echo "   condition     toolchain absent (empty HOME, PATH without cargo)"
 
+# Invoke via `bash "$TARGET"`, not "./$TARGET": the latter mangles an absolute
+# A/B-drill argument into ".//abs/path" and silently fails to find it —
+# reporting a FALSE FAIL, the same "verdict without running the thing" class
+# these self-tests exist to catch. bash resolves relative and absolute alike.
 OUT=$(env HOME="$SANDBOX_HOME" PATH=/usr/bin:/bin:/usr/sbin:/sbin \
-        "./$TARGET" 2>&1); RC=$?
+        bash "$TARGET" 2>&1); RC=$?
 TESTLINE=$(echo "$OUT" | grep -E 'cargo test --workspace' | head -1 | sed 's/\x1b\[[0-9;]*m//g; s/^ *//')
 
 FAILED=0
