@@ -68,6 +68,11 @@ def load_config(path: str = CONFIG_PATH) -> dict:
         re.compile(p["regex"])
         if not p.get("reason"):
             raise ValueError("guard-config.json: funds pattern without a reason: %r" % p)
+    pre = cfg.get("fix_lock_preflight", [])
+    if not (isinstance(pre, list) and all(
+            isinstance(cmd, list) and cmd and all(isinstance(w, str) and w for w in cmd) for cmd in pre)):
+        raise ValueError("guard-config.json: 'fix_lock_preflight' must be a list of argv lists, e.g. "
+                         '[["node", "scripts/quality-ratchet.mjs"]]')
     return cfg
 
 
@@ -309,9 +314,38 @@ def run_hook(stdin_text: str, config_path: str = CONFIG_PATH, root: str = ROOT) 
                                    "permissionDecisionReason": " | ".join(reasons)}}
 
 
-def fix_lock_cli(args: list, root: str = ROOT) -> int:
+def fix_lock_preflight(root: str, config_path: str) -> str | None:
+    """Run the repo's pre-lock checks; the reason to refuse, or None to go ahead.
+
+    Lesson gate (2026-09-25): twice a quality-ratchet breach in a new test was
+    found only after the lock was engaged, and fixing the test then needed the
+    owner's `fix-lock off`. Checks listed in guard-config.json's optional
+    `fix_lock_preflight` (argv lists, run from the repo root, no shell) must
+    pass before tests become read-only.
+    """
+    try:
+        cfg = load_config(config_path)
+    except Exception as e:  # noqa: BLE001 — any config problem refuses, with the reason
+        return "cannot read %s: %s" % (config_path, e)
+    for argv in cfg.get("fix_lock_preflight", []):
+        try:
+            proc = subprocess.run(argv, cwd=root, capture_output=True, text=True, timeout=600)
+        except (OSError, subprocess.TimeoutExpired) as e:
+            return "preflight %s could not run: %s" % (" ".join(argv), e)
+        if proc.returncode != 0:
+            tail = "\n".join((proc.stdout + proc.stderr).strip().splitlines()[-8:])
+            return "preflight %s failed (exit %d):\n%s" % (" ".join(argv), proc.returncode, tail)
+    return None
+
+
+def fix_lock_cli(args: list, root: str = ROOT, config_path: str = CONFIG_PATH) -> int:
     lock = os.path.join(root, LOCK_REL)
     if args[:1] == ["on"] and len(args) == 2:
+        refused = fix_lock_preflight(root, config_path)
+        if refused:
+            print("fix-lock NOT engaged — %s\nNothing was changed. Fix it first, then engage." % refused,
+                  file=sys.stderr)
+            return 1
         os.makedirs(os.path.dirname(lock), exist_ok=True)
         with open(lock, "w") as f:
             json.dump({"record": args[1], "since": time.strftime("%Y-%m-%dT%H:%M:%S%z")}, f)

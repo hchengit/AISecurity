@@ -118,13 +118,56 @@ class FailureModes(unittest.TestCase):
 
     def test_fix_lock_cli_roundtrip(self):
         with tempfile.TemporaryDirectory() as root:
-            self.assertEqual(guard.fix_lock_cli(["on", "docs/build-records/x.md"], root), 0)
+            # An explicit config without preflight: the repo's own may carry
+            # checks that only run in the real repo root.
+            cfg = self._cfg_with(root, None)
+            self.assertEqual(guard.fix_lock_cli(["on", "docs/build-records/x.md"], root, cfg), 0)
             lock = os.path.join(root, guard.LOCK_REL)
             with open(lock) as f:
                 self.assertEqual(json.load(f)["record"], "docs/build-records/x.md")
             self.assertEqual(guard.fix_lock_cli(["off"], root), 0)
             self.assertFalse(os.path.exists(lock))
             self.assertEqual(guard.fix_lock_cli(["bogus"], root), 2)
+
+    # Lesson gate (2026-09-25): twice a ratchet breach was found only AFTER the
+    # lock was engaged, and fixing the test then cost the owner a release. A
+    # repo can name checks that must pass before the lock may engage.
+    def _cfg_with(self, root: str, preflight) -> str:
+        cfg = json.loads(json.dumps(CFG))
+        cfg.pop("fix_lock_preflight", None)
+        if preflight is not None:
+            cfg["fix_lock_preflight"] = preflight
+        path = os.path.join(root, "guard-config.json")
+        with open(path, "w") as f:
+            json.dump(cfg, f)
+        return path
+
+    def test_fix_lock_preflight_failing_refuses(self):
+        with tempfile.TemporaryDirectory() as root:
+            cfg = self._cfg_with(root, [[sys.executable, "-c", "import sys; sys.exit(3)"]])
+            self.assertEqual(guard.fix_lock_cli(["on", "docs/build-records/x.md"], root, cfg), 1)
+            self.assertFalse(os.path.exists(os.path.join(root, guard.LOCK_REL)))
+
+    def test_fix_lock_preflight_runs_in_repo_root_and_passes(self):
+        with tempfile.TemporaryDirectory() as root:
+            marker = os.path.join(root, "ran-here")
+            cfg = self._cfg_with(root, [[sys.executable, "-c", "open('ran-here','w').close()"]])
+            self.assertEqual(guard.fix_lock_cli(["on", "docs/build-records/x.md"], root, cfg), 0)
+            self.assertTrue(os.path.exists(marker))
+            self.assertTrue(os.path.exists(os.path.join(root, guard.LOCK_REL)))
+
+    def test_fix_lock_without_preflight_is_unchanged(self):
+        with tempfile.TemporaryDirectory() as root:
+            cfg = self._cfg_with(root, None)
+            self.assertEqual(guard.fix_lock_cli(["on", "docs/build-records/x.md"], root, cfg), 0)
+
+    def test_fix_lock_malformed_preflight_refuses(self):
+        with tempfile.TemporaryDirectory() as root:
+            cfg = self._cfg_with(root, "node scripts/quality-ratchet.mjs")  # a string, not argv lists
+            self.assertNotEqual(guard.fix_lock_cli(["on", "docs/build-records/x.md"], root, cfg), 0)
+            self.assertFalse(os.path.exists(os.path.join(root, guard.LOCK_REL)))
+            with self.assertRaises(ValueError):
+                guard.load_config(cfg)
 
 
 if __name__ == "__main__":
