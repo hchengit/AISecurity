@@ -107,3 +107,33 @@ jobs:
       # it needs no Rust or Swift toolchain and runs in seconds.
       - name: Ratchet
         run: ./scripts/ratchet.sh --check-only
+
+  gate-selftests:
+    name: Gate self-tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      # The gates test the code; these test the GATES. Each one drives a gate
+      # with a deliberately broken input (a toolchain that cannot run tests; a
+      # source tree discovery cannot see) and asserts the gate fails closed
+      # rather than reporting a green it did not earn. Both defects shipped
+      # once (see docs/build-records/2026-09-23-* and 2026-09-25-ratchet-*);
+      # this job is what stops them coming back. Pure shell over a throwaway
+      # tree — no Rust/Swift toolchain, no cache, runs in seconds.
+      - name: Run every gate self-test
+        run: |
+          shopt -s nullglob
+          tests=(scripts/tests/*.sh)
+          # A glob that matched nothing would let this job pass having tested
+          # nothing — the exact failure the self-tests themselves guard against.
+          if [ ${#tests[@]} -eq 0 ]; then
+            echo "::error::no gate self-tests found under scripts/tests/ — the job would pass vacuously"
+            exit 1
+          fi
+          rc=0
+          for t in "${tests[@]}"; do
+            echo "── $t ──"
+            bash "$t" || { echo "::error::$t FAILED"; rc=1; }
+          done
+          exit $rc
