@@ -3,13 +3,19 @@
 
 CLAUDE.md, skills, and the procedure are advisory: an AI session can skip
 them. This file is not. It is IDENTICAL in every full-tier repo (rikurinode,
-Iceman, AISecurity); each repo's policy lives beside it in guard-config.json,
+Iceman, AISecurity, Rikuri-PI); each repo's policy lives beside it in guard-config.json,
 including worked examples that test_guard.py replays.
 
 Decisions: "deny" (refused; the reason goes to the agent), "ask" (the owner
 must approve in the UI), or silent allow. Any internal failure (bad config,
 crash) returns ASK with the error: the guard never fails open and never
 bricks a session.
+
+Profiles (owner, 2026-09-27): "stable" (the default) asks at every gate.
+"development" asks only before money moves (funds patterns marked
+"always_ask") and before touching a secret file; every other ask becomes an
+allow, logged to .claude/state/guard-relaxed.log. Denies never change.
+Switch with `guard.py profile development|stable`; loosening asks the owner.
 
 Bash matching is a tripwire, not a wall: it reads the command segment by
 segment (split on ; && || | and newlines, recursing into sh -c), so routine
@@ -18,6 +24,7 @@ is what code review and the owner are for.
 
 Hook:  stdin = PreToolUse JSON  (wired in .claude/settings.json)
 CLI:   guard.py fix-lock on <build-record> | off | status
+       guard.py profile [development | stable]
 """
 from __future__ import annotations
 
@@ -36,6 +43,10 @@ CONFIG_PATH = os.path.join(HERE, "guard-config.json")
 LOCK_REL = ".claude/state/fix-lock"
 # Every release, one JSON line: a release may be free (the owner's choice) but never invisible.
 LOCK_LOG_REL = ".claude/state/fix-lock.log"
+# An ask the development profile let through, one JSON line each: relaxed, never invisible.
+RELAXED_LOG_REL = ".claude/state/guard-relaxed.log"
+PROFILE_LOG_REL = ".claude/state/profile.log"
+PROFILES = ("stable", "development")
 
 PATH_TOOLS = {"Read": "file_path", "Edit": "file_path", "Write": "file_path",
               "MultiEdit": "file_path", "NotebookEdit": "notebook_path", "Grep": "path"}
@@ -70,6 +81,10 @@ def load_config(path: str = CONFIG_PATH) -> dict:
         re.compile(p["regex"])
         if not p.get("reason"):
             raise ValueError("guard-config.json: funds pattern without a reason: %r" % p)
+        if not isinstance(p.get("always_ask", False), bool):
+            raise ValueError("guard-config.json: 'always_ask' must be true or false: %r" % p)
+    if cfg.get("profile", "stable") not in PROFILES:
+        raise ValueError("guard-config.json: 'profile' must be one of %s" % ", ".join(PROFILES))
     pre = cfg.get("fix_lock_preflight", [])
     if not (isinstance(pre, list) and all(
             isinstance(cmd, list) and cmd and all(isinstance(w, str) and w for w in cmd) for cmd in pre)):
@@ -232,8 +247,12 @@ def current_branch(cwd: str) -> str:
 # ── decision ────────────────────────────────────────────────────────────────
 
 def decide(event: dict, cfg: dict, root: str = ROOT, lock_present: bool | None = None,
-           branch_fn=current_branch) -> tuple:
-    """Return (decision, [reasons]). Pure apart from branch_fn / lock lookup."""
+           branch_fn=current_branch, relaxed: list | None = None) -> tuple:
+    """Return (decision, [reasons]). Pure apart from branch_fn / lock lookup.
+
+    Each hit is (decision, reason, keep). `keep` marks an ask that stays in
+    the development profile (money moves, secrets). Asks development lets
+    through are appended to `relaxed`, so the caller can log them."""
     tool = event.get("tool_name", "")
     tin = event.get("tool_input") or {}
     cwd = event.get("cwd") or root
@@ -248,23 +267,30 @@ def decide(event: dict, cfg: dict, root: str = ROOT, lock_present: bool | None =
             if is_secret(raw, cfg):
                 hits.append(("deny" if tool in READ_TOOLS else "ask",
                              "%s is a secret file — its contents must not enter the transcript; "
-                             "ask the owner for the one value you need" % raw))
+                             "ask the owner for the one value you need" % raw, True))
             if rel is not None and tool not in READ_TOOLS:
                 if rel == LOCK_REL:
                     if tool != "Write":
-                        hits.append(("ask", "editing the fix-lock ends the fix phase — owner approves"))
+                        hits.append(("ask", "editing the fix-lock ends the fix phase — owner approves", False))
                 elif matches(rel, cfg["protected_globs"]):
-                    hits.append(("ask", "%s is protected (constitution / gate) — owner approves every change" % rel))
+                    hits.append(("ask", "%s is protected (constitution / gate) — owner approves every change" % rel,
+                                 False))
                 if lock_present and matches(rel, cfg["test_globs"]):
                     hits.append(("deny", "fix-lock is engaged: %s is a test/baseline. Fix the code, not the "
-                                         "test (release with `guard.py fix-lock off`, owner approves)" % rel))
+                                         "test (release with `guard.py fix-lock off`, owner approves)" % rel,
+                                 True))
     elif tool == "Bash":
         hits += bash_hits(tin.get("command", ""), cwd, cfg, root, lock_present, branch_fn)
 
+    if cfg.get("profile", "stable") == "development":
+        let_through = [r for d, r, keep in hits if d == "ask" and not keep]
+        if relaxed is not None:
+            relaxed += let_through
+        hits = [h for h in hits if not (h[0] == "ask" and not h[2])]
     if not hits:
         return "allow", []
     worst = max(hits, key=lambda h: RANK[h[0]])[0]
-    return worst, [r for d, r in hits if d == worst]
+    return worst, [r for d, r, _keep in hits if d == worst]
 
 
 def bash_hits(cmd: str, cwd: str, cfg: dict, root: str, lock_present: bool, branch_fn) -> list:
@@ -278,40 +304,64 @@ def bash_hits(cmd: str, cwd: str, cfg: dict, root: str, lock_present: bool, bran
         secrets = [t for t in file_args(verb, args) + redirect_targets(seg) if is_secret(t, cfg)]
         if secrets and verb not in METADATA_VERBS:
             if verb in READER_VERBS:
-                hits.append(("deny", "`%s` would print secret file %s into the transcript" % (verb, secrets[0])))
+                hits.append(("deny", "`%s` would print secret file %s into the transcript" % (verb, secrets[0]),
+                             True))
             else:
-                hits.append(("ask", "command touches secret file %s" % secrets[0]))
+                hits.append(("ask", "command touches secret file %s" % secrets[0], True))
         if verb == "git":
             d, r = git_push_verdict(args, cwd, cfg, branch_fn)
             if d != "allow":
-                hits.append((d, r))
+                hits.append((d, r, False))
         if ("guard.py" in seg and "fix-lock" in words and "off" in words
                 and cfg.get("fix_lock_release_needs_owner", True)):
-            hits.append(("ask", "releasing the fix-lock ends the fix phase — owner approves"))
+            hits.append(("ask", "releasing the fix-lock ends the fix phase — owner approves", False))
+        if ("guard.py" in seg and "profile" in words and "development" in words
+                and cfg.get("profile", "stable") != "development"):
+            hits.append(("ask", "switching the guard to 'development' stops most of its asks — owner "
+                                "approves (switching back to stable is always free)", True))
         for target in write_targets(seg):
             rel = rel_to_root(target, cwd, root)
             if rel is None:
                 continue
             if rel == LOCK_REL or matches(rel, cfg["protected_globs"]):
-                hits.append(("ask", "command writes protected path %s — owner approves" % rel))
+                hits.append(("ask", "command writes protected path %s — owner approves" % rel, False))
             if lock_present and matches(rel, cfg["test_globs"]):
                 hits.append(("deny", "fix-lock is engaged: command writes test/baseline %s. "
-                                     "Fix the code, not the test" % rel))
+                                     "Fix the code, not the test" % rel, True))
         for p in cfg["funds_patterns"]:
             if re.search(p["regex"], seg):
-                hits.append(("ask", p["reason"]))
+                hits.append(("ask", p["reason"], p.get("always_ask", False)))
     return hits
 
 
 # ── entry points ────────────────────────────────────────────────────────────
 
+def log_relaxed(root: str, event: dict, reasons: list) -> None:
+    """Record an ask the development profile let through. Never raises."""
+    tin = event.get("tool_input") or {}
+    what = tin.get("command") if event.get("tool_name") == "Bash" else tin.get(PATH_TOOLS.get(event.get("tool_name"), ""))
+    try:
+        path = os.path.join(root, RELAXED_LOG_REL)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "a") as f:
+            f.write(json.dumps({"at": time.strftime("%Y-%m-%dT%H:%M:%S%z"), "tool": event.get("tool_name"),
+                                "why": reasons, "what": str(what or "")[:300]}) + "\n")
+    except OSError:
+        pass
+
+
 def run_hook(stdin_text: str, config_path: str = CONFIG_PATH, root: str = ROOT) -> dict | None:
     """Hook output dict, or None for a silent allow. Never raises."""
+    relaxed: list = []
+    event: dict = {}
     try:
-        decision, reasons = decide(json.loads(stdin_text), load_config(config_path), root)
+        event = json.loads(stdin_text)
+        decision, reasons = decide(event, load_config(config_path), root, relaxed=relaxed)
     except Exception as e:  # noqa: BLE001 — a broken guard must be loud, not open
         decision, reasons = "ask", ["guard.py failed (%s: %s) — gates are NOT being checked; "
                                     "fix .claude/hooks before continuing" % (type(e).__name__, e)]
+    if relaxed:
+        log_relaxed(root, event, relaxed)
     if decision == "allow":
         return None
     return {"hookSpecificOutput": {"hookEventName": "PreToolUse",
@@ -380,9 +430,58 @@ def fix_lock_cli(args: list, root: str = ROOT, config_path: str = CONFIG_PATH) -
     return 2
 
 
+def profile_cli(args: list, root: str = ROOT, config_path: str = CONFIG_PATH) -> int:
+    """Show or set the profile. Only the "profile" line of the config changes
+    (no re-serialising: the file keeps its own layout), and every switch is
+    logged."""
+    try:
+        with open(config_path) as f:
+            text = f.read()
+        current = json.loads(text).get("profile", "stable")
+    except (OSError, ValueError) as e:
+        print("cannot read %s: %s" % (config_path, e), file=sys.stderr)
+        return 1
+    if not args:
+        print("profile: %s" % current)
+        return 0
+    if len(args) != 1 or args[0] not in PROFILES:
+        print("usage: guard.py profile [%s]" % " | ".join(PROFILES), file=sys.stderr)
+        return 2
+    want = args[0]
+    if want == current:
+        print("profile already %s" % want)
+        return 0
+    line = re.compile(r'^(\s*)"profile"\s*:\s*"[^"]*"', re.M)
+    if line.search(text):
+        new = line.sub(lambda m: '%s"profile": "%s"' % (m.group(1), want), text, count=1)
+    else:
+        new = text.replace("{\n", '{\n  "profile": "%s",\n' % want, 1)
+    if json.loads(new).get("profile") != want:
+        print("could not set the profile in %s; nothing was changed" % config_path, file=sys.stderr)
+        return 1
+    tmp = config_path + ".tmp"
+    with open(tmp, "w") as f:
+        f.write(new)
+    try:
+        load_config(tmp)
+    except Exception as e:  # noqa: BLE001 — never leave a config the guard cannot load
+        os.remove(tmp)
+        print("refused: the new config would not load (%s)" % e, file=sys.stderr)
+        return 1
+    os.replace(tmp, config_path)
+    log = os.path.join(root, PROFILE_LOG_REL)
+    os.makedirs(os.path.dirname(log), exist_ok=True)
+    with open(log, "a") as f:
+        f.write(json.dumps({"from": current, "to": want, "at": time.strftime("%Y-%m-%dT%H:%M:%S%z")}) + "\n")
+    print("profile: %s -> %s" % (current, want))
+    return 0
+
+
 def main() -> int:
     if sys.argv[1:2] == ["fix-lock"]:
         return fix_lock_cli(sys.argv[2:])
+    if sys.argv[1:2] == ["profile"]:
+        return profile_cli(sys.argv[2:])
     out = run_hook(sys.stdin.read())
     if out:
         print(json.dumps(out))

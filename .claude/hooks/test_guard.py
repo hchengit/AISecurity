@@ -22,10 +22,12 @@ CFG = guard.load_config()
 
 
 def verdict(tool: str, tool_input: dict, lock: bool = False, branch: str = "feature/x",
-            cwd: str = "") -> str:
+            cwd: str = "", profile: str = "stable", cfg: dict | None = None) -> str:
+    """The guard's decision under a given profile. Tests name the profile they
+    describe; the repo's own setting is whatever its owner chose today."""
     event = {"tool_name": tool, "tool_input": tool_input,
              "cwd": os.path.join(guard.ROOT, cwd)}
-    return guard.decide(event, CFG, guard.ROOT, lock_present=lock,
+    return guard.decide(event, dict(cfg or CFG, profile=profile), guard.ROOT, lock_present=lock,
                         branch_fn=lambda _cwd: branch)[0]
 
 
@@ -33,10 +35,15 @@ class ConfigExamples(unittest.TestCase):
     def test_every_example(self):
         self.assertGreater(len(CFG["examples"]), 10, "policy without worked examples is untested")
         for ex in CFG["examples"]:
-            with self.subTest(ex=ex):
-                got = verdict(ex["tool"], ex["input"], ex.get("lock", False),
-                              ex.get("branch", "feature/x"), ex.get("cwd", ""))
-                self.assertEqual(got, ex["expect"])
+            args = (ex["tool"], ex["input"], ex.get("lock", False), ex.get("branch", "feature/x"),
+                    ex.get("cwd", ""))
+            with self.subTest(ex=ex, profile="stable"):
+                self.assertEqual(verdict(*args, profile="stable"), ex["expect"])
+            # Development relaxes every ask EXCEPT money moves and secrets, so
+            # an example that must keep asking says so explicitly (expect_dev).
+            want_dev = ex.get("expect_dev", "allow" if ex["expect"] == "ask" else ex["expect"])
+            with self.subTest(ex=ex, profile="development"):
+                self.assertEqual(verdict(*args, profile="development"), want_dev)
 
 
 class GenericPolicy(unittest.TestCase):
@@ -94,6 +101,105 @@ class GenericPolicy(unittest.TestCase):
     def test_unknown_tools_pass(self):
         self.assertEqual(verdict("WebSearch", {"query": ".env"}), "allow")
         self.assertEqual(verdict("Bash", {"command": ""}), "allow")
+
+
+class Profiles(unittest.TestCase):
+    """Owner, 2026-09-27: one switch between 'stable' (every gate asks) and
+    'development' (only money moves and secrets ask; denies never change)."""
+
+    SYN = dict(CFG, funds_patterns=[
+        {"regex": r"\bmovemoney\b", "reason": "moves money", "always_ask": True},
+        {"regex": r"\brestartthing\b", "reason": "restarts a thing"},
+    ])
+
+    def v(self, tool, tin, profile, **kw):
+        return verdict(tool, tin, profile=profile, cfg=self.SYN, **kw)
+
+    def test_absent_profile_is_stable(self):
+        cfg = dict(self.SYN)
+        cfg.pop("profile", None)
+        event = {"tool_name": "Bash", "tool_input": {"command": "restartthing"}, "cwd": guard.ROOT}
+        self.assertEqual(guard.decide(event, cfg, guard.ROOT, lock_present=False)[0], "ask")
+
+    def test_development_keeps_only_money_and_secret_asks(self):
+        for profile, other in (("stable", "ask"), ("development", "allow")):
+            self.assertEqual(self.v("Bash", {"command": "movemoney now"}, profile), "ask", profile)
+            self.assertEqual(self.v("Bash", {"command": "restartthing now"}, profile), other, profile)
+            self.assertEqual(self.v("Edit", {"file_path": ".claude/settings.json"}, profile), other, profile)
+            self.assertEqual(self.v("Bash", {"command": "git push origin main"}, profile), other, profile)
+            self.assertEqual(self.v("Bash", {"command": "rm -f .env"}, profile), "ask", profile)
+            self.assertEqual(self.v("Write", {"file_path": ".env"}, profile), "ask", profile)
+
+    def test_development_never_changes_a_deny(self):
+        d = "development"
+        self.assertEqual(self.v("Read", {"file_path": ".env"}, d), "deny")
+        self.assertEqual(self.v("Bash", {"command": "cat .env"}, d), "deny")
+        self.assertEqual(self.v("Bash", {"command": "git push --force origin x"}, d), "deny")
+        self.assertEqual(self.v("Edit", {"file_path": "tests/test_x.py"}, d, lock=True), "deny")
+        self.assertEqual(self.v("Bash", {"command": "restartthing; cat .env"}, d), "deny")
+
+    def test_loosening_asks_tightening_is_free(self):
+        loosen = {"command": "python3 .claude/hooks/guard.py profile development"}
+        tighten = {"command": "python3 .claude/hooks/guard.py profile stable"}
+        self.assertEqual(self.v("Bash", loosen, "stable"), "ask")
+        self.assertEqual(self.v("Bash", loosen, "development"), "allow")
+        self.assertEqual(self.v("Bash", tighten, "stable"), "allow")
+        self.assertEqual(self.v("Bash", tighten, "development"), "allow")
+
+    def _cfg_file(self, root: str, profile: str | None) -> str:
+        cfg = json.loads(json.dumps(self.SYN))
+        cfg.pop("fix_lock_preflight", None)
+        cfg.pop("profile", None)
+        path = os.path.join(root, "guard-config.json")
+        with open(path, "w") as f:
+            text = json.dumps(cfg, indent=2)
+            if profile is not None:
+                text = text.replace("{\n", '{\n  "profile": "%s",\n' % profile, 1)
+            f.write(text + "\n")
+        return path
+
+    def test_every_relaxed_ask_is_logged(self):
+        with tempfile.TemporaryDirectory() as root:
+            path = self._cfg_file(root, "development")
+            event = {"tool_name": "Bash", "tool_input": {"command": "restartthing now"}, "cwd": root}
+            self.assertIsNone(guard.run_hook(json.dumps(event), path, root))
+            with open(os.path.join(root, guard.RELAXED_LOG_REL)) as f:
+                rows = [json.loads(line) for line in f]
+            self.assertEqual(len(rows), 1)
+            self.assertEqual(rows[0]["what"], "restartthing now")
+            self.assertIn("restarts a thing", rows[0]["why"][0])
+            self.assertTrue(rows[0]["at"])
+
+    def test_profile_cli_roundtrip(self):
+        with tempfile.TemporaryDirectory() as root:
+            path = self._cfg_file(root, None)
+            with open(path) as f:
+                before = json.load(f)
+            self.assertEqual(guard.profile_cli([], root, path), 0)
+            self.assertEqual(guard.profile_cli(["development"], root, path), 0)
+            after = guard.load_config(path)
+            self.assertEqual(after["profile"], "development")
+            self.assertEqual({k: v for k, v in after.items() if k != "profile"}, before)
+            self.assertEqual(guard.profile_cli(["stable"], root, path), 0)
+            self.assertEqual(guard.load_config(path)["profile"], "stable")
+            self.assertEqual(guard.profile_cli(["loose"], root, path), 2)
+            with open(os.path.join(root, guard.PROFILE_LOG_REL)) as f:
+                rows = [json.loads(line) for line in f]
+            self.assertEqual([(r["from"], r["to"]) for r in rows],
+                             [("stable", "development"), ("development", "stable")])
+
+    def test_config_validation(self):
+        with tempfile.TemporaryDirectory() as root:
+            for bad in ({"profile": "loose"},
+                        {"funds_patterns": [{"regex": "x", "reason": "r", "always_ask": "yes"}]}):
+                path = self._cfg_file(root, None)
+                with open(path) as f:
+                    cfg = json.load(f)
+                cfg.update(bad)
+                with open(path, "w") as f:
+                    json.dump(cfg, f)
+                with self.assertRaises(ValueError, msg=str(bad)):
+                    guard.load_config(path)
 
 
 class FailureModes(unittest.TestCase):

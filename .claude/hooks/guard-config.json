@@ -1,4 +1,5 @@
 {
+  "profile": "development",
   "_doc": "Policy for .claude/hooks/guard.py (see docs/BUILD-PROCEDURE.md > Deterministic gates). Globs without '/' match the basename; with '/' they match the repo-relative path ('*' crosses '/'). Every example below is replayed by test_guard.py: add one whenever the policy changes. guard.py/test_guard.py are identical to rikurinode's; only this file differs. funds_patterns here guard system-level installs (this repo has no funds).",
 
   "secret_globs": [".env", ".env.*", "*.env", "*.key", "*.pem", "*.p12", "*.cer",
@@ -36,6 +37,8 @@
   ],
 
   "examples": [
+    {"tool": "Bash", "input": {"command": "python3 .claude/hooks/guard.py profile development"}, "expect": "ask", "expect_dev": "allow"},
+    {"tool": "Bash", "input": {"command": "python3 .claude/hooks/guard.py profile stable"}, "expect": "allow"},
     {"tool": "Read", "input": {"file_path": ".env"}, "expect": "deny"},
     {"tool": "Read", "input": {"file_path": "config.toml.example"}, "expect": "allow"},
     {"tool": "Read", "input": {"file_path": "~/.mac-security/vault.db"}, "expect": "deny"},

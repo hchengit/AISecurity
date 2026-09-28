@@ -298,7 +298,24 @@ advisory; back critical policies with hooks.")
 | Writing tests or baselines while the fix-lock is engaged | **deny** |
 | The guard itself fails (bad config, crash) | **ask**, with the error. Never fail-open |
 
-- **Ask means the owner decides**, in the UI, every time, including in auto
+**Profiles (owner, 2026-09-27): how strict the guard is, switched with one command.**
+- `stable` asks at every **ask** row above. It is the default, suited to an
+  app that is close to done.
+- `development` keeps asking only before money moves (the funds rules marked
+  `always_ask`: sends, payments, channel and asset moves, live orders,
+  deleting wallet/chain/trade data) and before touching a secret file. Every
+  other ask is allowed and logged to `.claude/state/guard-relaxed.log`; the
+  agent's own auto mode (Claude Code, Codex) still judges it. **Deny** rows
+  never change.
+- Switch: `python3 .claude/hooks/guard.py profile development|stable`
+  (`profile` alone shows it; every switch is logged to
+  `.claude/state/profile.log`). Loosening to development asks the owner;
+  tightening to stable is always free.
+- All four full-tier repos are on `development` since 2026-09-27 (record:
+  rikurinode `docs/build-records/2026-09-27-guard-profiles.md`).
+
+- **Ask means the owner decides** (every ask in `stable`; only money and
+  secrets in `development`), in the UI, every time, including in auto
   mode and even when the tool is pre-approved. Deny means no one does, from
   inside a session. The owner runs it by hand.
 - **The guard is code, so it is gated like code**: `test_guard.py` replays

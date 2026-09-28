@@ -51,6 +51,11 @@ receipts, and the diff arrive in one commit. Unchecked boxes are listed under
   the owner's approval, as do `install.sh`, `launchctl` and `claude mcp` changes.
   Don't route around a deny — ask the owner. Policy + worked examples:
   `.claude/hooks/guard-config.json`.
+- **Guard profile: `development` since 2026-09-27** (owner): no money paths
+  here, so only touching secret files still asks; everything else above is
+  allowed and logged to `.claude/state/guard-relaxed.log`.
+  `python3 .claude/hooks/guard.py profile stable` brings every ask back
+  (docs/BUILD-PROCEDURE.md > Deterministic gates > Profiles).
 - Fixing a defect: write the failing test, see it fail, then
   `python3 .claude/hooks/guard.py fix-lock on <record>`. From then on, tests and
   the ratchet baseline are read-only.
