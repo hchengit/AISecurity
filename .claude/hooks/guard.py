@@ -17,6 +17,17 @@ Profiles (owner, 2026-09-27): "stable" (the default) asks at every gate.
 allow, logged to .claude/state/guard-relaxed.log. Denies never change.
 Switch with `guard.py profile development|stable`; loosening asks the owner.
 
+The fix-lock makes tests read-only while a defect is being fixed: files
+named by `test_globs`, and the tests written INSIDE a source file, named by
+the optional `inline_tests` (Rust's `#[cfg(test)]` module: from a file's first
+marker to its end, plus the attribute/comment lines directly above the marker
+named by `attached_above`). Lines matching the optional `guarded_lines` (e.g.
+code that acts differently under `cfg(test)`) may not change anywhere in the
+file while locked. An Edit/Write is checked by comparing that region before
+and after, and an Edit must match the file exactly (the Edit tool also matches
+loosely, which the guard can't follow). A shell write to a file of that type
+is refused by name, as a test file's is, since it can't be checked.
+
 Bash matching is a tripwire, not a wall: it reads the command segment by
 segment (split on ; && || | and newlines, recursing into sh -c), so routine
 commands stay silent. A determined `python -c open(...)` gets past it. That
@@ -29,6 +40,7 @@ CLI:   guard.py fix-lock on <build-record> | off | status
 from __future__ import annotations
 
 import fnmatch
+import glob
 import json
 import os
 import re
@@ -48,6 +60,7 @@ RELAXED_LOG_REL = ".claude/state/guard-relaxed.log"
 PROFILE_LOG_REL = ".claude/state/profile.log"
 PROFILES = ("stable", "development")
 
+EDIT_TOOLS = {"Edit", "MultiEdit", "Write"}
 PATH_TOOLS = {"Read": "file_path", "Edit": "file_path", "Write": "file_path",
               "MultiEdit": "file_path", "NotebookEdit": "notebook_path", "Grep": "path"}
 READ_TOOLS = {"Read", "Grep"}
@@ -92,6 +105,21 @@ def load_config(path: str = CONFIG_PATH) -> dict:
                          '[["node", "scripts/quality-ratchet.mjs"]]')
     if not isinstance(cfg.get("fix_lock_release_needs_owner", True), bool):
         raise ValueError("guard-config.json: 'fix_lock_release_needs_owner' must be true or false")
+    inline = cfg.get("inline_tests", [])
+    if not (isinstance(inline, list) and all(
+            isinstance(r, dict) and isinstance(r.get("glob"), str) and r["glob"]
+            and isinstance(r.get("starts_at"), str) and r["starts_at"] for r in inline)):
+        raise ValueError("guard-config.json: 'inline_tests' must be a list of "
+                         '{"glob": "*.rs", "starts_at": "<regex>"} objects')
+    for r in inline:
+        for key in ("attached_above", "guarded_lines"):
+            if not isinstance(r.get(key, ""), str):
+                raise ValueError("guard-config.json: inline_tests %s must be a regex string" % key)
+        for key in ("starts_at", "attached_above", "guarded_lines"):
+            try:
+                re.compile(r.get(key, ""))
+            except re.error as e:
+                raise ValueError("guard-config.json: inline_tests %s %r: %s" % (key, r[key], e)) from e
     return cfg
 
 
@@ -117,6 +145,134 @@ def matches(path: str, globs: list) -> bool:
 def is_secret(path: str, cfg: dict) -> bool:
     base = os.path.basename(path)
     return matches(base, cfg["secret_globs"]) and not matches(base, cfg["secret_allow_globs"])
+
+
+# ── inline tests ────────────────────────────────────────────────────────────
+
+def read_text(path: str) -> str:
+    """A file's text as the Edit tool sees it: UTF-8, with only \\r\\n folded
+    to \\n (a lone \\r is not a line break); "" when the file does not exist
+    yet. Anything else, bytes that are not UTF-8 included, raises."""
+    try:
+        with open(path, encoding="utf-8", newline="") as f:
+            return f.read().replace("\r\n", "\n")
+    except FileNotFoundError:
+        return ""
+
+
+def inline_region(text: str, starts_at: str, attached_above: str = "") -> str | None:
+    """The tests inside `text`: from the first match of `starts_at` to the end,
+    widened up over the lines directly above it that match `attached_above`
+    (attributes, comments), across blank lines, since an attribute there
+    still applies to the tests (`#[cfg(any())]` switches them off)."""
+    m = re.search(starts_at, text, re.M)
+    if m is None:
+        return None
+    start = scan = m.start()
+    while attached_above and scan > 0 and text[scan - 1] == "\n":
+        prev = text.rfind("\n", 0, scan - 1) + 1
+        line = text[prev:scan - 1]
+        if line.strip() and not re.match(attached_above, line):
+            break
+        scan = prev
+        if line.strip():
+            start = prev
+    return text[start:]
+
+
+def texts_after(tool: str, tin: dict, before: str) -> list | None:
+    """Every text the file may hold once this Write / Edit / MultiEdit lands,
+    modelled on the Edit tool (Claude Code 2.1.221):
+    - an old_string with no exact match: None. The tool then tries loose
+      matches (curly quotes straightened, \\uXXXX decoded) the guard can't
+      follow;
+    - a deletion (new_string "") also takes the newline after old_string
+      when there is one; both outcomes are returned;
+    - an empty old_string replaces a file the tool judges blank and is
+      refused otherwise; the guard does not guess which (JS trim() and
+      Python strip() disagree on U+FEFF), so both outcomes are returned."""
+    if tool == "Write":
+        return [tin.get("content") or ""]
+    texts = [before]
+    for e in (tin.get("edits") or []) if tool == "MultiEdit" else [tin]:
+        old, new = e.get("old_string") or "", e.get("new_string") or ""
+        nxt = []
+        for text in texts:
+            if not old:
+                nxt += [new, text]
+                continue
+            if old not in text:
+                return None
+            olds = [old]
+            if not new and not old.endswith("\n") and old + "\n" in text:
+                olds.append(old + "\n")
+            for o in olds:
+                nxt.append(text.replace(o, new) if e.get("replace_all") else text.replace(o, new, 1))
+        texts = list(dict.fromkeys(nxt))
+    return texts
+
+
+def guarded(text: str, pattern: str) -> dict:
+    """How many times each line matching `pattern` occurs in `text`."""
+    counts: dict = {}
+    for line in text.split("\n"):
+        if pattern and re.search(pattern, line):
+            counts[line.strip()] = counts.get(line.strip(), 0) + 1
+    return counts
+
+
+def inline_rules(rel: str, cfg: dict) -> list:
+    return [r for r in cfg.get("inline_tests", []) if matches(rel, [r["glob"]])]
+
+
+def inline_edit_hit(tool: str, tin: dict, rel: str, root: str, cfg: dict) -> tuple | None:
+    """Deny when this edit changes the tests inside `rel` (fix-lock engaged)."""
+    rules = inline_rules(rel, cfg)
+    if not rules:
+        return None
+    try:
+        before = read_text(os.path.join(root, rel))
+    except (OSError, UnicodeDecodeError) as e:
+        return ("deny", "fix-lock is engaged and %s could not be read to check the tests inside it (%s)"
+                % (rel, e), True)
+    after = texts_after(tool, tin, before)
+    if after is None:
+        return ("deny", "fix-lock is engaged: an old_string does not match %s exactly. The Edit tool can "
+                        "still apply it by a loose match, which the guard cannot check, so under the "
+                        "fix-lock this file takes exact edits only (copy the text as it is)" % rel, True)
+    for r in rules:
+        region = inline_region(before, r["starts_at"], r.get("attached_above", ""))
+        if any(inline_region(a, r["starts_at"], r.get("attached_above", "")) != region for a in after):
+            return ("deny", "fix-lock is engaged: this changes the tests inside %s (its first "
+                            "inline-test marker to the end of the file, with the attribute and comment "
+                            "lines directly above that marker). Fix the code, not the test "
+                            "(release with `guard.py fix-lock off`)" % rel, True)
+        lines = guarded(before, r.get("guarded_lines", ""))
+        if any(guarded(a, r.get("guarded_lines", "")) != lines for a in after):
+            return ("deny", "fix-lock is engaged: this adds, removes or changes code in %s that acts "
+                            "differently under test (cfg(test) / cfg!(test) / cfg_attr(test, …), or an assert "
+                            "macro shadow). While a fix is locked, production code must not behave differently "
+                            "in the test build" % rel, True)
+    return None
+
+
+def expand_braces(word: str) -> list:
+    """`a/{b,c}.rs` -> [`a/b.rs`, `a/c.rs`], as the shell would (unnested)."""
+    m = re.search(r"\{([^{}]*,[^{}]*)\}", word)
+    if not m:
+        return [word]
+    return [x for part in m.group(1).split(",")
+            for x in expand_braces(word[:m.start()] + part + word[m.end():])]
+
+
+def shell_names(target: str, cwd: str) -> list:
+    """A write target as written, plus what its braces and globs expand to."""
+    out = [target]
+    for word in expand_braces(target):
+        out.append(word)
+        if any(c in word for c in "*?["):
+            out += glob.glob(os.path.join(cwd, os.path.expanduser(word)))
+    return out
 
 
 # ── bash parsing ────────────────────────────────────────────────────────────
@@ -279,6 +435,10 @@ def decide(event: dict, cfg: dict, root: str = ROOT, lock_present: bool | None =
                     hits.append(("deny", "fix-lock is engaged: %s is a test/baseline. Fix the code, not the "
                                          "test (release with `guard.py fix-lock off`, owner approves)" % rel,
                                  True))
+                elif lock_present and tool in EDIT_TOOLS:
+                    hit = inline_edit_hit(tool, tin, rel, root, cfg)
+                    if hit:
+                        hits.append(hit)
     elif tool == "Bash":
         hits += bash_hits(tin.get("command", ""), cwd, cfg, root, lock_present, branch_fn)
 
@@ -325,9 +485,17 @@ def bash_hits(cmd: str, cwd: str, cfg: dict, root: str, lock_present: bool, bran
                 continue
             if rel == LOCK_REL or matches(rel, cfg["protected_globs"]):
                 hits.append(("ask", "command writes protected path %s — owner approves" % rel, False))
-            if lock_present and matches(rel, cfg["test_globs"]):
+            if not lock_present:
+                continue
+            names = [n for n in (rel_to_root(t, cwd, root) for t in shell_names(target, cwd)) if n]
+            if any(matches(n, cfg["test_globs"]) for n in names):
                 hits.append(("deny", "fix-lock is engaged: command writes test/baseline %s. "
                                      "Fix the code, not the test" % rel, True))
+            elif any(inline_rules(n, cfg) for n in names):
+                hits.append(("deny", "fix-lock is engaged: command writes %s, a file type that keeps tests "
+                                     "inside the code (inline_tests). A shell write can't be checked line by "
+                                     "line; make the change with Edit or Write, which the guard checks" % rel,
+                             True))
         for p in cfg["funds_patterns"]:
             if re.search(p["regex"], seg):
                 hits.append(("ask", p["reason"], p.get("always_ask", False)))
@@ -404,7 +572,7 @@ def fix_lock_cli(args: list, root: str = ROOT, config_path: str = CONFIG_PATH) -
         os.makedirs(os.path.dirname(lock), exist_ok=True)
         with open(lock, "w") as f:
             json.dump({"record": args[1], "since": time.strftime("%Y-%m-%dT%H:%M:%S%z")}, f)
-        print("fix-lock ENGAGED for %s — test files and baselines are now read-only" % args[1])
+        print("fix-lock ENGAGED for %s — test files, inline tests and baselines are now read-only" % args[1])
         return 0
     if args == ["off"]:
         if os.path.exists(lock):

@@ -26,6 +26,8 @@
 
   "test_globs": ["tests/*", "*/tests/*", "Tests/*", "*/Tests/*", "*_test.rs",
                  "*/fixtures/*", "*baseline*"],
+  "_inline_tests_doc": "Tests written inside a source file are tests too. Rust keeps most unit tests in a `#[cfg(test)] mod tests` block at the end of the file (29 of 50 .rs files, 2026-09-28): from a file's first marker (`#[cfg(test)]`, or a test-only helper under `#[cfg(any(test, …))]`/`all(test, …)`; never `cfg(not(test))`) to its end is read-only under the fix-lock. Attribute and comment lines directly above the first marker (across blank lines) belong to it: a `#[cfg(any())]` there switches the tests off. Lines that make production code act differently under test (cfg(test)/cfg!(test)/cfg_attr(test,…), or an assert-macro shadow) may not be added, removed or changed anywhere in the file while locked. Edits there must match exactly, and shell writes to any .rs file are refused while locked (use Edit/Write). Lesson gate 2026-09-28 (rikurinode docs/build-records/2026-09-28-fix-lock-covers-inline-tests.md).",
+  "inline_tests": [{"glob": "*.rs", "starts_at": "^[ \\t\\f\\v\\r\u200b-\u200f\u2060\ufeff]*#\\s*\\[\\s*cfg\\s*\\(\\s*(?:test|(?:any|all)\\s*\\((?:.*[(,]\\s*)?(?<!not\\()test(?=\\s*[,)]).*\\))\\s*\\)\\s*\\]", "attached_above": "^[ \\t\\f\\v\\r\u200b-\u200f\u2060\ufeff]*(#\\s*\\[|//|/\\*|\\*)", "guarded_lines": "cfg(?:_attr)?\\s*!?\\s*\\(.*\\btest\\b|macro_rules!\\s*(?:assert\\w*|debug_assert\\w*|panic|unreachable|todo)\\b"}],
 
   "funds_patterns": [
     {"regex": "(^|[\\s/])(install|uninstall)\\.sh\\b",
@@ -73,6 +75,15 @@
 
     {"tool": "Edit", "input": {"file_path": "SecurityCore/crates/security-core/tests/cross_validation.rs"}, "lock": false, "expect": "allow"},
     {"tool": "Edit", "input": {"file_path": "SecurityCore/crates/security-core/tests/cross_validation.rs"}, "lock": true, "expect": "deny"},
+    {"tool": "Edit", "input": {"file_path": "SecurityCore/crates/security-core/src/agent_policy.rs", "old_string": "#[cfg(test)]", "new_string": "#[cfg(test)] // edited"}, "lock": true, "expect": "deny"},
+    {"tool": "Edit", "input": {"file_path": "SecurityCore/crates/security-core/src/agent_policy.rs", "old_string": "#[cfg(test)]", "new_string": "#[cfg(test)] // edited"}, "lock": false, "expect": "allow"},
+    {"tool": "Bash", "input": {"command": "sed -i 's/a/b/' SecurityCore/crates/security-core/src/agent_policy.rs"}, "lock": true, "expect": "deny"},
+    {"tool": "Write", "input": {"file_path": "SecurityCore/crates/security-core/src/guard_example_only.rs", "content": "#[cfg(not(test))]\npub fn two() -> u8 {\n    2\n}\n"}, "lock": true, "expect": "deny"},
+    {"tool": "Write", "input": {"file_path": "SecurityCore/crates/security-core/src/guard_example_only.rs", "content": "#[cfg(not(test))]\npub fn two() -> u8 {\n    2\n}\n"}, "lock": false, "expect": "allow"},
+    {"tool": "Write", "input": {"file_path": "SecurityCore/crates/security-core/src/guard_example_only.rs", "content": "macro_rules! assert_eq { ($($t:tt)*) => {}; }\n"}, "lock": true, "expect": "deny"},
+    {"tool": "Write", "input": {"file_path": "SecurityCore/crates/security-core/src/guard_example_only.rs", "content": "pub fn two() -> bool {\n    cfg!(test)\n}\n"}, "lock": true, "expect": "deny"},
+    {"tool": "Write", "input": {"file_path": "SecurityCore/crates/security-core/src/guard_example_only.rs", "content": "pub fn two() -> u8 {\n    2\n}\n\n#[cfg(test)]\nmod tests {}\n"}, "lock": true, "expect": "deny"},
+    {"tool": "Write", "input": {"file_path": "SecurityCore/crates/security-core/src/guard_example_only.rs", "content": "pub fn two() -> u8 {\n    2\n}\n"}, "lock": true, "expect": "allow"},
     {"tool": "Bash", "input": {"command": "cd SecurityCore && cargo test -p security-core sensitive_data"}, "lock": true, "expect": "allow"},
     {"tool": "Bash", "input": {"command": "./scripts/ratchet.sh --update > scripts/ratchet-baseline.txt"}, "lock": true, "expect": "deny"}
   ]

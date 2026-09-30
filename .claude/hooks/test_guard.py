@@ -202,6 +202,281 @@ class Profiles(unittest.TestCase):
                     guard.load_config(path)
 
 
+class InlineTests(unittest.TestCase):
+    """Lesson gate (2026-09-28): Rust keeps most unit tests inside the source
+    file (`#[cfg(test)] mod tests`). The fix-lock covered test FILES only, so
+    the test proving a fix stayed editable during the fix. A repo names its
+    inline-test markers in `inline_tests`: from a file's first marker to its
+    end is test code, read-only under the lock like any test file."""
+
+    SRC = ("pub fn add(a: i32, b: i32) -> i32 {\n    a + b\n}\n\n"
+           "#[cfg(test)]\nmod tests {\n    use super::*;\n\n"
+           "    #[test]\n    fn adds() {\n        assert_eq!(add(2, 2), 4);\n    }\n}\n")
+    PLAIN = "pub fn sub(a: i32, b: i32) -> i32 {\n    a - b\n}\n"
+    QUOTED = ('pub fn f() {}\n\n#[cfg(test)]\nmod tests {\n    #[test]\n    fn t() {\n'
+              '        assert!(true, "holds");\n    }\n}\n')
+    # A test-only helper module (cfg(any(test, feature))) above the tests is test
+    # code too; cfg(not(test)) marks production code and is not a marker.
+    SUPPORT = ('#[cfg(not(test))]\npub fn real() -> u8 {\n    1\n}\n\n'
+               '#[cfg(any(test, feature = "test-helpers"))]\npub mod test_support {\n'
+               '    pub fn fake() -> u8 {\n        2\n    }\n}\n\n#[cfg(test)]\nmod tests {}\n')
+    # A comment directly above the marker (as in two real files).
+    DOC = ("pub fn f() {}\n\n/// note ZQX\n#[cfg(test)]\nmod tests {\n    #[test]\n    fn t() {\n"
+           "        assert!(true);\n    }\n}\n")
+    # A lone CR planted above the code, and the same two lines inside the tests.
+    CR = 'pub fn f() {} // L1\rL2\n\n#[cfg(test)]\nmod tests {\n    const S: &str = "L1\nL2";\n}\n'
+    BANNER = "pub fn f() {}\n\n// ====\n// Tests\n// ====\n#[cfg(test)]\nmod tests {}\n"
+    CRLF = "pub fn f() {} // Z\r\n#[cfg(test)]\r\nmod tests {\r\n    fn t() { assert!(true); }\r\n}\r\n"
+    # The rule rikurinode and AISecurity configure (test_marker_shapes pins it).
+    RUST = dict(CFG, inline_tests=[{"glob": "*.rs", "starts_at":
+                                    r"^[ \t\f\v\r​-‏⁠﻿]*#\s*\[\s*cfg\s*\(\s*(?:test|(?:any|all)\s*\((?:.*[(,]\s*)?(?<!not\()test(?=\s*[,)]).*\))\s*\)\s*\]",
+                                    "guarded_lines": r"cfg(?:_attr)?\s*!?\s*\(.*\btest\b|macro_rules!\s*(?:assert\w*|debug_assert\w*|panic|unreachable|todo)\b",
+                                    "attached_above": r"^[ \t\f\v\r​-‏⁠﻿]*(#\s*\[|//|/\*|\*)"}])
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.root = self._tmp.name
+        os.makedirs(os.path.join(self.root, "src", "dir.rs"))
+        for name, text in (("lib.rs", self.SRC), ("plain.rs", self.PLAIN), ("notes.md", self.SRC),
+                           ("quoted.rs", self.QUOTED), ("support.rs", self.SUPPORT), ("doc.rs", self.DOC),
+                           ("cr.rs", self.CR), ("blank.rs", "\n  \n"), ("bom.rs", "\ufeff\n"),
+                           ("crlf.rs", self.CRLF), ("banner.rs", self.BANNER),
+                           ("lfa.rs", "pub fn f() {} // Z\n#[cfg(test)]\nmod tests {}\n"),
+                           ("join.rs", "pub fn f() {}\n// cfg!( Z\ntest) marker\n"),
+                           ("allow.rs", "pub fn f() {} // Z\n#[allow(unused)]\n#[cfg(test)]\nmod tests {}\n")):
+            with open(os.path.join(self.root, "src", name), "w", newline="") as f:
+                f.write(text)
+        with open(os.path.join(self.root, "src", "bytes.rs"), "wb") as f:
+            f.write(b"pub fn f() {}\n// \xff\n#[cfg(test)]\nmod tests {}\n")
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def v(self, tool, tin, lock=True, profile="stable", cfg=None):
+        event = {"tool_name": tool, "tool_input": tin, "cwd": self.root}
+        return guard.decide(event, dict(cfg or self.RUST, profile=profile), self.root,
+                            lock_present=lock, branch_fn=lambda _cwd: "feature/x")[0]
+
+    @staticmethod
+    def edit(old, new, path="src/lib.rs", **kw):
+        return dict({"file_path": path, "old_string": old, "new_string": new}, **kw)
+
+    def test_edit_inside_the_tests(self):
+        change = self.edit("assert_eq!(add(2, 2), 4);", "assert_eq!(add(2, 2), 5);")
+        self.assertEqual(self.v("Edit", change), "deny")
+        self.assertEqual(self.v("Edit", change, lock=False), "allow")
+        self.assertEqual(self.v("Edit", dict(change, file_path=os.path.join(self.root, "src/lib.rs"))), "deny")
+
+    def test_edit_above_the_tests_is_the_fix(self):
+        self.assertEqual(self.v("Edit", self.edit("    a + b\n", "    b + a\n")), "allow")
+        # New code inserted just above the tests leaves them byte-identical.
+        above = self.edit("}\n\n#[cfg(test)]", "}\n\npub fn two() -> i32 {\n    2\n}\n\n#[cfg(test)]")
+        self.assertEqual(self.v("Edit", above), "allow")
+
+    def test_edit_reaching_into_the_tests(self):
+        self.assertEqual(self.v("Edit", self.edit("#[cfg(test)]\nmod tests {\n    use super::*;",
+                                                  "#[cfg(test)]\nmod tests {\n    use super::add;")), "deny")
+        self.assertEqual(self.v("Edit", self.edit("add(", "sum(", replace_all=True)), "deny")
+        # Removing the marker, or adding a second test module above it, changes the tests too.
+        self.assertEqual(self.v("Edit", self.edit("#[cfg(test)]\n", "")), "deny")
+        self.assertEqual(self.v("Edit", self.edit("}\n\n#[cfg(test)]",
+                                                  "}\n\n#[cfg(test)]\nmod more {}\n\n#[cfg(test)]")), "deny")
+
+    def test_multiedit_applies_every_edit(self):
+        fix = {"old_string": "    a + b\n", "new_string": "    b + a\n"}
+        cheat = {"old_string": "(add(2, 2), 4)", "new_string": "(add(2, 2), 5)"}
+        self.assertEqual(self.v("MultiEdit", {"file_path": "src/lib.rs", "edits": [fix]}), "allow")
+        self.assertEqual(self.v("MultiEdit", {"file_path": "src/lib.rs", "edits": [fix, cheat]}), "deny")
+
+    def test_write(self):
+        fixed = self.SRC.replace("    a + b\n", "    b + a\n")
+        self.assertEqual(self.v("Write", {"file_path": "src/lib.rs", "content": fixed}), "allow")
+        self.assertEqual(self.v("Write", {"file_path": "src/lib.rs", "content": fixed.replace(", 4)", ", 5)")}),
+                         "deny")
+        self.assertEqual(self.v("Write", {"file_path": "src/lib.rs", "content": fixed.split("#[cfg")[0]}),
+                         "deny")
+        # A new file: production code is free, a new test module is a new test.
+        self.assertEqual(self.v("Write", {"file_path": "src/new.rs", "content": self.PLAIN}), "allow")
+        self.assertEqual(self.v("Write", {"file_path": "src/new.rs", "content": self.SRC}), "deny")
+        # Edit with an empty old_string creates a file, the same as Write.
+        self.assertEqual(self.v("Edit", self.edit("", self.PLAIN, path="src/new.rs")), "allow")
+        self.assertEqual(self.v("Edit", self.edit("", self.SRC, path="src/new.rs")), "deny")
+
+    def test_adding_tests_to_a_file_without_any(self):
+        self.assertEqual(self.v("Edit", self.edit("    a - b\n}\n", "    a - b\n}\n\n#[cfg(test)]\nmod tests {}\n",
+                                                  path="src/plain.rs")), "deny")
+        self.assertEqual(self.v("Edit", self.edit("    a - b\n", "    b - a\n", path="src/plain.rs")), "allow")
+
+    def test_only_the_configured_files(self):
+        # Same text in a file the glob does not name: not Rust, not inline tests.
+        self.assertEqual(self.v("Edit", self.edit(", 4)", ", 5)", path="src/notes.md")), "allow")
+        # A repo that does not opt in keeps today's behaviour.
+        plain = {k: v for k, v in self.RUST.items() if k != "inline_tests"}
+        self.assertEqual(self.v("Edit", self.edit(", 4)", ", 5)"), cfg=plain), "allow")
+
+    def test_an_edit_must_match_exactly(self):
+        # Verifier, 2026-09-28: the Edit tool also matches loosely (curly quotes
+        # straightened, \\uXXXX escapes decoded), so an old_string the guard
+        # finds nowhere can still land inside the tests. Under the lock, a
+        # covered file takes exact edits only.
+        for path, old in (("src/quoted.rs", "assert!(true, \u201cholds\u201d);"),
+                          ("src/lib.rs", "assert_eq!(add(2, 2), 4)\\u003b"),
+                          ("src/plain.rs", "    a \u2212 b\n")):
+            change = self.edit(old, "let _ = 0;", path=path)
+            self.assertEqual(self.v("Edit", change), "deny", old)
+            self.assertEqual(self.v("Edit", change, lock=False), "allow", old)
+        fix = {"old_string": "    a + b\n", "new_string": "    b + a\n"}
+        loose = {"old_string": "(add(2, 2), 4)\\u003b", "new_string": "(add(2, 2), 5);"}
+        self.assertEqual(self.v("MultiEdit", {"file_path": "src/lib.rs", "edits": [fix, loose]}), "deny")
+
+    def test_marker_shapes(self):
+        rx = self.RUST["inline_tests"][0]["starts_at"]
+        for line, marker in (("#[cfg(test)]", True), ('#[cfg(any(test, feature = "test-helpers"))]', True),
+                             ("    #[cfg(all(test, unix))]", True), ("#[cfg(all(unix, test))]", True),
+                             ("#[cfg(not(test))]", False), ('#[cfg(feature = "x")]', False),
+                             ('#[cfg(any(feature = "test-helpers", unix))]', False),
+                             ("#[cfg(any(not(test), unix))]", False), ("#[cfg_attr(test, derive(Debug))]", False),
+                             ("# [cfg(test)]", True), ("#[cfg (test)]", True), ("#[ cfg(test) ]", True),
+                             ("\u200e#[cfg(test)]", True), ("#[cfg(not (test))]", False)):
+            self.assertEqual(guard.inline_region("fn a() {}\n" + line + "\n", rx) is not None, marker, line)
+
+    def test_the_edit_tool_is_modelled_exactly(self):
+        # Verifier round two, 2026-09-28. (A) Deleting text (new_string "")
+        # also removes the newline after it, which can pull the marker onto
+        # the line above and hide every test below it from the lock.
+        self.assertEqual(self.v("Edit", self.edit(" ZQX", "", path="src/doc.rs")), "deny")
+        self.assertEqual(self.v("Edit", self.edit("pub fn f() {}", "", path="src/doc.rs")), "allow")
+        # (B) The tool splits lines on \\n only; a lone \\r is not a line break.
+        self.assertEqual(self.v("Edit", self.edit("L1\nL2", "X", path="src/cr.rs")), "deny")
+        # (C) An empty old_string replaces a whitespace-only file entirely.
+        self.assertEqual(self.v("Edit", self.edit("", self.SRC, path="src/blank.rs")), "deny")
+        self.assertEqual(self.v("Edit", self.edit("", self.PLAIN, path="src/blank.rs")), "allow")
+        # (D) Text that is not UTF-8 cannot be checked (rustc rejects it anyway).
+        self.assertEqual(self.v("Edit", self.edit("pub fn f() {}", "pub fn g() {}", path="src/bytes.rs")), "deny")
+        for path in ("src/doc.rs", "src/cr.rs", "src/blank.rs", "src/bytes.rs"):
+            self.assertEqual(self.v("Edit", self.edit("", "x", path=path), lock=False), "allow")
+
+    def test_lines_attached_above_the_marker(self):
+        # Verifier round three: `#[cfg(any())]` added above the marker switches
+        # the whole module off, even across blank lines. Attributes and
+        # comments directly above it belong to it.
+        self.assertEqual(self.v("Edit", self.edit("}\n\n#[cfg(test)]", "}\n\n#[cfg(any())]\n#[cfg(test)]")), "deny")
+        self.assertEqual(self.v("Edit", self.edit("}\n\n#[cfg(test)]", "}\n#[cfg(any())]\n\n#[cfg(test)]")), "deny")
+        self.assertEqual(self.v("Edit", self.edit(" ZQX", " ZQY", path="src/doc.rs")), "deny")
+        # Every line of a stacked banner, other attribute spellings, block comments.
+        self.assertEqual(self.v("Edit", self.edit("\n\n// ====\n", "\n\n// ==\n", path="src/banner.rs")), "deny")
+        for above in ("# [cfg(any())]", "#\t[cfg(any())]", "/* note */", "/** doc */", "\u200e#[cfg(any())]"):
+            self.assertEqual(self.v("Edit", self.edit("}\n\n#[cfg(test)]", "}\n\n%s\n#[cfg(test)]" % above)),
+                             "deny", above)
+        # Code above them, and the blank lines between, are not the tests.
+        self.assertEqual(self.v("Edit", self.edit("pub fn f() {}\n", "pub fn f() {}\n\n\n", path="src/doc.rs")), "allow")
+        self.assertEqual(self.v("Edit", self.edit("}\n\n#[cfg(test)]",
+                                                  "}\n\n#[inline]\npub fn two() -> i32 {\n    2\n}\n\n#[cfg(test)]")), "allow")
+        self.assertEqual(self.v("Edit", self.edit("}\n\n#[cfg(test)]", "}\n\n#[cfg(any())]\n#[cfg(test)]"),
+                                lock=False), "allow")
+
+    def test_an_empty_old_string_is_judged_both_ways(self):
+        # Verifier round three: the tool calls a file blank by JS trim() (U+FEFF
+        # included), Python's strip() doesn't. Rather than model that, both
+        # outcomes, "replaced" and "unchanged", must leave the tests alone.
+        self.assertEqual(self.v("Edit", self.edit("", self.SRC, path="src/bom.rs")), "deny")
+        self.assertEqual(self.v("Edit", self.edit("", self.PLAIN, path="src/bom.rs")), "allow")
+
+    def test_crlf_is_folded_as_the_tool_does(self):
+        # An LF old_string matches a CRLF file, and a deletion there still
+        # takes the line break with it (route A on a CRLF file).
+        self.assertEqual(self.v("Edit", self.edit("pub fn f() {} // Z\n", "pub fn g() {} // Z\n", path="src/crlf.rs")),
+                         "allow")
+        self.assertEqual(self.v("Edit", self.edit(" // Z", "", path="src/crlf.rs")), "deny")
+        # The same deletion on an LF file (route A where the line above is code).
+        self.assertEqual(self.v("Edit", self.edit(" // Z", "", path="src/lfa.rs")), "deny")
+        # ...and where the joined line is an attached attribute, not a guarded
+        # line, so only the region check sees the second outcome.
+        self.assertEqual(self.v("Edit", self.edit(" // Z", "", path="src/allow.rs")), "deny")
+
+    def test_production_code_may_not_start_behaving_differently_under_test(self):
+        # Verifier round five (class G): production code that acts differently
+        # only in the test build turns a failing inline test green without
+        # touching it (a tests/* integration test is built without cfg(test)
+        # and would still fail). Under the lock such lines may not change.
+        for old, new in (("    a + b\n", "    if cfg!(test) { return 4; }\n    a + b\n"),
+                         ("pub fn add", "#[cfg(not(test))]\npub fn add"),
+                         ("pub fn add", "#[cfg(not(not(test)))]\npub fn add"),
+                         ("pub fn add", "#[cfg_attr(test, allow(unused))]\npub fn add"),
+                         ("pub fn add", "macro_rules! assert_eq { ($($t:tt)*) => {} }\npub fn add")):
+            self.assertEqual(self.v("Edit", self.edit(old, new)), "deny", new)
+            self.assertEqual(self.v("Edit", self.edit(old, new), lock=False), "allow", new)
+        # In a file with no tests at all, and a second copy of an existing line.
+        self.assertEqual(self.v("Edit", self.edit("pub fn sub", "#[cfg(not(test))]\npub fn sub", path="src/plain.rs")),
+                         "deny")
+        self.assertEqual(self.v("Edit", self.edit("pub fn real() -> u8 {", "pub fn real2() -> u8 { 1 }\n#[cfg(not(test))]\n"
+                                                  "pub fn real() -> u8 {", path="src/support.rs")), "deny")
+        # A deletion that joins two lines into one (the tool's newline swallow).
+        self.assertEqual(self.v("Edit", self.edit(" Z", "", path="src/join.rs")), "deny")
+        # A rule without guarded_lines guards nothing.
+        rule = {k: v for k, v in self.RUST["inline_tests"][0].items() if k != "guarded_lines"}
+        self.assertEqual(self.v("Edit", self.edit("pub fn sub", "#[cfg(not(test))]\npub fn sub", path="src/plain.rs"),
+                                cfg=dict(self.RUST, inline_tests=[rule])), "allow")
+        # Removing one changes what the tests exercise, too.
+        self.assertEqual(self.v("Edit", self.edit("#[cfg(not(test))]\n", "", path="src/support.rs")), "deny")
+        # Ordinary production edits stay open.
+        self.assertEqual(self.v("Edit", self.edit("    a + b\n", "    let s = a + b;\n    s\n")), "allow")
+
+    def test_a_test_edit_is_named_as_one(self):
+        # The marker line itself matches guarded_lines; the deny must still say
+        # "this changes the tests", the message that tells the session what to do.
+        event = {"tool_name": "Edit", "tool_input": self.edit("#[cfg(test)]\nmod tests {", "mod tests {"),
+                 "cwd": self.root}
+        reasons = guard.decide(event, dict(self.RUST, profile="stable"), self.root, lock_present=True,
+                               branch_fn=lambda _cwd: "feature/x")[1]
+        self.assertTrue(any("changes the tests inside" in r for r in reasons), reasons)
+
+    def test_test_helper_modules_are_tests(self):
+        self.assertEqual(self.v("Edit", self.edit("        2\n", "        3\n", path="src/support.rs")), "deny")
+        self.assertEqual(self.v("Edit", self.edit("    1\n", "    9\n", path="src/support.rs")), "allow")
+
+    def test_shell_writes_to_rust_files(self):
+        # Verifier, 2026-09-28: a check that reads the file on disk misses `cd`,
+        # globs and new files, so a shell write to ANY covered file is refused
+        # by name under the lock, the way tests/* is. Edit and Write stay open.
+        for cmd in ("sed -i 's/4/5/' src/lib.rs", "rm src/lib.rs", "git checkout -- src/lib.rs",
+                    "echo '// x' >> src/lib.rs", "cp /tmp/other.rs src/lib.rs",
+                    "sed -i 's/a - b/b - a/' src/plain.rs", "printf '#[cfg(test)] mod t {}' >> src/plain.rs",
+                    "cp src/lib.rs src/copy.rs", "cd src && sed -i 's/4/5/' lib.rs",
+                    "sed -i 's/4/5/' src/*.rs", "sed -i 's/4/5/' src/lib.r?",
+                    "sed -i 's/4/5/' src/{lib,plain}.rs", "sed -i 's/4/5/' src/lib.{rs,bak}"):
+            self.assertEqual(self.v("Bash", {"command": cmd}), "deny", cmd)
+            self.assertEqual(self.v("Bash", {"command": cmd}, lock=False), "allow", cmd)
+        for cmd in ("cat src/lib.rs", "sed -i 's/a/b/' src/notes.md", "cargo test -p x"):
+            self.assertEqual(self.v("Bash", {"command": cmd}), "allow", cmd)
+
+    def test_denies_hold_in_development(self):
+        self.assertEqual(self.v("Edit", self.edit(", 4)", ", 5)"), profile="development"), "deny")
+        self.assertEqual(self.v("Bash", {"command": "rm src/lib.rs"}, profile="development"), "deny")
+
+    def test_a_file_that_cannot_be_read_is_refused(self):
+        self.assertEqual(self.v("Edit", self.edit("x", "y", path="src/dir.rs")), "deny")
+        self.assertEqual(self.v("Bash", {"command": "rm -r src/dir.rs"}), "deny")
+        self.assertEqual(self.v("Bash", {"command": "rm -r src/dir.rs"}, lock=False), "allow")
+
+    def test_config_validation(self):
+        with tempfile.TemporaryDirectory() as root:
+            path = os.path.join(root, "guard-config.json")
+            for bad in ("*.rs", [{"glob": "", "starts_at": "x"}], [{"glob": "*.rs"}],
+                        [{"glob": "*.rs", "starts_at": "("}], ["*.rs"],
+                        [{"glob": "*.rs", "starts_at": "x", "attached_above": 3}],
+                        [{"glob": "*.rs", "starts_at": "x", "attached_above": "("}],
+                        [{"glob": "*.rs", "starts_at": "x", "guarded_lines": 3}],
+                        [{"glob": "*.rs", "starts_at": "x", "guarded_lines": "("}]):
+                with open(path, "w") as f:
+                    json.dump(dict(CFG, inline_tests=bad), f)
+                with self.assertRaises(ValueError, msg=repr(bad)):
+                    guard.load_config(path)
+            with open(path, "w") as f:
+                json.dump(self.RUST, f)
+            self.assertEqual(guard.load_config(path)["inline_tests"], self.RUST["inline_tests"])
+
+
 class FailureModes(unittest.TestCase):
     def test_bad_config_asks(self):
         with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as f:

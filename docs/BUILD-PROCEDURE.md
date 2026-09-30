@@ -112,7 +112,21 @@ a product.
 - [ ] Write the failing test, SEE it fail, then engage the **fix-lock**
       (`python3 .claude/hooks/guard.py fix-lock on <record>`). From then
       on, test files and baselines are read-only to the AI session: the fix
-      goes in the code, not the test. Releasing it (`fix-lock off`) needs
+      goes in the code, not the test. So are tests written inside a
+      source file (Rust's `#[cfg(test)]` module, or a test-only helper
+      under `#[cfg(any(test, …))]`, from the marker to the end of the file,
+      together with the attribute and comment lines directly above it;
+      `inline_tests` in guard-config.json). An Edit to such a file must
+      match its text exactly and leave the tests unchanged. A shell write
+      to any file of that type (every `.rs` file) is refused while locked,
+      because it cannot be checked, so use Edit or Write. While locked,
+      production code may not start acting differently under test: lines
+      with `cfg(test)`, `cfg!(test)`, `cfg_attr(test, …)` or an
+      assert-macro shadow cannot be added, removed or changed. This is a
+      tripwire, not a wall. A disguised switch-off (an attribute on the code
+      line above, an inner `#![cfg]`, a changed `mod` line) shows as a drop
+      in the "N passed" count, so compare it before and after a fix. Other
+      disguised cheats are left to review. Releasing it (`fix-lock off`) needs
       the owner.
 - [ ] Read the actual error/log — not what you expect it to say. The clue is
       usually verbatim in there. (Case study: a "stuck" node was printing
@@ -295,7 +309,7 @@ advisory; back critical policies with hooks.")
 | `git push` to a protected branch (`main`) | **ask** |
 | Writing a protected path (constitution, procedure, CI, git hooks, the guard itself) | **ask** |
 | Funds / money-daemon / real-order commands (per-repo list) | **ask** |
-| Writing tests or baselines while the fix-lock is engaged | **deny** |
+| Writing tests (test files, or the tests inside a source file) or baselines while the fix-lock is engaged | **deny** |
 | The guard itself fails (bad config, crash) | **ask**, with the error. Never fail-open |
 
 **Profiles (owner, 2026-09-27): how strict the guard is, switched with one command.**
