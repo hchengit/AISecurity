@@ -28,13 +28,23 @@ and after, and an Edit must match the file exactly (the Edit tool also matches
 loosely, which the guard can't follow). A shell write to a file of that type
 is refused by name, as a test file's is, since it can't be checked.
 
+A fix-lock belongs to the session that took it (owner, 2026-10-03: "Let's not
+share fix-lock"). `fix-lock on` inside a Claude Code session writes
+.claude/state/fix-locks/<CLAUDE_CODE_SESSION_ID>.json and binds only that
+session (the hook reads `session_id`); taken outside a session (the owner's
+terminal) it writes the global .claude/state/fix-lock, which binds every
+session. `off` releases only your own; `off --session <id>` / `off --global`
+release someone else's and always ask the owner.
+
 Bash matching is a tripwire, not a wall: it reads the command segment by
 segment (split on ; && || | and newlines, recursing into sh -c), so routine
-commands stay silent. A determined `python -c open(...)` gets past it. That
-is what code review and the owner are for.
+commands stay silent. While your lock is held, inline interpreter code
+(python/node/... with -c/-e/stdin/heredoc) that writes and names a test path
+is refused (the 2026-10-03 heredoc hole); a determined workaround still gets
+past it. That is what code review and the owner are for.
 
 Hook:  stdin = PreToolUse JSON  (wired in .claude/settings.json)
-CLI:   guard.py fix-lock on <build-record> | off | status
+CLI:   guard.py fix-lock on <build-record> | off [--session <id> | --global] | status
        guard.py profile [development | stable]
 """
 from __future__ import annotations
@@ -53,6 +63,8 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(os.path.dirname(HERE))
 CONFIG_PATH = os.path.join(HERE, "guard-config.json")
 LOCK_REL = ".claude/state/fix-lock"
+# One lock per Claude Code session: <session id>.json (see the header).
+LOCK_DIR_REL = ".claude/state/fix-locks"
 # Every release, one JSON line: a release may be free (the owner's choice) but never invisible.
 LOCK_LOG_REL = ".claude/state/fix-lock.log"
 # An ask the development profile let through, one JSON line each: relaxed, never invisible.
@@ -400,6 +412,57 @@ def current_branch(cwd: str) -> str:
         return ""
 
 
+# ── fix-lock ownership ──────────────────────────────────────────────────────
+
+def session_lock_path(root: str, session: str) -> str:
+    """The lock file for one session; the id is reduced to [A-Za-z0-9_-]."""
+    safe = re.sub(r"[^A-Za-z0-9_-]", "_", session) or "_"
+    return os.path.join(root, LOCK_DIR_REL, safe + ".json")
+
+
+def lock_held(root: str, session: str | None) -> bool:
+    """Is the caller locked? The global lock binds everyone; a session lock its owner."""
+    if os.path.exists(os.path.join(root, LOCK_REL)):
+        return True
+    return bool(session) and os.path.exists(session_lock_path(root, session))
+
+
+def is_lock_file(rel: str) -> bool:
+    return rel == LOCK_REL or rel.startswith(LOCK_DIR_REL + "/")
+
+
+INTERPRETERS = ("python", "python3", "node", "perl", "ruby", "tsx", "deno", "bun")
+INLINE_CODE = re.compile(r"(?:^|\s)(?:-c|-e|--eval|-)(?:\s|$)|<<")
+INLINE_WRITE = re.compile(r"open\([^)]*['\"][wax+]+b?['\"]|\.write_text\(|\.write_bytes\(|writeFile|appendFile|"
+                          r"fs\.write|createWriteStream|\bunlink|\.unlink\(|os\.remove|shutil\.")
+
+
+def inline_code_test_writes(cmd: str, cwd: str, cfg: dict, root: str) -> list:
+    """Test paths written by inline interpreter code (python3 - <<EOF, node -e …).
+
+    The 2026-10-03 hole: a python3 heredoc with a relative path wrote a test
+    file while a lock was engaged — write_targets() only sees shell syntax.
+    Running a test file (no inline code, or inline code that only reads) passes."""
+    first = cmd.strip().split("\n", 1)[0]
+    # Any segment of the first line may start the interpreter (live drill,
+    # 2026-10-03: `cd X && python3 - <<'EOF'` got past a first-word check).
+    inline = False
+    for part in re.split(r"&&|\|\||;|\|", first):
+        words = part.split()
+        if words and os.path.basename(words[0]) in INTERPRETERS and INLINE_CODE.search(part):
+            inline = True
+    if not inline or not INLINE_WRITE.search(cmd):
+        return []
+    found = []
+    for tok in re.findall(r"[\w@./+-]+", cmd):
+        if "/" not in tok and "." not in tok:
+            continue
+        rel = rel_to_root(tok, cwd, root)
+        if rel and matches(rel, cfg["test_globs"]) and rel not in found:
+            found.append(rel)
+    return found
+
+
 # ── decision ────────────────────────────────────────────────────────────────
 
 def decide(event: dict, cfg: dict, root: str = ROOT, lock_present: bool | None = None,
@@ -413,7 +476,7 @@ def decide(event: dict, cfg: dict, root: str = ROOT, lock_present: bool | None =
     tin = event.get("tool_input") or {}
     cwd = event.get("cwd") or root
     if lock_present is None:
-        lock_present = os.path.exists(os.path.join(root, LOCK_REL))
+        lock_present = lock_held(root, event.get("session_id"))
     hits = []
 
     if tool in PATH_TOOLS:
@@ -425,7 +488,7 @@ def decide(event: dict, cfg: dict, root: str = ROOT, lock_present: bool | None =
                              "%s is a secret file — its contents must not enter the transcript; "
                              "ask the owner for the one value you need" % raw, True))
             if rel is not None and tool not in READ_TOOLS:
-                if rel == LOCK_REL:
+                if is_lock_file(rel):
                     if tool != "Write":
                         hits.append(("ask", "editing the fix-lock ends the fix phase — owner approves", False))
                 elif matches(rel, cfg["protected_globs"]):
@@ -440,7 +503,12 @@ def decide(event: dict, cfg: dict, root: str = ROOT, lock_present: bool | None =
                     if hit:
                         hits.append(hit)
     elif tool == "Bash":
-        hits += bash_hits(tin.get("command", ""), cwd, cfg, root, lock_present, branch_fn)
+        cmd = tin.get("command", "")
+        hits += bash_hits(cmd, cwd, cfg, root, lock_present, branch_fn)
+        if lock_present:
+            for rel in inline_code_test_writes(cmd, cwd, cfg, root):
+                hits.append(("deny", "fix-lock is engaged: inline code in this command writes test/baseline %s. "
+                                     "Fix the code, not the test" % rel, True))
 
     if cfg.get("profile", "stable") == "development":
         let_through = [r for d, r, keep in hits if d == "ask" and not keep]
@@ -472,9 +540,12 @@ def bash_hits(cmd: str, cwd: str, cfg: dict, root: str, lock_present: bool, bran
             d, r = git_push_verdict(args, cwd, cfg, branch_fn)
             if d != "allow":
                 hits.append((d, r, False))
-        if ("guard.py" in seg and "fix-lock" in words and "off" in words
-                and cfg.get("fix_lock_release_needs_owner", True)):
-            hits.append(("ask", "releasing the fix-lock ends the fix phase — owner approves", False))
+        if "guard.py" in seg and "fix-lock" in words and "off" in words:
+            if "--session" in words or "--global" in words:
+                hits.append(("ask", "this releases a fix-lock another session (or the owner) holds — owner "
+                                    "approves", True))
+            elif cfg.get("fix_lock_release_needs_owner", True):
+                hits.append(("ask", "releasing the fix-lock ends the fix phase — owner approves", False))
         if ("guard.py" in seg and "profile" in words and "development" in words
                 and cfg.get("profile", "stable") != "development"):
             hits.append(("ask", "switching the guard to 'development' stops most of its asks — owner "
@@ -483,7 +554,7 @@ def bash_hits(cmd: str, cwd: str, cfg: dict, root: str, lock_present: bool, bran
             rel = rel_to_root(target, cwd, root)
             if rel is None:
                 continue
-            if rel == LOCK_REL or matches(rel, cfg["protected_globs"]):
+            if is_lock_file(rel) or matches(rel, cfg["protected_globs"]):
                 hits.append(("ask", "command writes protected path %s — owner approves" % rel, False))
             if not lock_present:
                 continue
@@ -561,40 +632,68 @@ def fix_lock_preflight(root: str, config_path: str) -> str | None:
     return None
 
 
-def fix_lock_cli(args: list, root: str = ROOT, config_path: str = CONFIG_PATH) -> int:
-    lock = os.path.join(root, LOCK_REL)
+def _read_lock(path: str) -> dict:
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return {}
+
+
+def fix_lock_cli(args: list, root: str = ROOT, config_path: str = CONFIG_PATH, session: str | None = None) -> int:
+    """`session`: the caller's Claude Code session (main() passes
+    CLAUDE_CODE_SESSION_ID); None = the global lock, which binds every session."""
+    glob_lock = os.path.join(root, LOCK_REL)
+    own = session_lock_path(root, session) if session else glob_lock
     if args[:1] == ["on"] and len(args) == 2:
         refused = fix_lock_preflight(root, config_path)
         if refused:
             print("fix-lock NOT engaged — %s\nNothing was changed. Fix it first, then engage." % refused,
                   file=sys.stderr)
             return 1
-        os.makedirs(os.path.dirname(lock), exist_ok=True)
-        with open(lock, "w") as f:
-            json.dump({"record": args[1], "since": time.strftime("%Y-%m-%dT%H:%M:%S%z")}, f)
-        print("fix-lock ENGAGED for %s — test files, inline tests and baselines are now read-only" % args[1])
+        os.makedirs(os.path.dirname(own), exist_ok=True)
+        with open(own, "w") as f:
+            json.dump({"record": args[1], "since": time.strftime("%Y-%m-%dT%H:%M:%S%z"), "session": session}, f)
+        scope = "this session" if session else "EVERY session (global lock)"
+        print("fix-lock ENGAGED for %s (%s) — test files, inline tests and baselines are now read-only"
+              % (args[1], scope))
         return 0
-    if args == ["off"]:
-        if os.path.exists(lock):
-            try:
-                with open(lock) as f:
-                    held = json.load(f)
-            except (OSError, ValueError):
-                held = {}
-            with open(os.path.join(root, LOCK_LOG_REL), "a") as f:
-                f.write(json.dumps({"record": held.get("record"), "engaged_since": held.get("since"),
-                                    "released_at": time.strftime("%Y-%m-%dT%H:%M:%S%z")}) + "\n")
-            os.remove(lock)
-        print("fix-lock released")
-        return 0
-    if args == ["status"]:
-        if os.path.exists(lock):
-            with open(lock) as f:
-                print(f.read())
+    if args[:1] == ["off"]:
+        if args == ["off"]:
+            target = own
+        elif len(args) == 3 and args[1] == "--session":
+            target = session_lock_path(root, args[2])
+        elif args == ["off", "--global"]:
+            target = glob_lock
         else:
+            target = None
+        if target is not None:
+            if os.path.exists(target):
+                held = _read_lock(target)
+                with open(os.path.join(root, LOCK_LOG_REL), "a") as f:
+                    f.write(json.dumps({"record": held.get("record"), "engaged_since": held.get("since"),
+                                        "session": held.get("session"), "released_by": session,
+                                        "released_at": time.strftime("%Y-%m-%dT%H:%M:%S%z")}) + "\n")
+                os.remove(target)
+                print("fix-lock released (%s)" % (held.get("record") or "?"))
+            else:
+                print("no fix-lock held there — nothing released")
+            return 0
+    if args == ["status"]:
+        found = []
+        if os.path.exists(glob_lock):
+            found.append(("GLOBAL (binds every session)", _read_lock(glob_lock)))
+        for path in sorted(glob.glob(os.path.join(root, LOCK_DIR_REL, "*.json"))):
+            held = _read_lock(path)
+            mine = bool(session) and os.path.abspath(path) == os.path.abspath(own)
+            found.append(("session %s%s" % (held.get("session") or os.path.basename(path)[:-5],
+                                            " (this session)" if mine else ""), held))
+        if not found:
             print("fix-lock not engaged")
+        for who, held in found:
+            print("%s: %s since %s" % (who, held.get("record"), held.get("since")))
         return 0
-    print("usage: guard.py fix-lock on <build-record> | off | status", file=sys.stderr)
+    print("usage: guard.py fix-lock on <build-record> | off [--session <id> | --global] | status", file=sys.stderr)
     return 2
 
 
@@ -647,7 +746,7 @@ def profile_cli(args: list, root: str = ROOT, config_path: str = CONFIG_PATH) ->
 
 def main() -> int:
     if sys.argv[1:2] == ["fix-lock"]:
-        return fix_lock_cli(sys.argv[2:])
+        return fix_lock_cli(sys.argv[2:], session=os.environ.get("CLAUDE_CODE_SESSION_ID") or None)
     if sys.argv[1:2] == ["profile"]:
         return profile_cli(sys.argv[2:])
     out = run_hook(sys.stdin.read())

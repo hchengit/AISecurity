@@ -582,5 +582,127 @@ class FailureModes(unittest.TestCase):
                 guard.load_config(cfg)
 
 
+class PerSessionLock(unittest.TestCase):
+    """Owner, 2026-10-03: "Let's not share fix-lock." Two sessions worked one
+    repo; one session's lock blocked the other's test writes, `on` overwrote
+    another record's lock and `off` released anyone's. A lock now binds only
+    the session that took it; the old global file (taken outside any session,
+    e.g. from the owner's terminal) still binds everyone."""
+
+    TEST = "tests/test_something.py"
+
+    def _cfg(self, root: str) -> str:
+        cfg = json.loads(json.dumps(CFG))
+        cfg.pop("fix_lock_preflight", None)
+        path = os.path.join(root, "guard-config.json")
+        with open(path, "w") as f:
+            json.dump(cfg, f)
+        return path
+
+    def _edit(self, root: str, session) -> str:
+        event = {"tool_name": "Edit", "tool_input": {"file_path": self.TEST}, "cwd": root}
+        if session is not None:
+            event["session_id"] = session
+        return guard.decide(event, dict(CFG, profile="stable"), root, branch_fn=lambda _c: "feature/x")[0]
+
+    def test_a_lock_binds_only_its_own_session(self):
+        with tempfile.TemporaryDirectory() as root:
+            self.assertEqual(guard.fix_lock_cli(["on", "docs/build-records/a.md"], root, self._cfg(root),
+                                                session="sess-A"), 0)
+            self.assertFalse(os.path.exists(os.path.join(root, guard.LOCK_REL)))
+            self.assertEqual(self._edit(root, "sess-A"), "deny")
+            self.assertEqual(self._edit(root, "sess-B"), "allow")
+            self.assertEqual(self._edit(root, None), "allow")
+
+    def test_the_global_lock_still_binds_everyone(self):
+        with tempfile.TemporaryDirectory() as root:
+            self.assertEqual(guard.fix_lock_cli(["on", "docs/build-records/owner.md"], root, self._cfg(root)), 0)
+            for s in ("sess-A", "sess-B", None):
+                self.assertEqual(self._edit(root, s), "deny")
+
+    def test_on_never_touches_another_sessions_lock_and_off_only_releases_your_own(self):
+        with tempfile.TemporaryDirectory() as root:
+            cfg = self._cfg(root)
+            guard.fix_lock_cli(["on", "docs/build-records/a.md"], root, cfg, session="sess-A")
+            guard.fix_lock_cli(["on", "docs/build-records/b.md"], root, cfg, session="sess-B")
+            guard.fix_lock_cli(["on", "docs/build-records/owner.md"], root, cfg)  # global
+            with open(guard.session_lock_path(root, "sess-A")) as f:
+                self.assertEqual(json.load(f)["record"], "docs/build-records/a.md")
+            self.assertEqual(guard.fix_lock_cli(["off"], root, cfg, session="sess-B"), 0)
+            self.assertFalse(os.path.exists(guard.session_lock_path(root, "sess-B")))
+            self.assertTrue(os.path.exists(guard.session_lock_path(root, "sess-A")))
+            self.assertTrue(os.path.exists(os.path.join(root, guard.LOCK_REL)))
+            # releasing someone else's is explicit
+            self.assertEqual(guard.fix_lock_cli(["off", "--session", "sess-A"], root, cfg, session="sess-B"), 0)
+            self.assertFalse(os.path.exists(guard.session_lock_path(root, "sess-A")))
+            self.assertEqual(guard.fix_lock_cli(["off", "--global"], root, cfg, session="sess-B"), 0)
+            self.assertFalse(os.path.exists(os.path.join(root, guard.LOCK_REL)))
+
+    def test_every_release_is_logged_with_its_session(self):
+        with tempfile.TemporaryDirectory() as root:
+            cfg = self._cfg(root)
+            guard.fix_lock_cli(["on", "docs/build-records/a.md"], root, cfg, session="sess-A")
+            guard.fix_lock_cli(["off"], root, cfg, session="sess-A")
+            with open(os.path.join(root, guard.LOCK_LOG_REL)) as f:
+                entry = json.loads(f.read().splitlines()[-1])
+            self.assertEqual((entry["record"], entry["session"]), ("docs/build-records/a.md", "sess-A"))
+            self.assertIn("released_at", entry)
+
+    def test_status_lists_every_lock_and_marks_yours(self):
+        import contextlib
+        import io
+        with tempfile.TemporaryDirectory() as root:
+            cfg = self._cfg(root)
+            guard.fix_lock_cli(["on", "docs/build-records/a.md"], root, cfg, session="sess-A")
+            guard.fix_lock_cli(["on", "docs/build-records/b.md"], root, cfg, session="sess-B")
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                self.assertEqual(guard.fix_lock_cli(["status"], root, cfg, session="sess-A"), 0)
+            out = buf.getvalue()
+            self.assertIn("docs/build-records/a.md", out)
+            self.assertIn("docs/build-records/b.md", out)
+            self.assertIn("this session", out)
+
+    def test_a_session_id_cannot_escape_the_lock_directory(self):
+        with tempfile.TemporaryDirectory() as root:
+            path = guard.session_lock_path(root, "../../etc/x")
+            self.assertTrue(os.path.realpath(path).startswith(os.path.realpath(
+                os.path.join(root, guard.LOCK_DIR_REL)) + os.sep))
+
+    def test_releasing_someone_elses_lock_always_asks(self):
+        for cmd in ("python3 .claude/hooks/guard.py fix-lock off --session abc",
+                    "python3 .claude/hooks/guard.py fix-lock off --global"):
+            for profile in ("stable", "development"):
+                self.assertEqual(verdict("Bash", {"command": cmd}, profile=profile), "ask")
+
+    def test_lock_files_are_guarded_like_the_global_one(self):
+        self.assertEqual(verdict("Bash", {"command": "rm -f .claude/state/fix-locks/sess-A.json"}), "ask")
+        self.assertEqual(verdict("Edit", {"file_path": ".claude/state/fix-locks/sess-A.json"}), "ask")
+
+    # The 2026-10-03 hole: a python3 heredoc with a relative path wrote a test
+    # file while a lock was engaged — only shell write targets were checked.
+    def test_inline_code_cannot_write_a_locked_test(self):
+        writes = [
+            "python3 - <<'EOF'\nopen('tests/test_something.py', 'a').write('x')\nEOF",
+            "python3 -c \"open('tests/test_something.py','w').write('')\"",
+            "node -e \"require('fs').writeFileSync('tests/test_something.py', '')\"",
+            "python3 <<EOF\nfrom pathlib import Path\nPath('tests/test_something.py').write_text('')\nEOF",
+            # Live drill, 2026-10-03: the interpreter was not the first word.
+            "cd . && python3 - <<'EOF'\nopen('tests/test_something.py', 'w').write('// drill')\nEOF",
+            "echo go | python3 -c \"open('tests/test_something.py','w')\"",
+        ]
+        for cmd in writes:
+            self.assertEqual({"cmd": cmd, "v": verdict("Bash", {"command": cmd}, lock=True)},
+                             {"cmd": cmd, "v": "deny"})
+            self.assertEqual(verdict("Bash", {"command": cmd}, lock=False), "allow")
+
+    def test_running_or_reading_a_test_is_still_fine_while_locked(self):
+        for cmd in ("python3 -m pytest tests/test_something.py",
+                    "node --test tests/test_something.py",
+                    "python3 -c \"print(open('tests/test_something.py').read())\""):
+            self.assertEqual({"cmd": cmd, "v": verdict("Bash", {"command": cmd}, lock=True)},
+                             {"cmd": cmd, "v": "allow"})
+
+
 if __name__ == "__main__":
     unittest.main()
