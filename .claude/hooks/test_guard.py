@@ -699,7 +699,11 @@ class PerSessionLock(unittest.TestCase):
     def test_running_or_reading_a_test_is_still_fine_while_locked(self):
         for cmd in ("python3 -m pytest tests/test_something.py",
                     "node --test tests/test_something.py",
-                    "python3 -c \"print(open('tests/test_something.py').read())\""):
+                    "python3 -c \"print(open('tests/test_something.py').read())\"",
+                    # False positive seen 2026-10-03: inline code writes a SOURCE
+                    # file, a later command runs the tests by path.
+                    "python3 - <<'EOF'\nopen('src/app.py', 'w').write('x')\nEOF\npython3 -m pytest tests/test_something.py",
+                    "cd . && python3 - <<'EOF'\nopen('src/app.py','w')\nEOF\nnpx jest tests/test_something.py"):
             self.assertEqual({"cmd": cmd, "v": verdict("Bash", {"command": cmd}, lock=True)},
                              {"cmd": cmd, "v": "allow"})
 

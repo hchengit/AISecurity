@@ -443,18 +443,31 @@ def inline_code_test_writes(cmd: str, cwd: str, cfg: dict, root: str) -> list:
     The 2026-10-03 hole: a python3 heredoc with a relative path wrote a test
     file while a lock was engaged — write_targets() only sees shell syntax.
     Running a test file (no inline code, or inline code that only reads) passes."""
-    first = cmd.strip().split("\n", 1)[0]
+    lines = cmd.strip().split("\n")
     # Any segment of the first line may start the interpreter (live drill,
     # 2026-10-03: `cd X && python3 - <<'EOF'` got past a first-word check).
-    inline = False
-    for part in re.split(r"&&|\|\||;|\|", first):
+    # Only the inline code itself is read: the -c/-e argument on that segment
+    # and the heredoc body up to its terminator — not the commands around it
+    # (false positive, 2026-10-03: a source edit followed by `jest <test path>`).
+    regions = []
+    for part in re.split(r"&&|\|\||;|\|", lines[0]):
         words = part.split()
-        if words and os.path.basename(words[0]) in INTERPRETERS and INLINE_CODE.search(part):
-            inline = True
-    if not inline or not INLINE_WRITE.search(cmd):
+        if not (words and os.path.basename(words[0]) in INTERPRETERS and INLINE_CODE.search(part)):
+            continue
+        regions.append(part)
+        heredoc = re.search(r"<<-?\s*['\"]?(\w+)['\"]?", part)
+        if heredoc:
+            body = []
+            for ln in lines[1:]:
+                if ln.strip() == heredoc.group(1):
+                    break
+                body.append(ln)
+            regions.append("\n".join(body))
+    code = "\n".join(regions)
+    if not code or not INLINE_WRITE.search(code):
         return []
     found = []
-    for tok in re.findall(r"[\w@./+-]+", cmd):
+    for tok in re.findall(r"[\w@./+-]+", code):
         if "/" not in tok and "." not in tok:
             continue
         rel = rel_to_root(tok, cwd, root)
