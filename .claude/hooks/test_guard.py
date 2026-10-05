@@ -450,6 +450,82 @@ class InlineTests(unittest.TestCase):
         for cmd in ("cat src/lib.rs", "sed -i 's/a/b/' src/notes.md", "cargo test -p x"):
             self.assertEqual(self.v("Bash", {"command": cmd}), "allow", cmd)
 
+    def test_inline_code_writes_to_rust_files(self):
+        # The 2026-10-04 gap (rikurinode, electrs_phase.rs): a python heredoc
+        # wrote a Rust file under the lock and passed, while `sed -i` on the
+        # same file was refused — interpreter writes were checked against test
+        # FILES only. Now refused like a shell write; Edit/Write stay open.
+        for cmd in ("python3 - <<'EOF'\np='src/lib.rs'\ns=open(p).read()\nopen(p,'w').write(s.replace('4','5'))\nEOF",
+                    "python3 -c \"open('src/lib.rs','w').write('')\"",
+                    "node -e \"require('fs').writeFileSync('src/plain.rs', '')\"",
+                    "cd src && python3 - <<'EOF'\nopen('lib.rs','a').write('x')\nEOF",
+                    "python3 - <<'EOF'\nfrom pathlib import Path\nPath('src/new.rs').write_text('fn x() {}')\nEOF",
+                    # unresolvable target: strict, any covered path in the code counts
+                    "python3 - \"$f\" <<'EOF'\nimport sys\nopen(sys.argv[1],'w').write(open('src/lib.rs').read())\nEOF"):
+            self.assertEqual({"cmd": cmd, "v": self.v("Bash", {"command": cmd})}, {"cmd": cmd, "v": "deny"})
+            self.assertEqual({"cmd": cmd, "v": self.v("Bash", {"command": cmd}, lock=False)},
+                             {"cmd": cmd, "v": "allow"})
+        for cmd in ("python3 -c \"print(open('src/lib.rs').read())\"",
+                    "python3 - <<'EOF'\nopen('docs/notes.md','w').write('see src/lib.rs')\nEOF",
+                    "node -e \"require('fs').writeFileSync('src/notes.md', '// src/lib.rs')\""):
+            self.assertEqual({"cmd": cmd, "v": self.v("Bash", {"command": cmd})}, {"cmd": cmd, "v": "allow"})
+
+    def test_lock_bypasses_found_by_the_verifier(self):
+        # Verifier, 2026-10-05: shapes that still wrote a covered file under the
+        # lock — a path built from pieces, a path passed as an argument,
+        # bundled/long in-place flags, perl's paren-less open. (A script FILE
+        # run by path is out of scope: the guard judges commands and never
+        # reads the files a command runs — verifier round 2: reading them
+        # leaked secret-file contents into reasons and blew the time budget.)
+        denied = (
+            "python3 - <<'EOF'\nd='src'\nopen(f'{d}/lib.rs','w').write('')\nEOF",
+            "python3 - <<'EOF'\nd='src'\nopen(d + '/lib.rs','w').write('')\nEOF",
+            "node -e \"const d='src'; require('fs').writeFileSync(`${d}/lib.rs`, '')\"",
+            "python3 -c \"import sys; open(sys.argv[1],'w').write('')\" src/lib.rs",
+            "python3 - src/lib.rs <<'EOF'\nimport sys\nopen(sys.argv[1],'w').write('')\nEOF",
+            "sed -Ei 's/4/5/' src/lib.rs", "sed --in-place=.bak 's/4/5/' src/lib.rs",
+            "perl -pi -e 's/4/5/' src/lib.rs", "awk -i inplace '{print}' src/lib.rs",
+            "perl -e 'open F, \">src/lib.rs\"; print F 1'",
+            # the same holes for a test FILE (built path)
+            "python3 - <<'EOF'\nd='tests'\nopen(f'{d}/test_x.py','w').write('')\nEOF",
+        )
+        for cmd in denied:
+            self.assertEqual({"cmd": cmd, "v": self.v("Bash", {"command": cmd})}, {"cmd": cmd, "v": "deny"})
+            self.assertEqual({"cmd": cmd, "v": self.v("Bash", {"command": cmd}, lock=False)},
+                             {"cmd": cmd, "v": "allow"})
+        for cmd in ("perl -ne 'print' src/lib.rs", "sed -n '1,5p' src/lib.rs",
+                    "python3 - <<'EOF'\nopen('/tmp/x.md','w').write('d/lib.rs')\nEOF",
+                    # code that writes nothing: a read-only loop over the files
+                    "python3 - <<'EOF'\nimport glob\nfor f in sorted(glob.glob('src/*.rs')):\n"
+                    "    print(f, len(open(f).read()))\nEOF",
+                    # verifier round 2: perl READS ('<' modes) are not writes
+                    "perl -e 'open(F, \"<src/lib.rs\"); print <F>'",
+                    "perl -e 'open my $fh, \"<\", \"src/lib.rs\"; print <$fh>'",
+                    # ... and an argument belongs to its own interpreter run only
+                    "python3 -c \"import subprocess; subprocess.run(['true'])\" && python3 -m mytool src/lib.rs"):
+            self.assertEqual({"cmd": cmd, "v": self.v("Bash", {"command": cmd})}, {"cmd": cmd, "v": "allow"})
+
+    def test_huge_inline_code_stays_inside_the_time_budget(self):
+        # Verifier round 2, 2026-10-05: the write scanner never checked the
+        # guard's deadline; unbalanced `open(` calls made it quadratic (a 40 KB
+        # script: 25 s, past the hook's 10 s timeout). Too slow = ask, in time.
+        import time
+        code = "\n".join("open('/tmp/x%d.md', 'w'" % i for i in range(4000))
+        cmd = "python3 - <<'EOF'\n" + code + "\nEOF"
+        t0 = time.time()
+        v = self.v("Bash", {"command": cmd})
+        self.assertLess(time.time() - t0, 8.0)
+        self.assertIn(v, ("ask", "deny"))
+
+    def test_the_guards_own_commands_run_under_the_lock(self):
+        # Verifier, 2026-10-05: scanning script FILES read guard.py itself (full
+        # of test paths and writes), so `guard.py fix-lock off` was refused under
+        # the lock. The repo's tracked scripts are not ad-hoc edits.
+        for cmd in ("python3 .claude/hooks/guard.py fix-lock off", "python3 .claude/hooks/guard.py fix-lock status",
+                    "python3 .claude/hooks/guard.py profile stable"):
+            self.assertNotEqual({"cmd": cmd, "v": verdict("Bash", {"command": cmd}, lock=True)},
+                                {"cmd": cmd, "v": "deny"})
+
     def test_denies_hold_in_development(self):
         self.assertEqual(self.v("Edit", self.edit(", 4)", ", 5)"), profile="development"), "deny")
         self.assertEqual(self.v("Bash", {"command": "rm src/lib.rs"}, profile="development"), "deny")

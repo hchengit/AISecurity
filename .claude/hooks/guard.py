@@ -477,8 +477,17 @@ def write_targets(seg: str) -> list:
         out += paths
     elif verb in WRITE_LAST_ARG and paths:
         out.append(paths[-1])
-    elif verb in ("sed", "perl") and any(a.startswith("-i") or a == "--in-place" for a in args):
+    elif verb in ("sed", "perl") and any(a.startswith("-i") or a.startswith("--in-place") for a in args):
         out += paths
+    # bundled with other flags (verifier 2026-10-05): `sed -Ei`, `sed -ni`, `perl -pi`, `perl -0pi`
+    elif verb == "sed" and any(re.fullmatch(r"-[nEsrzu]+i.*", a) for a in args):
+        out += paths
+    elif verb == "perl" and any(re.fullmatch(r"-[0anpslwTtuUWX]+i.*", a) for a in args):
+        out += paths
+    elif verb in ("awk", "gawk") and any(
+            a in ("-iinplace", "--include=inplace") or (a in ("-i", "--include") and args[k + 1:k + 2] == ["inplace"])
+            for k, a in enumerate(args)):
+        out += [p for p in paths if p != "inplace"]
     elif verb == "dd":
         out += [a[3:] for a in args if a.startswith("of=")]
     elif verb == "git" and paths and paths[0] in GIT_PATH_WRITERS:
@@ -695,6 +704,7 @@ def _write_targets_in(code: str) -> tuple:
     write call in `code`."""
     targets, unresolved, covered, names = [], False, [], []
     for m in WRITE_FUNCS.finditer(code):
+        _tick()  # quadratic on unbalanced calls: stay inside the time budget
         name, start = m.group(1), m.end() - 1
         end = _balanced(code, start)
         covered.append((m.start(), end))
@@ -721,6 +731,7 @@ def _write_targets_in(code: str) -> tuple:
             else:
                 targets.append(path)
     for m in RECEIVER_WRITES.finditer(code):
+        _tick()
         dot = m.start()
         if m.group(1) == "open":
             end = _balanced(code, m.end() - 1)
@@ -751,6 +762,7 @@ def _write_targets_in(code: str) -> tuple:
         else:
             targets.append(path)
     for h in INLINE_WRITE.finditer(code):
+        _tick()
         if not any(a <= h.start() < b for a, b in covered):
             unresolved = True  # a write the scanner cannot read: stay strict
     if re.search(r"\bchdir\s*\(", code):
@@ -976,8 +988,56 @@ def _test_dir_names(cfg: dict) -> set:
     return names
 
 
+PERL_OPEN = re.compile(r"\bopen\s+(?:my\s+)?[$\w]")  # perl's paren-less `open F, ">x"`
+# perl writes: a write/append/read-write/pipe mode on open, or a writing builtin
+PERL_WRITE = re.compile(r"""\bopen\s*\(?\s*(?:my\s+)?[$\w]+\s*,\s*['"]\s*(?:\+?[>|]|\+<|[^'"]*\|\s*['"])"""
+                        r"""|\b(?:sysopen|unlink|rename|truncate|system|exec|qx|copy|move|write_file)\b|`""")
+FRAGMENT_BEFORE = re.compile(r"(?:\}|\+\s*['\"`])$")  # `{d}/x`, `${d}/x`, `+ '/x'`
+
+
+def _inline_argv(cmd: str, cwd: str) -> list:
+    """(the inline code texts, their argument words, folders) for each
+    interpreter run whose program is inline code (-c/-e/-p, or `-` with a
+    heredoc). The arguments belong to THAT code only (verifier round 2: they
+    leaked onto unrelated runs). A script run by path is not read: the guard
+    judges commands, never the files a command runs."""
+    shell, bodies = split_heredocs(cmd)
+    out, heres = [], [cwd]
+    for seg in split_segments("\n".join(shell)):
+        _tick()
+        verb, args = verb_and_args(words_of(seg))
+        if verb in ("cd", "pushd"):
+            nxt = cd_target(heres[-1], args)
+            heres = heres + [nxt] if nxt not in heres and len(heres) < MAX_FOLDERS else heres
+            continue
+        seg_bodies = [b for tag in (t for _d, t in HEREDOC.findall(seg))
+                      for t2, b, _l in bodies if t2 == tag]
+        if not INTERPRETER.fullmatch(verb):
+            continue
+        codes, words, k, stdin = [], [], 0, False
+        while k < len(args):
+            a = args[k]
+            if a in INLINE_FLAGS or re.fullmatch(r"-[A-Za-z]*[ceEp]", a):
+                codes += args[k + 1:k + 2]
+                k += 2
+                continue
+            if a == "-":
+                stdin = True
+            elif codes or stdin:
+                if a[:1] not in "<>":
+                    words.append(a)
+            elif not a.startswith("-"):
+                break  # a script file or `-m module`: not inline code
+            k += 1
+        codes += seg_bodies if stdin else []
+        if codes:
+            out.append((codes, words, list(heres)))
+    return out
+
+
 def inline_code_test_writes(cmd: str, cwd: str, cfg: dict, root: str) -> list:
-    """Test paths written by inline interpreter code (python3 - <<EOF, node -e …).
+    """Test paths, and files covered by `inline_tests`, written by inline
+    interpreter code (python3 - <<EOF, node -e …).
 
     The 2026-10-03 hole: a python3 heredoc with a relative path wrote a test
     file while a lock was engaged — write_targets() only sees shell syntax.
@@ -989,19 +1049,40 @@ def inline_code_test_writes(cmd: str, cwd: str, cfg: dict, root: str) -> list:
     interpreter) it is strict: every test path in the code counts, and so does
     a test DIRECTORY name (paths built from pieces: f'{d}/x', join('tests',…))."""
     found, test_dirs = [], _test_dir_names(cfg)
+    runs = _inline_argv(cmd, cwd)
     for interp, code, here in _inline_regions(cmd, cwd):
-        if not INLINE_WRITE.search(code):
+        perl = interp.startswith("perl")
+        if not INLINE_WRITE.search(code) and not (perl and PERL_OPEN.search(code)):
             continue
         targets, unresolved, names = _write_targets_in(code)
+        # An inline-tests file counts only when the code writes something
+        # (a read-only loop over *.rs files is not an edit); test paths keep
+        # the older, stricter rule unchanged. perl: only its write modes
+        # (`>`, `>>`, `+<`, a pipe) or a writing builtin count — the python
+        # reading of `open(F, "<x")` took a letter of the path for a mode.
+        writes = (bool(PERL_WRITE.search(code)) if perl
+                  else bool(targets) or unresolved)
+        argv = [(a, h) for codes, words, heres in runs if code in codes for a in words for h in heres]
         # Lenient only for straight-line python/node code (string contents
         # don't count: a record's text may say "for" or "case").
         strict = unresolved or not RESOLVING.fullmatch(interp) or not _lenient_ok(code, names)
-        candidates = re.findall(r"[\w@./+-]+", code) if strict else targets
-        for tok in candidates:
+        candidates = [(t, here) for t in targets]
+        if strict:
+            # every path token, a path the code receives as an argument, and a
+            # path FRAGMENT joined onto something else (f'{d}/x.rs',
+            # d + '/x.rs', `${d}/x.rs`) — judged by its own name
+            candidates = [(m.group(0), here) for m in re.finditer(r"[\w@./+-]+", code)]
+            candidates += argv
+            candidates += [(m.group(0).lstrip("/"), None) for m in re.finditer(r"/[\w@.+-][\w@./+-]*", code)
+                           if FRAGMENT_BEFORE.search(code[:m.start()])]
+        for tok, at in candidates:
             if "/" not in tok and "." not in tok and not (strict and tok in test_dirs):
                 continue
-            rel = rel_to_root(tok, here, root)
-            hit = rel and (matches(rel, cfg["test_globs"])
+            rel = tok if at is None else rel_to_root(tok, at, root)
+            # 2026-10-05: also a file that keeps tests inside the code
+            # (inline_tests) — a python heredoc wrote electrs_phase.rs under
+            # the lock while `sed -i` on it was refused.
+            hit = rel and (matches(rel, cfg["test_globs"]) or (writes and inline_rules(rel, cfg))
                            or (strict and any(p in test_dirs for p in rel.split("/"))))
             if hit and rel not in found:
                 found.append(rel)
@@ -1492,8 +1573,14 @@ def _decide_new(event: dict, cfg: dict, root: str = ROOT, lock_present: bool | N
         hits += bash_hits(cmd, cwd, cfg, root, lock_present, branch_fn)
         if lock_present:
             for rel in inline_code_test_writes(cmd, cwd, cfg, root):
-                hits.append(("deny", "fix-lock is engaged: inline code in this command writes test/baseline %s. "
-                                     "Fix the code, not the test" % rel, True))
+                if matches(rel, cfg["test_globs"]) or not inline_rules(rel, cfg):
+                    hits.append(("deny", "fix-lock is engaged: inline code in this command writes test/baseline "
+                                         "%s. Fix the code, not the test" % rel, True))
+                else:
+                    hits.append(("deny", "fix-lock is engaged: inline code in this command writes %s, a file type "
+                                         "that keeps tests inside the code (inline_tests). Interpreter code can't be "
+                                         "checked line by line; make the change with Edit or Write, which the guard "
+                                         "checks" % rel, True))
 
     if cfg.get("profile", "stable") == "development":
         let_through = [r for d, r, keep in hits if d == "ask" and not keep]
