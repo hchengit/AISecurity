@@ -708,5 +708,373 @@ class PerSessionLock(unittest.TestCase):
                              {"cmd": cmd, "v": "allow"})
 
 
+class InlineWriteTargets(unittest.TestCase):
+    """False positive (2026-10-03/04, three times): inline code that writes a
+    NON-test file was denied because its text mentioned a test path. Now the
+    tripwire looks at what the code writes: resolvable targets that are not
+    tests pass; an unresolvable target keeps the strict rule."""
+
+    def _v(self, cmd: str) -> str:
+        return verdict("Bash", {"command": cmd}, lock=True)
+
+    def test_a_resolvable_non_test_target_passes_even_if_the_text_names_a_test(self):
+        for cmd in (
+            "python3 - <<'EOF'\np='docs/build-records/x.md'\nopen(p,'w').write('see tests/test_something.py')\nEOF",
+            "python3 - <<'EOF'\nopen('src/app.py','w').write('# tests/test_something.py')\nEOF",
+            "node -e \"require('fs').writeFileSync('src/app.js', '// tests/test_something.py')\"",
+            "python3 - <<'EOF'\nfrom pathlib import Path\nPath('docs/a.md').write_text('tests/test_something.py')\nEOF",
+        ):
+            self.assertEqual({"cmd": cmd, "v": self._v(cmd)}, {"cmd": cmd, "v": "allow"})
+
+    def test_the_2026_10_03_hole_is_still_denied(self):
+        for cmd in (
+            "python3 - <<'EOF'\np='tests/test_something.py'\ns=open(p).read()\nopen(p,'w').write(s+'x')\nEOF",
+            "python3 - <<'EOF'\nconst = 1\nT = \"tests/test_something.py\"\nopen(T, 'a').write('x')\nEOF",
+            "node -e \"const f='tests/test_something.py'; require('fs').writeFileSync(f, '')\"",
+        ):
+            self.assertEqual({"cmd": cmd, "v": self._v(cmd)}, {"cmd": cmd, "v": "deny"})
+
+    def test_an_unresolvable_target_keeps_the_strict_rule(self):
+        for cmd in (
+            "python3 - \"$f\" <<'EOF'\nimport sys\nopen(sys.argv[1],'w').write('tests/test_something.py')\nEOF",
+            "python3 - <<'EOF'\nimport os\nopen(os.path.join('tests','x.py'),'w').write('tests/test_something.py')\nEOF",
+        ):
+            self.assertEqual({"cmd": cmd, "v": self._v(cmd)}, {"cmd": cmd, "v": "deny"})
+
+
+class SecretSearches(unittest.TestCase):
+    """Owner, 2026-10-04: "should not be allowed to search or look into .env
+    without permission." A recursive search over a tree holding a secret file
+    read it without asking (`grep -r X .` names no secret file), while
+    `grep -r --exclude='*.env' X .` — which would NOT read it — was denied."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.root = self._tmp.name
+        os.makedirs(os.path.join(self.root, "src"))
+        os.makedirs(os.path.join(self.root, "app", "deep"))
+        for rel in ("src/a.py", "app/deep/b.py"):
+            with open(os.path.join(self.root, rel), "w") as f:
+                f.write("x = 1\n")
+        with open(os.path.join(self.root, "app", "deep", ".env"), "w") as f:
+            f.write("SECRET=1\n")
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def _v(self, cmd: str, profile: str = "stable") -> str:
+        event = {"tool_name": "Bash", "tool_input": {"command": cmd}, "cwd": self.root}
+        return guard.decide(event, dict(CFG, profile=profile), self.root, lock_present=False,
+                            branch_fn=lambda _c: "feature/x")[0]
+
+    # rg and ag skip hidden files unless told (--hidden, -uu); .env is hidden.
+    def test_a_recursive_search_over_a_tree_with_a_secret_asks_in_every_profile(self):
+        for cmd in ("grep -r x .", "grep -rn x", "grep -Rl x app", "egrep -r 'x|y' .",
+                    "grep --recursive x .", "grep -d recurse x .", "rg --hidden x", "rg -uu x app",
+                    "ag --hidden x .", "find . -type f -exec grep -l x {} +",
+                    "cd app && grep -r x ."):
+            for profile in ("stable", "development"):
+                self.assertEqual({"cmd": cmd, "p": profile, "v": self._v(cmd, profile)},
+                                 {"cmd": cmd, "p": profile, "v": "ask"})
+
+    def test_searches_that_cannot_reach_a_secret_pass(self):
+        for cmd in ("grep -r x src", "grep x app/deep/b.py", "git grep x",
+                    "grep -r --exclude='*.env' x .", "grep -r --exclude=.env x .",
+                    "grep -r --exclude-dir=deep x .", "rg -g '!*.env' x", "rg --glob '!.env' x app",
+                    "find src -name '*.py' -exec grep -l x {} +"):
+            self.assertEqual({"cmd": cmd, "v": self._v(cmd)}, {"cmd": cmd, "v": "allow"})
+
+    def test_excluding_secrets_is_never_itself_refused(self):
+        cmd = "grep -rn --exclude='*.env' --exclude='*.key' x src"
+        self.assertEqual(self._v(cmd), "allow")
+
+    def test_a_tree_too_big_to_walk_counts_as_holding_secrets(self):
+        old = guard.SECRET_WALK_BUDGET
+        guard.SECRET_WALK_BUDGET = 0  # src/ holds one file: any walk is "too big"
+        try:
+            self.assertEqual(self._v("grep -r x src"), "ask")
+        finally:
+            guard.SECRET_WALK_BUDGET = old
+
+
+class GuardRound2(SecretSearches):
+    """Verifier round 1 of the 2026-10-04 guard record: regressions against the
+    previous guard (it denied these) plus old gaps. Every row was shown to get
+    through on a temp root holding app/deep/.env."""
+
+    def _lock(self, cmd: str) -> str:
+        return verdict("Bash", {"command": cmd}, lock=True)
+
+    def _at(self, cmd: str, sub: str) -> str:
+        event = {"tool_name": "Bash", "tool_input": {"command": cmd}, "cwd": os.path.join(self.root, sub)}
+        return guard.decide(event, dict(CFG, profile="stable"), self.root, lock_present=False,
+                            branch_fn=lambda _c: "feature/x")[0]
+
+    def test_regressions_reading_a_secret(self):
+        self.assertEqual(self._v("grep -T DUMMY app/deep/.env"), "deny")  # -T takes no value
+        for cmd in ("grep -r --exclude='*.env' --include='.env' x .",   # last matching filter wins
+                    "grep -r --exclude=.env --include='*' x ."):
+            # the previous guard denies these; the new guard may not loosen that (round 6)
+            self.assertEqual({"cmd": cmd, "v": self._v(cmd)}, {"cmd": cmd, "v": "deny"})
+
+    def test_regressions_writing_a_locked_test(self):
+        for cmd in ('python3 <<< "open(\'tests/x.py\',\'w\')"',
+                    "python3 -c \"open(mode='w', file='tests/x.py')\"",
+                    "python3 -c \"open('a' and 'tests/x.py','w')\"",
+                    "python3 -c \"open('a.md' if 0 else 'tests/x.py','w')\"",
+                    "python3 - <<'EOF'\np='a.md'\nfor p in ['tests/x.py']: open(p,'w')\nEOF",
+                    "python3 - <<'EOF'\np='a.md'\np, q = 'tests/x.py', 1\nopen(p,'w')\nEOF",
+                    "python3 - <<'EOF'\np='a.md'\n(p := 'tests/x.py')\nopen(p,'w')\nEOF",
+                    "python3 - <<'EOF'\np='a.md'\nglobals()['p']='tests/x.py'\nopen(p,'w')\nEOF"):
+            self.assertEqual({"cmd": cmd, "v": self._lock(cmd)}, {"cmd": cmd, "v": "deny"})
+
+    def test_searches_that_slipped_past(self):
+        os.symlink(os.path.join(self.root, "app", "deep"), os.path.join(self.root, "lnk"))
+        for cmd in ("timeout 5 grep -r x .", "nice -n 5 grep -r x .", "env -i grep -r x .",
+                    "stdbuf -oL grep -r x .", "eval \"grep -r x .\"", "busybox grep -r x .",
+                    "rgrep x .", "grep --recu x .", "grep --directories=rec x .", "grep -d rec x .",
+                    "grep -rC2 x .", "grep -rm1 x .", "grep -r --color x app", "grep -r -T x app",
+                    "rg --hidden -g '!.env' -g '*' x", "rg --hidden --iglob '*.ENV' x",
+                    "find -L app -type f -exec cat {} +", "find . -type f -exec sh -c 'cat \"$1\"' _ {} \\;",
+                    "find . -type f -exec perl -ne print {} +", "grep -R x lnk",
+                    "grep -r x $DIR", "grep -r x \"$(echo app)\"",
+                    "git grep --untracked x", "git grep --no-index x .", "grep x app/deep"):
+            self.assertEqual({"cmd": cmd, "v": self._v(cmd)}, {"cmd": cmd, "v": "ask"})
+        self.assertEqual(self._at("cd ../app && grep -r x .", "src"), "ask")
+
+    def test_inline_writes_that_slipped_past(self):
+        for cmd in ("perl -e 'open(my $f, \">\", \"tests/x.py\")'",
+                    "python3 -Bc \"open('tests/x.py','w')\"",
+                    "node -pe \"require('fs').writeFileSync('tests/x.py','')\"",
+                    "python3 - <<\\EOF\nopen('tests/x.py','w')\nEOF",
+                    "cat <<'EOF' | python3\nopen('tests/x.py','w')\nEOF",
+                    "echo \"open('tests/x.py','w')\" | python3",
+                    "bash -c \"python3 -c \\\"open('tests/x.py','w')\\\"\"",
+                    "python3 - <<'EOF'\nd='tests'\nopen(f'{d}/x.py','w')\nEOF",
+                    "python3 - <<'EOF'\nimport os\nos.replace('a.py','tests/x.py')\nEOF",
+                    "python3 - <<'EOF'\nfrom pathlib import Path\nPath('tests/x.py').touch()\nEOF",
+                    "node -e \"require('fs').renameSync('a','tests/x.py')\"",
+                    "node -e \"require('fs').cpSync('a','tests/x.py')\"",
+                    "cat <<EOF\nhello\nEOF\npython3 - <<EOF\nopen('tests/x.py','w')\nEOF"):
+            self.assertEqual({"cmd": cmd, "v": self._lock(cmd)}, {"cmd": cmd, "v": "deny"})
+
+    # Verifier round 2: regressions again (HEAD denied these), the strict-unless-
+    # straight-line rule for inline code, more bypasses, and two false positives.
+    def test_round2_regressions(self):
+        for cmd in ("rg --ignore-file=app/deep/.env x src",          # reads the file (errors print lines)
+                    "grep -r --exclude-from=app/deep/.env x src",
+                    "grep --exclude-from=app/deep/.env x src/a.py"):
+            self.assertEqual({"cmd": cmd, "v": self._v(cmd)}, {"cmd": cmd, "v": "deny"})
+        for cmd in ("python3 -c \"open(**{'file':'tests/x.py','mode':'w'}).write('')\"",
+                    "python3 - <<'EOF'\np='a.md'\ndef f(p):\n    open(p,'w')\nf('tests/x.py')\nEOF",
+                    "python3 - <<'EOF'\np='a.md'\nmatch 'tests/x.py':\n    case p:\n        open(p,'w')\nEOF",
+                    "python3 - <<'EOF'\np='a.md'\ng=lambda p: open(p,'w')\ng('tests/x.py')\nEOF",
+                    "node -e \"const p='a.md'; ['tests/x.js'].forEach(p => require('fs').writeFileSync(p,''))\"",
+                    "node -e \"let p='a.md'; for (p of ['tests/x.js']) require('fs').writeFileSync(p,'')\"",
+                    "node -e \"require('fs').openSync('tests/x.js','w')\"",
+                    "python3 -c \"import subprocess; subprocess.run(['cp','a','tests/x.py'])\"",
+                    "python3 - <<'EOF'\nopen('a.md','w')\n  EOF\nopen('tests/x.py','w')\nEOF",
+                    "cd tests && python3 -c \"open('x.py','w')\"",
+                    "npx tsx -e \"require('fs').writeFileSync('tests/x.js','')\""):
+            self.assertEqual({"cmd": cmd, "v": self._lock(cmd)}, {"cmd": cmd, "v": "deny"})
+
+    def test_round2_bypasses(self):
+        for cmd in ("rg --hidden -g '**/.env' x", "rg --hidden -g '{.env,zz}' x", "rg -nuu x", "rg -n. x",
+                    "grep -r x {app,zz}", "cd -- app && grep -r x .", "cd -P app && grep -r x .",
+                    "pushd app && grep -r x .", "( cd app && grep -r x . )",
+                    "git -C app grep --untracked x", "git --no-pager grep --no-index x .",
+                    "setsid grep -r x .", "watch -n1 grep -r x .", "su -c 'grep -r x .'",
+                    "find . -type d -name deep -exec grep -r x {} +"):
+            self.assertEqual({"cmd": cmd, "v": self._v(cmd)}, {"cmd": cmd, "v": "ask"})
+        for cmd in ("cat app/deep/.e*", "grep x app/deep/.*",
+                    "find . -name a.py -exec sh -c 'cat app/deep/.env' \\;"):
+            self.assertNotEqual({"cmd": cmd, "v": self._v(cmd)}, {"cmd": cmd, "v": "allow"})
+
+    def test_round2_false_positives(self):
+        # the everyday record edit: read a .md, replace text, write it back
+        cmd = ("python3 - <<'EOF'\np='docs/build-records/r.md'\nt=open(p).read()\n"
+               "open(p,'w').write(t.replace('a','tests/test_something.py'))\nEOF")
+        self.assertEqual(self._lock(cmd), "allow")
+        # Verifier round 3: treating heredoc bodies as data hid money moves run
+        # by ssh / docker exec / subprocess — bodies stay commands, as before.
+        self.assertEqual(self._v("cat > notes.md <<'EOF'\ngrep x app/deep/.env\nEOF"), "deny")
+        # but a heredoc fed to a shell IS commands
+        self.assertEqual(self._v("bash <<'EOF'\ncat app/deep/.env\nEOF"), "deny")
+
+    # Verifier round 3 (19 regressions). Rule since: never drop a check the
+    # previous guard made; only the inline false positive and secret-excluding
+    # searches got more lenient.
+    def test_round3_money_and_secrets_in_heredocs_still_ask(self):
+        # every repo has secrets; not every repo's examples include a money move
+        must = ["cat .env"] + [ex["input"]["command"] for ex in CFG["examples"]
+                               if ex["tool"] == "Bash" and ex.get("expect_dev") in ("ask", "deny")]
+        for c in must:
+            forms = ["docker exec -i box sh <<'EOF'\n%s\nEOF" % c,
+                     "ssh node2 <<'EOF'\n%s\nEOF" % c,
+                     "x=$(cat <<'EOF'\n%s\nEOF\n); eval \"$x\"" % c,
+                     "cat > /tmp/run.sh <<'EOF'\n%s\nEOF\nbash /tmp/run.sh" % c]
+            if c != "cat .env":  # a read inside a code string is a known limit (old guard too)
+                forms.append("python3 - <<'EOF'\nimport subprocess\nsubprocess.run(%r, shell=True)\nEOF" % c)
+            for wrapped in forms:
+                for profile in ("stable", "development"):
+                    v = verdict("Bash", {"command": wrapped}, profile=profile)
+                    self.assertNotEqual({"cmd": wrapped, "p": profile, "v": v},
+                                        {"cmd": wrapped, "p": profile, "v": "allow"})
+        for cmd in ("tee >(sh) <<'EOF'\ncat app/deep/.env\nEOF", "ssh localhost <<'EOF'\ncat app/deep/.env\nEOF",
+                    "uv run --env-file app/deep/.env python3 x.py", "uv run --env-file=app/deep/.env python3 x.py"):
+            self.assertNotEqual({"cmd": cmd, "v": self._v(cmd)}, {"cmd": cmd, "v": "allow"})
+
+    def test_round3_inline_tricks_are_strict(self):
+        for cmd in ("python3 - <<'EOF'\np = 'a.md'\n# `\ndef f(p): open(p, 'w').write('x')\n# `\nf('tests/x.py')\nEOF",
+                    "node -e \"let p='a.md'; // `\nfunction f(p){require('fs').writeFileSync(p,'')}\n// `\nf('tests/x.js')\"",
+                    "python3 - <<'EOF'\np = 'a.md'\nx = p = 'tests/x.py'\nopen(p,'w')\nEOF",
+                    "python3 - <<'EOF'\nimport sys\np = 'a.md'\nsys.modules[__name__].p = 'tests/x.py'\nopen(p,'w')\nEOF",
+                    "node -e \"var p='a.md'; globalThis.p = 'tests/x.js'; require('fs').writeFileSync(p,'')\"",
+                    "python3 - <<'EOF'\np = 'a.md'\nｐ = 'tests/x.py'\nopen(p,'w')\nEOF",
+                    "node -e \"var p='a.md'; \\u0070 = 'tests/x.js'; require('fs').writeFileSync(p,'')\""):
+            self.assertEqual({"cmd": cmd, "v": self._lock(cmd)}, {"cmd": cmd, "v": "deny"})
+
+    # Verifier round 4: a `cd` that may not take effect dropped checks on the
+    # original paths, and the inline leniency trusted operations it did not know.
+    def test_round4_cd_never_drops_a_check(self):
+        for pre in ("cd nonexistent_zz; ", "cd docs || true; ", "cd docs && cd - && ",
+                    "if false; then cd docs; fi; ", "cd \"$OLDPWD\"; ", "pushd docs && popd && "):
+            cmd = pre + "echo '{}' > .claude/settings.local.json"
+            self.assertEqual({"cmd": cmd, "v": verdict("Bash", {"command": cmd})}, {"cmd": cmd, "v": "ask"})
+            cmd = pre + "echo x > tests/test_something.py"
+            self.assertEqual({"cmd": cmd, "v": self._lock(cmd)}, {"cmd": cmd, "v": "deny"})
+            cmd = pre + "python3 -c \"open('tests/test_something.py','w')\""
+            self.assertEqual({"cmd": cmd, "v": self._lock(cmd)}, {"cmd": cmd, "v": "deny"})
+
+    def test_round4_inline_lenient_only_for_known_harmless_calls(self):
+        md = "open('docs/r.md','w').write('see tests/test_x.py')\n"
+        for extra in ("import os\ngetattr(os, 'remove')('tests/x.py')\n",
+                      "p = 'docs/r.md'\nfrom helpers import p\nopen(p,'w')\n",
+                      "import shutil\nshutil.rmtree('tests')\n", "import os\nos.rmdir('tests')\n",
+                      "import os\nos.makedirs('tests/new')\n", "import os\nos.chmod('tests/x.py', 0)\n",
+                      "import urllib.request\nurllib.request.urlretrieve('http://x', 'tests/x.py')\n"):
+            cmd = "python3 - <<'EOF'\n" + md + extra + "EOF"
+            self.assertEqual({"cmd": cmd, "v": self._lock(cmd)}, {"cmd": cmd, "v": "deny"})
+        for extra in ("require('fs').rmSync('tests', {recursive: true})", "require('fs').mkdirSync('tests/n')",
+                      "require('fs').linkSync('docs/r.md', 'tests/x.test.js')"):
+            cmd = "node -e \"require('fs').writeFileSync('docs/r.md','see tests/x'); %s\"" % extra
+            self.assertEqual({"cmd": cmd, "v": self._lock(cmd)}, {"cmd": cmd, "v": "deny"})
+        # still lenient: the everyday record edit with ordinary helpers
+        ok = ("python3 - <<'EOF'\nimport re, json\np = 'docs/build-records/r.md'\nt = open(p).read()\n"
+              "t = re.sub('a', 'tests/test_something.py', t).strip()\nopen(p, 'w').write(t + '\\n')\nEOF")
+        self.assertEqual(self._lock(ok), "allow")
+
+    def test_round4_shared_gaps_closed(self):
+        for cmd in ("(cat .env)", "x=$(cat .env)", "echo `cat .env`", "sh <<< 'cat .env'",
+                    "echo 'cat .env' | sh"):
+            self.assertEqual({"cmd": cmd, "v": verdict("Bash", {"command": cmd})}, {"cmd": cmd, "v": "deny"})
+        for cmd in ("rm -rf tests", "mv tests /tmp/x", "git checkout -- tests"):
+            self.assertEqual({"cmd": cmd, "v": self._lock(cmd)}, {"cmd": cmd, "v": "deny"})
+
+    # Verifier round 5. Structural answer: the previous guard ships unchanged as
+    # guard_base.py and its decision always counts; the new code only adds,
+    # except two narrow, proven overrides (harmless inline code; a search
+    # filter's value).
+    def test_round5_the_previous_guard_always_counts(self):
+        import guard_base  # noqa: F401  (must exist beside guard.py)
+        real = guard.base_decide
+        try:
+            guard.base_decide = lambda *a, **k: ("deny", ["previous guard says no"])
+            self.assertEqual(verdict("Bash", {"command": "ls"}), "deny")
+        finally:
+            guard.base_decide = real
+
+    def test_round5_cd_segment_itself_is_checked(self):
+        musts = [ex["input"]["command"] for ex in CFG["examples"]
+                 if ex["tool"] == "Bash" and ex.get("expect_dev") in ("ask", "deny")]
+        for c in musts:
+            for form in ('cd "$(%s)"', "cd `%s`", 'pushd "$(%s)"'):
+                cmd = form % c
+                for profile in ("stable", "development"):
+                    self.assertNotEqual({"cmd": cmd, "v": verdict("Bash", {"command": cmd}, profile=profile)},
+                                        {"cmd": cmd, "v": "allow"})
+        self.assertNotEqual(verdict("Bash", {"command": "cd . > .env"}), "allow")
+        self.assertEqual(verdict("Bash", {"command": "cd . > .claude/settings.local.json"}), "ask")
+        for cmd in ("cd . > tests/test_x.py", "pushd . > tests/test_x.py"):
+            self.assertEqual({"cmd": cmd, "v": self._lock(cmd)}, {"cmd": cmd, "v": "deny"})
+
+    def test_round5_inline_arguments_aliases_and_second_calls(self):
+        md = "open('docs/r.md','w').write('x')\n"
+        for cmd in ("python3 - tests/test_x.py <<'EOF'\nimport sys\nopen(sys.argv[1],'w').write('x')\nEOF",
+                    "node -e \"require('fs').writeFileSync(process.argv[1],'x')\" tests/x.test.js",
+                    "python3 - <<'EOF'\n" + md + "read = open\nread('tests/test_x.py','w').write('x')\nEOF",
+                    "python3 - <<'EOF'\n" + md + "strip = open\nstrip('tests/test_x.py','a')\nEOF",
+                    "python3 - <<'EOF'\nfrom pathlib import Path\n" + md
+                    + "write = Path('tests/test_x.py').write_text\nwrite('x')\nEOF",
+                    "python3 - <<'EOF'\nfrom helpers import myopen\nmyopen('tests/test_x.py','w')\nEOF",
+                    "python3 -c \"open('docs/r.md','w').write('x')\" && "
+                    "python3 -c \"__import__('os').makedirs('tests/new')\"",
+                    "node -e \"require('fs').writeFileSync('docs/r.md','x')\" && "
+                    "node -e \"require('fs').mkdirSync('tests/newdir')\""):
+            self.assertEqual({"cmd": cmd, "v": self._lock(cmd)}, {"cmd": cmd, "v": "deny"})
+
+    def test_round5_many_cds_and_searches_stay_fast(self):
+        import time
+        cds = " && ".join("cd /usr/share" for _ in range(10))
+        cmd = cds + " && " + " && ".join("grep -r x ." for _ in range(8))
+        t = time.time()
+        self._v(cmd)
+        self.assertLess(time.time() - t, 4.0)
+
+    # Verifier round 6: the inline override lifted real test writes ($VAR
+    # expansion, a `cd` the guard cannot follow), and nesting ran past the
+    # hook's 10 s. The override now needs a command that is ONLY python/node
+    # calls, with no `$` or backtick anywhere.
+    def test_round6_inline_override_only_for_pure_interpreter_commands(self):
+        for cmd in ("T=tes\"ts\"/test_x.py; python3 -c \"open('$T','w').write('see tests/test_x.py')\"",
+                    "T=tests/test_x.py; python3 - <<EOF\nopen('$T','w').write('see tests/test_x.py')\nEOF",
+                    "T=tests/x.test.js; node -e \"require('fs').writeFileSync('$T','see tests/x')\"",
+                    "D=tests; cd $D && python3 -c \"open('helper.py','w').write('see tests/test_x.py')\"",
+                    "cd $(echo tests) && python3 -c \"open('helper.py','w').write('see tests/test_x.py')\"",
+                    "builtin cd tests && python3 -c \"open('helper.py','w').write('see tests/test_x.py')\"",
+                    "eval cd tests && python3 -c \"open('helper.py','w').write('see tests/test_x.py')\"",
+                    "g() { cd tests; }; g; python3 -c \"open('helper.py','w').write('see tests/test_x.py')\""):
+            self.assertEqual({"cmd": cmd, "v": self._lock(cmd)}, {"cmd": cmd, "v": "deny"})
+
+    def test_round6_include_filters_name_the_file_read(self):
+        for cmd in ("grep -r --include='.env' x .", "grep -r --exclude='*.env' --include='.env' x .",
+                    "grep -r --exclude=.env --include='*' x ."):
+            self.assertEqual({"cmd": cmd, "v": self._v(cmd)}, {"cmd": cmd, "v": "deny"})
+
+    def test_round6_deep_nesting_stays_inside_the_hook_timeout(self):
+        import shlex
+        import time
+        dirs = ["/usr/share", "/usr/lib", "/usr/include", "/usr/src", "/var/lib", "/usr/bin", "/etc", "/opt",
+                "/usr/libexec", "/usr/local"]
+        cds = "; ".join("cd " + d for d in dirs)  # ten different folders per level
+        c = cds + "; cat ." + "env"  # verifier round 6's no-search case, with a secret read at the core
+        for _ in range(5):
+            c = cds + "; true; sh -c " + shlex.quote(c)
+        t = time.time()
+        v = self._v(c)
+        self.assertLess(time.time() - t, 6.0)
+        self.assertNotEqual(v, "allow")
+
+    # Verifier round 7: after the new checks time out, NO override may lift
+    # the previous guard's decision (override (2) still could).
+    def test_round7_no_override_after_a_timeout(self):
+        real_new, real_base = guard._decide_new, guard.base_decide
+
+        def slow(*a, **k):
+            raise guard._TooSlow()
+        try:
+            guard._decide_new = slow
+            guard.base_decide = lambda *a, **k: ("deny", ["`grep` would print secret file *.env into the transcript"])
+            self.assertEqual(self._v("grep -r --exclude='*.env' x src"), "deny")
+        finally:
+            guard._decide_new, guard.base_decide = real_new, real_base
+
+    def test_false_positives_that_should_pass(self):
+        for cmd in ("find . -name '*.md' -exec grep -l foo {} +",  # -name is a filter
+                    "rg foo",                                      # rg skips hidden files (.env)
+                    "rg foo app"):
+            self.assertEqual({"cmd": cmd, "v": self._v(cmd)}, {"cmd": cmd, "v": "allow"})
+
+
 if __name__ == "__main__":
     unittest.main()

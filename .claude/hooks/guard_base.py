@@ -1,0 +1,772 @@
+#!/usr/bin/env python3
+"""Claude Code PreToolUse guard: the deterministic gates of BUILD-PROCEDURE.md.
+
+CLAUDE.md, skills, and the procedure are advisory: an AI session can skip
+them. This file is not. It is IDENTICAL in every full-tier repo (rikurinode,
+Iceman, AISecurity, Rikuri-PI); each repo's policy lives beside it in guard-config.json,
+including worked examples that test_guard.py replays.
+
+Decisions: "deny" (refused; the reason goes to the agent), "ask" (the owner
+must approve in the UI), or silent allow. Any internal failure (bad config,
+crash) returns ASK with the error: the guard never fails open and never
+bricks a session.
+
+Profiles (owner, 2026-09-27): "stable" (the default) asks at every gate.
+"development" asks only before money moves (funds patterns marked
+"always_ask") and before touching a secret file; every other ask becomes an
+allow, logged to .claude/state/guard-relaxed.log. Denies never change.
+Switch with `guard.py profile development|stable`; loosening asks the owner.
+
+The fix-lock makes tests read-only while a defect is being fixed: files
+named by `test_globs`, and the tests written INSIDE a source file, named by
+the optional `inline_tests` (Rust's `#[cfg(test)]` module: from a file's first
+marker to its end, plus the attribute/comment lines directly above the marker
+named by `attached_above`). Lines matching the optional `guarded_lines` (e.g.
+code that acts differently under `cfg(test)`) may not change anywhere in the
+file while locked. An Edit/Write is checked by comparing that region before
+and after, and an Edit must match the file exactly (the Edit tool also matches
+loosely, which the guard can't follow). A shell write to a file of that type
+is refused by name, as a test file's is, since it can't be checked.
+
+A fix-lock belongs to the session that took it (owner, 2026-10-03: "Let's not
+share fix-lock"). `fix-lock on` inside a Claude Code session writes
+.claude/state/fix-locks/<CLAUDE_CODE_SESSION_ID>.json and binds only that
+session (the hook reads `session_id`); taken outside a session (the owner's
+terminal) it writes the global .claude/state/fix-lock, which binds every
+session. `off` releases only your own; `off --session <id>` / `off --global`
+release someone else's and always ask the owner.
+
+Bash matching is a tripwire, not a wall: it reads the command segment by
+segment (split on ; && || | and newlines, recursing into sh -c), so routine
+commands stay silent. While your lock is held, inline interpreter code
+(python/node/... with -c/-e/stdin/heredoc) that writes and names a test path
+is refused (the 2026-10-03 heredoc hole); a determined workaround still gets
+past it. That is what code review and the owner are for.
+
+Hook:  stdin = PreToolUse JSON  (wired in .claude/settings.json)
+CLI:   guard.py fix-lock on <build-record> | off [--session <id> | --global] | status
+       guard.py profile [development | stable]
+"""
+from __future__ import annotations
+
+import fnmatch
+import glob
+import json
+import os
+import re
+import shlex
+import subprocess
+import sys
+import time
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+ROOT = os.path.dirname(os.path.dirname(HERE))
+CONFIG_PATH = os.path.join(HERE, "guard-config.json")
+LOCK_REL = ".claude/state/fix-lock"
+# One lock per Claude Code session: <session id>.json (see the header).
+LOCK_DIR_REL = ".claude/state/fix-locks"
+# Every release, one JSON line: a release may be free (the owner's choice) but never invisible.
+LOCK_LOG_REL = ".claude/state/fix-lock.log"
+# An ask the development profile let through, one JSON line each: relaxed, never invisible.
+RELAXED_LOG_REL = ".claude/state/guard-relaxed.log"
+PROFILE_LOG_REL = ".claude/state/profile.log"
+PROFILES = ("stable", "development")
+
+EDIT_TOOLS = {"Edit", "MultiEdit", "Write"}
+PATH_TOOLS = {"Read": "file_path", "Edit": "file_path", "Write": "file_path",
+              "MultiEdit": "file_path", "NotebookEdit": "notebook_path", "Grep": "path"}
+READ_TOOLS = {"Read", "Grep"}
+READER_VERBS = {"cat", "less", "more", "head", "tail", "grep", "egrep", "fgrep", "rg",
+                "awk", "sed", "xxd", "od", "hexdump", "strings", "base64", "nl", "tac",
+                "cut", "sort", "uniq", "diff", "cp", "scp", "rsync", "vi", "vim", "nano",
+                "source", ".", "bat", "jq", "openssl"}
+METADATA_VERBS = {"ls", "stat", "test", "[", "du", "wc", "find", "realpath", "readlink",
+                  "dirname", "basename"}
+PATTERN_FIRST = {"grep", "egrep", "fgrep", "rg", "awk", "sed", "jq"}
+PREFIX_WORDS = {"sudo", "env", "command", "nohup", "time", "nice", "exec"}
+WRITE_ALL_ARGS = {"rm", "mv", "tee", "truncate", "touch", "chmod", "chown", "ln",
+                  "unlink", "shred", "patch"}
+WRITE_LAST_ARG = {"cp", "install", "rsync"}
+GIT_PATH_WRITERS = {"checkout", "restore", "rm", "mv", "apply"}
+RANK = {"allow": 0, "ask": 1, "deny": 2}
+CONFIG_KEYS = {"secret_globs": list, "secret_allow_globs": list, "protected_globs": list,
+               "protected_branches": list, "test_globs": list, "funds_patterns": list,
+               "examples": list}
+
+
+# ── config ──────────────────────────────────────────────────────────────────
+
+def load_config(path: str = CONFIG_PATH) -> dict:
+    with open(path) as f:
+        cfg = json.load(f)
+    for key, typ in CONFIG_KEYS.items():
+        if not isinstance(cfg.get(key), typ):
+            raise ValueError("guard-config.json: '%s' missing or not a %s" % (key, typ.__name__))
+    for p in cfg["funds_patterns"]:
+        re.compile(p["regex"])
+        if not p.get("reason"):
+            raise ValueError("guard-config.json: funds pattern without a reason: %r" % p)
+        if not isinstance(p.get("always_ask", False), bool):
+            raise ValueError("guard-config.json: 'always_ask' must be true or false: %r" % p)
+    if cfg.get("profile", "stable") not in PROFILES:
+        raise ValueError("guard-config.json: 'profile' must be one of %s" % ", ".join(PROFILES))
+    pre = cfg.get("fix_lock_preflight", [])
+    if not (isinstance(pre, list) and all(
+            isinstance(cmd, list) and cmd and all(isinstance(w, str) and w for w in cmd) for cmd in pre)):
+        raise ValueError("guard-config.json: 'fix_lock_preflight' must be a list of argv lists, e.g. "
+                         '[["node", "scripts/quality-ratchet.mjs"]]')
+    if not isinstance(cfg.get("fix_lock_release_needs_owner", True), bool):
+        raise ValueError("guard-config.json: 'fix_lock_release_needs_owner' must be true or false")
+    inline = cfg.get("inline_tests", [])
+    if not (isinstance(inline, list) and all(
+            isinstance(r, dict) and isinstance(r.get("glob"), str) and r["glob"]
+            and isinstance(r.get("starts_at"), str) and r["starts_at"] for r in inline)):
+        raise ValueError("guard-config.json: 'inline_tests' must be a list of "
+                         '{"glob": "*.rs", "starts_at": "<regex>"} objects')
+    for r in inline:
+        for key in ("attached_above", "guarded_lines"):
+            if not isinstance(r.get(key, ""), str):
+                raise ValueError("guard-config.json: inline_tests %s must be a regex string" % key)
+        for key in ("starts_at", "attached_above", "guarded_lines"):
+            try:
+                re.compile(r.get(key, ""))
+            except re.error as e:
+                raise ValueError("guard-config.json: inline_tests %s %r: %s" % (key, r[key], e)) from e
+    return cfg
+
+
+# ── path helpers ────────────────────────────────────────────────────────────
+
+def rel_to_root(path: str, cwd: str, root: str) -> str | None:
+    """Repo-relative path, or None when the path is outside the repo."""
+    path = os.path.expanduser(path)
+    absolute = os.path.normpath(path if os.path.isabs(path) else os.path.join(cwd, path))
+    rel = os.path.relpath(absolute, root)
+    return None if rel == ".." or rel.startswith("../") else rel
+
+
+def matches(path: str, globs: list) -> bool:
+    base = os.path.basename(path)
+    for g in globs:
+        target = path if "/" in g else base
+        if fnmatch.fnmatchcase(target, g):
+            return True
+    return False
+
+
+def is_secret(path: str, cfg: dict) -> bool:
+    base = os.path.basename(path)
+    return matches(base, cfg["secret_globs"]) and not matches(base, cfg["secret_allow_globs"])
+
+
+# ── inline tests ────────────────────────────────────────────────────────────
+
+def read_text(path: str) -> str:
+    """A file's text as the Edit tool sees it: UTF-8, with only \\r\\n folded
+    to \\n (a lone \\r is not a line break); "" when the file does not exist
+    yet. Anything else, bytes that are not UTF-8 included, raises."""
+    try:
+        with open(path, encoding="utf-8", newline="") as f:
+            return f.read().replace("\r\n", "\n")
+    except FileNotFoundError:
+        return ""
+
+
+def inline_region(text: str, starts_at: str, attached_above: str = "") -> str | None:
+    """The tests inside `text`: from the first match of `starts_at` to the end,
+    widened up over the lines directly above it that match `attached_above`
+    (attributes, comments), across blank lines, since an attribute there
+    still applies to the tests (`#[cfg(any())]` switches them off)."""
+    m = re.search(starts_at, text, re.M)
+    if m is None:
+        return None
+    start = scan = m.start()
+    while attached_above and scan > 0 and text[scan - 1] == "\n":
+        prev = text.rfind("\n", 0, scan - 1) + 1
+        line = text[prev:scan - 1]
+        if line.strip() and not re.match(attached_above, line):
+            break
+        scan = prev
+        if line.strip():
+            start = prev
+    return text[start:]
+
+
+def texts_after(tool: str, tin: dict, before: str) -> list | None:
+    """Every text the file may hold once this Write / Edit / MultiEdit lands,
+    modelled on the Edit tool (Claude Code 2.1.221):
+    - an old_string with no exact match: None. The tool then tries loose
+      matches (curly quotes straightened, \\uXXXX decoded) the guard can't
+      follow;
+    - a deletion (new_string "") also takes the newline after old_string
+      when there is one; both outcomes are returned;
+    - an empty old_string replaces a file the tool judges blank and is
+      refused otherwise; the guard does not guess which (JS trim() and
+      Python strip() disagree on U+FEFF), so both outcomes are returned."""
+    if tool == "Write":
+        return [tin.get("content") or ""]
+    texts = [before]
+    for e in (tin.get("edits") or []) if tool == "MultiEdit" else [tin]:
+        old, new = e.get("old_string") or "", e.get("new_string") or ""
+        nxt = []
+        for text in texts:
+            if not old:
+                nxt += [new, text]
+                continue
+            if old not in text:
+                return None
+            olds = [old]
+            if not new and not old.endswith("\n") and old + "\n" in text:
+                olds.append(old + "\n")
+            for o in olds:
+                nxt.append(text.replace(o, new) if e.get("replace_all") else text.replace(o, new, 1))
+        texts = list(dict.fromkeys(nxt))
+    return texts
+
+
+def guarded(text: str, pattern: str) -> dict:
+    """How many times each line matching `pattern` occurs in `text`."""
+    counts: dict = {}
+    for line in text.split("\n"):
+        if pattern and re.search(pattern, line):
+            counts[line.strip()] = counts.get(line.strip(), 0) + 1
+    return counts
+
+
+def inline_rules(rel: str, cfg: dict) -> list:
+    return [r for r in cfg.get("inline_tests", []) if matches(rel, [r["glob"]])]
+
+
+def inline_edit_hit(tool: str, tin: dict, rel: str, root: str, cfg: dict) -> tuple | None:
+    """Deny when this edit changes the tests inside `rel` (fix-lock engaged)."""
+    rules = inline_rules(rel, cfg)
+    if not rules:
+        return None
+    try:
+        before = read_text(os.path.join(root, rel))
+    except (OSError, UnicodeDecodeError) as e:
+        return ("deny", "fix-lock is engaged and %s could not be read to check the tests inside it (%s)"
+                % (rel, e), True)
+    after = texts_after(tool, tin, before)
+    if after is None:
+        return ("deny", "fix-lock is engaged: an old_string does not match %s exactly. The Edit tool can "
+                        "still apply it by a loose match, which the guard cannot check, so under the "
+                        "fix-lock this file takes exact edits only (copy the text as it is)" % rel, True)
+    for r in rules:
+        region = inline_region(before, r["starts_at"], r.get("attached_above", ""))
+        if any(inline_region(a, r["starts_at"], r.get("attached_above", "")) != region for a in after):
+            return ("deny", "fix-lock is engaged: this changes the tests inside %s (its first "
+                            "inline-test marker to the end of the file, with the attribute and comment "
+                            "lines directly above that marker). Fix the code, not the test "
+                            "(release with `guard.py fix-lock off`)" % rel, True)
+        lines = guarded(before, r.get("guarded_lines", ""))
+        if any(guarded(a, r.get("guarded_lines", "")) != lines for a in after):
+            return ("deny", "fix-lock is engaged: this adds, removes or changes code in %s that acts "
+                            "differently under test (cfg(test) / cfg!(test) / cfg_attr(test, …), or an assert "
+                            "macro shadow). While a fix is locked, production code must not behave differently "
+                            "in the test build" % rel, True)
+    return None
+
+
+def expand_braces(word: str) -> list:
+    """`a/{b,c}.rs` -> [`a/b.rs`, `a/c.rs`], as the shell would (unnested)."""
+    m = re.search(r"\{([^{}]*,[^{}]*)\}", word)
+    if not m:
+        return [word]
+    return [x for part in m.group(1).split(",")
+            for x in expand_braces(word[:m.start()] + part + word[m.end():])]
+
+
+def shell_names(target: str, cwd: str) -> list:
+    """A write target as written, plus what its braces and globs expand to."""
+    out = [target]
+    for word in expand_braces(target):
+        out.append(word)
+        if any(c in word for c in "*?["):
+            out += glob.glob(os.path.join(cwd, os.path.expanduser(word)))
+    return out
+
+
+# ── bash parsing ────────────────────────────────────────────────────────────
+
+def split_segments(cmd: str) -> list:
+    """Split on ; && || | and newlines, outside quotes."""
+    segs, cur, quote, i = [], [], None, 0
+    while i < len(cmd):
+        c = cmd[i]
+        if quote:
+            if c == quote:
+                quote = None
+            cur.append(c)
+        elif c in "'\"":
+            quote = c
+            cur.append(c)
+        elif c in ";|\n" or cmd.startswith("&&", i):
+            segs.append("".join(cur))
+            cur = []
+            if cmd.startswith("&&", i) or cmd.startswith("||", i):
+                i += 1
+        else:
+            cur.append(c)
+        i += 1
+    segs.append("".join(cur))
+    return [s.strip() for s in segs if s.strip()]
+
+
+def words_of(seg: str) -> list:
+    try:
+        return shlex.split(seg, comments=False)
+    except ValueError:
+        return seg.split()
+
+
+def verb_and_args(words: list) -> tuple:
+    i = 0
+    while i < len(words) and (words[i] in PREFIX_WORDS or re.match(r"^\w+=", words[i])):
+        i += 1
+    if i >= len(words):
+        return "", []
+    return os.path.basename(words[i]), words[i + 1:]
+
+
+def file_args(verb: str, args: list) -> list:
+    """Words that can name a file: drops the pattern of grep/sed/awk/jq, and
+    quoted prose (a commit message mentioning .env is not a read of .env)."""
+    if verb in PATTERN_FIRST and "-e" not in args and "-f" not in args:
+        positional = [a for a in args if not a.startswith("-")]
+        if positional:
+            args = list(args)
+            args.remove(positional[0])
+    out = []
+    for w in args:
+        if not re.search(r"\s", w):
+            out += [p for p in re.split(r"[=<>]", w) if p]
+    return out
+
+
+def redirect_targets(seg: str) -> list:
+    return re.findall(r"(?<![0-9&])>{1,2}\|?\s*([^\s;&|<>]+)", seg)
+
+
+def write_targets(seg: str) -> list:
+    """Paths this segment writes, as far as a tripwire can tell."""
+    verb, args = verb_and_args(words_of(seg))
+    paths = [a for a in args if not a.startswith("-")]
+    out = list(redirect_targets(seg))
+    if verb in WRITE_ALL_ARGS:
+        out += paths
+    elif verb in WRITE_LAST_ARG and paths:
+        out.append(paths[-1])
+    elif verb in ("sed", "perl") and any(a.startswith("-i") or a == "--in-place" for a in args):
+        out += paths
+    elif verb == "dd":
+        out += [a[3:] for a in args if a.startswith("of=")]
+    elif verb == "git" and paths and paths[0] in GIT_PATH_WRITERS:
+        out += paths[1:]
+    return out
+
+
+def git_push_verdict(args: list, cwd: str, cfg: dict, branch_fn) -> tuple:
+    """(decision, reason) for `git <args>`; allow when it is not a push."""
+    i, git_cwd = 0, cwd
+    while i < len(args) and args[i].startswith("-"):
+        if args[i] in ("-C", "-c") and i + 1 < len(args):
+            if args[i] == "-C":
+                git_cwd = os.path.join(cwd, args[i + 1])
+            i += 2
+        else:
+            i += 1
+    if i >= len(args) or args[i] != "push":
+        return "allow", ""
+    rest = args[i + 1:]
+    for a in rest:
+        if (a in ("--force", "--mirror", "--delete", "--prune", "--force-if-includes")
+                or a.startswith("--force-with-lease")
+                or (re.match(r"^-[A-Za-z]+$", a) and ("f" in a or "d" in a))):
+            return "deny", "git push %s rewrites or deletes remote history — the owner runs that by hand" % a
+    positional = [a for a in rest if not a.startswith("-")]
+    refspecs = positional[1:]
+    protected = cfg["protected_branches"]
+    if "--all" in rest:
+        return "ask", "git push --all includes protected branches (%s)" % ", ".join(protected)
+    if not refspecs:
+        refspecs = ["HEAD"]
+    for spec in refspecs:
+        if spec.startswith("+"):
+            return "deny", "git push %s is a force push (leading +)" % spec
+        if spec.startswith(":"):
+            return "deny", "git push %s deletes a remote branch" % spec
+        dst = spec.split(":", 1)[-1].replace("refs/heads/", "")
+        if dst == "HEAD":
+            dst = branch_fn(git_cwd)
+        if dst in protected:
+            return "ask", "git push to protected branch '%s' — owner approves pushes to %s" % (dst, dst)
+    return "allow", ""
+
+
+def current_branch(cwd: str) -> str:
+    try:
+        return subprocess.run(["git", "-C", cwd, "rev-parse", "--abbrev-ref", "HEAD"],
+                              capture_output=True, text=True, timeout=5).stdout.strip()
+    except (OSError, subprocess.SubprocessError):
+        return ""
+
+
+# ── fix-lock ownership ──────────────────────────────────────────────────────
+
+def session_lock_path(root: str, session: str) -> str:
+    """The lock file for one session; the id is reduced to [A-Za-z0-9_-]."""
+    safe = re.sub(r"[^A-Za-z0-9_-]", "_", session) or "_"
+    return os.path.join(root, LOCK_DIR_REL, safe + ".json")
+
+
+def lock_held(root: str, session: str | None) -> bool:
+    """Is the caller locked? The global lock binds everyone; a session lock its owner."""
+    if os.path.exists(os.path.join(root, LOCK_REL)):
+        return True
+    return bool(session) and os.path.exists(session_lock_path(root, session))
+
+
+def is_lock_file(rel: str) -> bool:
+    return rel == LOCK_REL or rel.startswith(LOCK_DIR_REL + "/")
+
+
+INTERPRETERS = ("python", "python3", "node", "perl", "ruby", "tsx", "deno", "bun")
+INLINE_CODE = re.compile(r"(?:^|\s)(?:-c|-e|--eval|-)(?:\s|$)|<<")
+INLINE_WRITE = re.compile(r"open\([^)]*['\"][wax+]+b?['\"]|\.write_text\(|\.write_bytes\(|writeFile|appendFile|"
+                          r"fs\.write|createWriteStream|\bunlink|\.unlink\(|os\.remove|shutil\.")
+
+
+def inline_code_test_writes(cmd: str, cwd: str, cfg: dict, root: str) -> list:
+    """Test paths written by inline interpreter code (python3 - <<EOF, node -e …).
+
+    The 2026-10-03 hole: a python3 heredoc with a relative path wrote a test
+    file while a lock was engaged — write_targets() only sees shell syntax.
+    Running a test file (no inline code, or inline code that only reads) passes."""
+    lines = cmd.strip().split("\n")
+    # Any segment of the first line may start the interpreter (live drill,
+    # 2026-10-03: `cd X && python3 - <<'EOF'` got past a first-word check).
+    # Only the inline code itself is read: the -c/-e argument on that segment
+    # and the heredoc body up to its terminator — not the commands around it
+    # (false positive, 2026-10-03: a source edit followed by `jest <test path>`).
+    regions = []
+    for part in re.split(r"&&|\|\||;|\|", lines[0]):
+        words = part.split()
+        if not (words and os.path.basename(words[0]) in INTERPRETERS and INLINE_CODE.search(part)):
+            continue
+        regions.append(part)
+        heredoc = re.search(r"<<-?\s*['\"]?(\w+)['\"]?", part)
+        if heredoc:
+            body = []
+            for ln in lines[1:]:
+                if ln.strip() == heredoc.group(1):
+                    break
+                body.append(ln)
+            regions.append("\n".join(body))
+    code = "\n".join(regions)
+    if not code or not INLINE_WRITE.search(code):
+        return []
+    found = []
+    for tok in re.findall(r"[\w@./+-]+", code):
+        if "/" not in tok and "." not in tok:
+            continue
+        rel = rel_to_root(tok, cwd, root)
+        if rel and matches(rel, cfg["test_globs"]) and rel not in found:
+            found.append(rel)
+    return found
+
+
+# ── decision ────────────────────────────────────────────────────────────────
+
+def decide(event: dict, cfg: dict, root: str = ROOT, lock_present: bool | None = None,
+           branch_fn=current_branch, relaxed: list | None = None) -> tuple:
+    """Return (decision, [reasons]). Pure apart from branch_fn / lock lookup.
+
+    Each hit is (decision, reason, keep). `keep` marks an ask that stays in
+    the development profile (money moves, secrets). Asks development lets
+    through are appended to `relaxed`, so the caller can log them."""
+    tool = event.get("tool_name", "")
+    tin = event.get("tool_input") or {}
+    cwd = event.get("cwd") or root
+    if lock_present is None:
+        lock_present = lock_held(root, event.get("session_id"))
+    hits = []
+
+    if tool in PATH_TOOLS:
+        raw = tin.get(PATH_TOOLS[tool])
+        if raw:
+            rel = rel_to_root(raw, cwd, root)
+            if is_secret(raw, cfg):
+                hits.append(("deny" if tool in READ_TOOLS else "ask",
+                             "%s is a secret file — its contents must not enter the transcript; "
+                             "ask the owner for the one value you need" % raw, True))
+            if rel is not None and tool not in READ_TOOLS:
+                if is_lock_file(rel):
+                    if tool != "Write":
+                        hits.append(("ask", "editing the fix-lock ends the fix phase — owner approves", False))
+                elif matches(rel, cfg["protected_globs"]):
+                    hits.append(("ask", "%s is protected (constitution / gate) — owner approves every change" % rel,
+                                 False))
+                if lock_present and matches(rel, cfg["test_globs"]):
+                    hits.append(("deny", "fix-lock is engaged: %s is a test/baseline. Fix the code, not the "
+                                         "test (release with `guard.py fix-lock off`, owner approves)" % rel,
+                                 True))
+                elif lock_present and tool in EDIT_TOOLS:
+                    hit = inline_edit_hit(tool, tin, rel, root, cfg)
+                    if hit:
+                        hits.append(hit)
+    elif tool == "Bash":
+        cmd = tin.get("command", "")
+        hits += bash_hits(cmd, cwd, cfg, root, lock_present, branch_fn)
+        if lock_present:
+            for rel in inline_code_test_writes(cmd, cwd, cfg, root):
+                hits.append(("deny", "fix-lock is engaged: inline code in this command writes test/baseline %s. "
+                                     "Fix the code, not the test" % rel, True))
+
+    if cfg.get("profile", "stable") == "development":
+        let_through = [r for d, r, keep in hits if d == "ask" and not keep]
+        if relaxed is not None:
+            relaxed += let_through
+        hits = [h for h in hits if not (h[0] == "ask" and not h[2])]
+    if not hits:
+        return "allow", []
+    worst = max(hits, key=lambda h: RANK[h[0]])[0]
+    return worst, [r for d, r, _keep in hits if d == worst]
+
+
+def bash_hits(cmd: str, cwd: str, cfg: dict, root: str, lock_present: bool, branch_fn) -> list:
+    hits = []
+    for seg in split_segments(cmd):
+        words = words_of(seg)
+        verb, args = verb_and_args(words)
+        if verb in ("sh", "bash", "zsh") and "-c" in args and args.index("-c") + 1 < len(args):
+            hits += bash_hits(args[args.index("-c") + 1], cwd, cfg, root, lock_present, branch_fn)
+            continue
+        secrets = [t for t in file_args(verb, args) + redirect_targets(seg) if is_secret(t, cfg)]
+        if secrets and verb not in METADATA_VERBS:
+            if verb in READER_VERBS:
+                hits.append(("deny", "`%s` would print secret file %s into the transcript" % (verb, secrets[0]),
+                             True))
+            else:
+                hits.append(("ask", "command touches secret file %s" % secrets[0], True))
+        if verb == "git":
+            d, r = git_push_verdict(args, cwd, cfg, branch_fn)
+            if d != "allow":
+                hits.append((d, r, False))
+        if "guard.py" in seg and "fix-lock" in words and "off" in words:
+            if "--session" in words or "--global" in words:
+                hits.append(("ask", "this releases a fix-lock another session (or the owner) holds — owner "
+                                    "approves", True))
+            elif cfg.get("fix_lock_release_needs_owner", True):
+                hits.append(("ask", "releasing the fix-lock ends the fix phase — owner approves", False))
+        if ("guard.py" in seg and "profile" in words and "development" in words
+                and cfg.get("profile", "stable") != "development"):
+            hits.append(("ask", "switching the guard to 'development' stops most of its asks — owner "
+                                "approves (switching back to stable is always free)", True))
+        for target in write_targets(seg):
+            rel = rel_to_root(target, cwd, root)
+            if rel is None:
+                continue
+            if is_lock_file(rel) or matches(rel, cfg["protected_globs"]):
+                hits.append(("ask", "command writes protected path %s — owner approves" % rel, False))
+            if not lock_present:
+                continue
+            names = [n for n in (rel_to_root(t, cwd, root) for t in shell_names(target, cwd)) if n]
+            if any(matches(n, cfg["test_globs"]) for n in names):
+                hits.append(("deny", "fix-lock is engaged: command writes test/baseline %s. "
+                                     "Fix the code, not the test" % rel, True))
+            elif any(inline_rules(n, cfg) for n in names):
+                hits.append(("deny", "fix-lock is engaged: command writes %s, a file type that keeps tests "
+                                     "inside the code (inline_tests). A shell write can't be checked line by "
+                                     "line; make the change with Edit or Write, which the guard checks" % rel,
+                             True))
+        for p in cfg["funds_patterns"]:
+            if re.search(p["regex"], seg):
+                hits.append(("ask", p["reason"], p.get("always_ask", False)))
+    return hits
+
+
+# ── entry points ────────────────────────────────────────────────────────────
+
+def log_relaxed(root: str, event: dict, reasons: list) -> None:
+    """Record an ask the development profile let through. Never raises."""
+    tin = event.get("tool_input") or {}
+    what = tin.get("command") if event.get("tool_name") == "Bash" else tin.get(PATH_TOOLS.get(event.get("tool_name"), ""))
+    try:
+        path = os.path.join(root, RELAXED_LOG_REL)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "a") as f:
+            f.write(json.dumps({"at": time.strftime("%Y-%m-%dT%H:%M:%S%z"), "tool": event.get("tool_name"),
+                                "why": reasons, "what": str(what or "")[:300]}) + "\n")
+    except OSError:
+        pass
+
+
+def run_hook(stdin_text: str, config_path: str = CONFIG_PATH, root: str = ROOT) -> dict | None:
+    """Hook output dict, or None for a silent allow. Never raises."""
+    relaxed: list = []
+    event: dict = {}
+    try:
+        event = json.loads(stdin_text)
+        decision, reasons = decide(event, load_config(config_path), root, relaxed=relaxed)
+    except Exception as e:  # noqa: BLE001 — a broken guard must be loud, not open
+        decision, reasons = "ask", ["guard.py failed (%s: %s) — gates are NOT being checked; "
+                                    "fix .claude/hooks before continuing" % (type(e).__name__, e)]
+    if relaxed:
+        log_relaxed(root, event, relaxed)
+    if decision == "allow":
+        return None
+    return {"hookSpecificOutput": {"hookEventName": "PreToolUse",
+                                   "permissionDecision": decision,
+                                   "permissionDecisionReason": " | ".join(reasons)}}
+
+
+def fix_lock_preflight(root: str, config_path: str) -> str | None:
+    """Run the repo's pre-lock checks; the reason to refuse, or None to go ahead.
+
+    Lesson gate (2026-09-25): twice a quality-ratchet breach in a new test was
+    found only after the lock was engaged, and fixing the test then needed the
+    owner's `fix-lock off`. Checks listed in guard-config.json's optional
+    `fix_lock_preflight` (argv lists, run from the repo root, no shell) must
+    pass before tests become read-only.
+    """
+    try:
+        cfg = load_config(config_path)
+    except Exception as e:  # noqa: BLE001 — any config problem refuses, with the reason
+        return "cannot read %s: %s" % (config_path, e)
+    for argv in cfg.get("fix_lock_preflight", []):
+        try:
+            proc = subprocess.run(argv, cwd=root, capture_output=True, text=True, timeout=600)
+        except (OSError, subprocess.TimeoutExpired) as e:
+            return "preflight %s could not run: %s" % (" ".join(argv), e)
+        if proc.returncode != 0:
+            tail = "\n".join((proc.stdout + proc.stderr).strip().splitlines()[-8:])
+            return "preflight %s failed (exit %d):\n%s" % (" ".join(argv), proc.returncode, tail)
+    return None
+
+
+def _read_lock(path: str) -> dict:
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return {}
+
+
+def fix_lock_cli(args: list, root: str = ROOT, config_path: str = CONFIG_PATH, session: str | None = None) -> int:
+    """`session`: the caller's Claude Code session (main() passes
+    CLAUDE_CODE_SESSION_ID); None = the global lock, which binds every session."""
+    glob_lock = os.path.join(root, LOCK_REL)
+    own = session_lock_path(root, session) if session else glob_lock
+    if args[:1] == ["on"] and len(args) == 2:
+        refused = fix_lock_preflight(root, config_path)
+        if refused:
+            print("fix-lock NOT engaged — %s\nNothing was changed. Fix it first, then engage." % refused,
+                  file=sys.stderr)
+            return 1
+        os.makedirs(os.path.dirname(own), exist_ok=True)
+        with open(own, "w") as f:
+            json.dump({"record": args[1], "since": time.strftime("%Y-%m-%dT%H:%M:%S%z"), "session": session}, f)
+        scope = "this session" if session else "EVERY session (global lock)"
+        print("fix-lock ENGAGED for %s (%s) — test files, inline tests and baselines are now read-only"
+              % (args[1], scope))
+        return 0
+    if args[:1] == ["off"]:
+        if args == ["off"]:
+            target = own
+        elif len(args) == 3 and args[1] == "--session":
+            target = session_lock_path(root, args[2])
+        elif args == ["off", "--global"]:
+            target = glob_lock
+        else:
+            target = None
+        if target is not None:
+            if os.path.exists(target):
+                held = _read_lock(target)
+                with open(os.path.join(root, LOCK_LOG_REL), "a") as f:
+                    f.write(json.dumps({"record": held.get("record"), "engaged_since": held.get("since"),
+                                        "session": held.get("session"), "released_by": session,
+                                        "released_at": time.strftime("%Y-%m-%dT%H:%M:%S%z")}) + "\n")
+                os.remove(target)
+                print("fix-lock released (%s)" % (held.get("record") or "?"))
+            else:
+                print("no fix-lock held there — nothing released")
+            return 0
+    if args == ["status"]:
+        found = []
+        if os.path.exists(glob_lock):
+            found.append(("GLOBAL (binds every session)", _read_lock(glob_lock)))
+        for path in sorted(glob.glob(os.path.join(root, LOCK_DIR_REL, "*.json"))):
+            held = _read_lock(path)
+            mine = bool(session) and os.path.abspath(path) == os.path.abspath(own)
+            found.append(("session %s%s" % (held.get("session") or os.path.basename(path)[:-5],
+                                            " (this session)" if mine else ""), held))
+        if not found:
+            print("fix-lock not engaged")
+        for who, held in found:
+            print("%s: %s since %s" % (who, held.get("record"), held.get("since")))
+        return 0
+    print("usage: guard.py fix-lock on <build-record> | off [--session <id> | --global] | status", file=sys.stderr)
+    return 2
+
+
+def profile_cli(args: list, root: str = ROOT, config_path: str = CONFIG_PATH) -> int:
+    """Show or set the profile. Only the "profile" line of the config changes
+    (no re-serialising: the file keeps its own layout), and every switch is
+    logged."""
+    try:
+        with open(config_path) as f:
+            text = f.read()
+        current = json.loads(text).get("profile", "stable")
+    except (OSError, ValueError) as e:
+        print("cannot read %s: %s" % (config_path, e), file=sys.stderr)
+        return 1
+    if not args:
+        print("profile: %s" % current)
+        return 0
+    if len(args) != 1 or args[0] not in PROFILES:
+        print("usage: guard.py profile [%s]" % " | ".join(PROFILES), file=sys.stderr)
+        return 2
+    want = args[0]
+    if want == current:
+        print("profile already %s" % want)
+        return 0
+    line = re.compile(r'^(\s*)"profile"\s*:\s*"[^"]*"', re.M)
+    if line.search(text):
+        new = line.sub(lambda m: '%s"profile": "%s"' % (m.group(1), want), text, count=1)
+    else:
+        new = text.replace("{\n", '{\n  "profile": "%s",\n' % want, 1)
+    if json.loads(new).get("profile") != want:
+        print("could not set the profile in %s; nothing was changed" % config_path, file=sys.stderr)
+        return 1
+    tmp = config_path + ".tmp"
+    with open(tmp, "w") as f:
+        f.write(new)
+    try:
+        load_config(tmp)
+    except Exception as e:  # noqa: BLE001 — never leave a config the guard cannot load
+        os.remove(tmp)
+        print("refused: the new config would not load (%s)" % e, file=sys.stderr)
+        return 1
+    os.replace(tmp, config_path)
+    log = os.path.join(root, PROFILE_LOG_REL)
+    os.makedirs(os.path.dirname(log), exist_ok=True)
+    with open(log, "a") as f:
+        f.write(json.dumps({"from": current, "to": want, "at": time.strftime("%Y-%m-%dT%H:%M:%S%z")}) + "\n")
+    print("profile: %s -> %s" % (current, want))
+    return 0
+
+
+def main() -> int:
+    if sys.argv[1:2] == ["fix-lock"]:
+        return fix_lock_cli(sys.argv[2:], session=os.environ.get("CLAUDE_CODE_SESSION_ID") or None)
+    if sys.argv[1:2] == ["profile"]:
+        return profile_cli(sys.argv[2:])
+    out = run_hook(sys.stdin.read())
+    if out:
+        print(json.dumps(out))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
